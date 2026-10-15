@@ -5,7 +5,7 @@ import time
 import urllib.error
 import urllib.request
 from pathlib import Path
-from urllib.parse import urljoin
+from urllib.parse import urljoin, urlparse
 
 from anim.ledger import StageError
 
@@ -26,7 +26,7 @@ def urllib_transport(method, url, headers, data, timeout=120):
 
 
 def resolve(base, url):
-    if url.startswith("http"):
+    if url.startswith(("http://", "https://")):
         return url
     if url.startswith("/api/"):
         return urljoin(base, url)
@@ -40,44 +40,76 @@ class Client:
             raise OpenRouterError("OPENROUTER_API_KEY is not set")
         self.transport, self.base = transport or urllib_transport, base
 
+    def _trusted(self, url):
+        target, home = urlparse(url), urlparse(self.base)
+        return target.scheme == "https" and home.scheme == "https" and target.netloc == home.netloc
+
     def _call(self, method, url, body=None, raw=False):
         url = resolve(self.base, url)
-        headers = {"Authorization": f"Bearer {self.key}", "Content-Type": "application/json"}
+        headers = {"Content-Type": "application/json"}
+        if self._trusted(url):
+            headers["Authorization"] = f"Bearer {self.key}"
         status, data = self.transport(method, url, headers, json.dumps(body).encode() if body is not None else None)
         if status >= 400:
             raise OpenRouterError(f"OpenRouter {method} {url} -> HTTP {status}: {data[:300]!r}")
-        return data if raw else json.loads(data)
+        if raw:
+            return data
+        try:
+            parsed = json.loads(data)
+        except ValueError as error:
+            raise OpenRouterError(f"OpenRouter {method} {url} returned a body that is not JSON: {data[:200]!r}") \
+                from error
+        if not isinstance(parsed, dict):
+            raise OpenRouterError(f"OpenRouter {method} {url} returned JSON that is not an object: {data[:200]!r}")
+        return parsed
 
     def video_model(self, model_id):
-        for model in self._call("GET", "videos/models")["data"]:
-            if model["id"] == model_id:
+        models = self._call("GET", "videos/models").get("data")
+        if not isinstance(models, list):
+            raise OpenRouterError("OpenRouter's video model list has no 'data' list")
+        for model in models:
+            if isinstance(model, dict) and model.get("id") == model_id:
                 return model
         raise OpenRouterError(f"OpenRouter serves no video model {model_id!r}")
 
     def limit_remaining(self):
-        return self._call("GET", "key")["data"].get("limit_remaining")
+        data = self._call("GET", "key").get("data")
+        if not isinstance(data, dict):
+            raise OpenRouterError("OpenRouter's key response has no 'data' object")
+        remaining = data.get("limit_remaining")
+        if remaining is not None and (isinstance(remaining, bool) or not isinstance(remaining, (int, float))):
+            raise OpenRouterError(f"OpenRouter's limit_remaining is not a number: {remaining!r}")
+        return remaining
 
     def submit(self, payload):
         job = self._call("POST", "videos", payload)
-        if "id" not in job or "polling_url" not in job:
-            raise OpenRouterError(f"Unexpected submit response: {job}")
+        if not job.get("id") or not job.get("polling_url"):
+            raise OpenRouterError(f"Submit response lacks 'id' or 'polling_url': {job}")
         return job
 
     def wait(self, job, interval=10, timeout=1800, sleep=time.sleep, clock=time.monotonic):
+        if not job.get("polling_url"):
+            raise OpenRouterError(f"Video job {job.get('id')} has no 'polling_url' to poll")
         start = clock()
         while True:
             state = self._call("GET", job["polling_url"])
-            if state["status"] == "completed":
+            status = state.get("status")
+            if not isinstance(status, str):
+                raise OpenRouterError(f"Poll response for video job {job.get('id')} has no 'status': {state}")
+            if status == "completed":
                 return state
-            if state["status"] == "failed":
-                raise OpenRouterError(f"Video job {job['id']} failed: {state.get('error')}")
+            if status == "failed":
+                raise OpenRouterError(f"Video job {job.get('id')} failed: {state.get('error')}")
             if clock() - start > timeout:
-                raise OpenRouterError(f"Video job {job['id']} did not finish in {timeout} s")
+                raise OpenRouterError(f"Video job {job.get('id')} did not finish in {timeout} s")
             sleep(interval)
 
     def download(self, job, path, index=0):
+        urls = job.get("unsigned_urls")
+        if not isinstance(urls, list) or not 0 <= index < len(urls) or not isinstance(urls[index], str):
+            raise OpenRouterError(f"Completed video job {job.get('id')} has no 'unsigned_urls'[{index}] to download")
         path = Path(path)
-        path.write_bytes(self._call("GET", job["unsigned_urls"][index], raw=True))
+        path.write_bytes(self._call("GET", urls[index], raw=True))
         return path
 
     def generation(self, generation_id):

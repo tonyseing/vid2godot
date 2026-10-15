@@ -66,3 +66,34 @@ class ClientTests(unittest.TestCase):
         client, _ = self.client({("GET", "/videos/j1"): [(200, job)]})
         with self.assertRaises(OpenRouterError):
             client.wait(job, interval=0, timeout=250, sleep=lambda s: None, clock=lambda: next(ticks))
+
+    def test_malformed_responses_raise_openrouter_error(self):
+        job = {"id": "j1", "polling_url": "https://openrouter.ai/api/v1/videos/j1"}
+        client, _ = self.client({("GET", "/videos/models"): [(200, {})], ("GET", "/key"): [(200, {})],
+                                 ("POST", "/videos"): [(202, {})], ("GET", "/videos/j1"): [(200, {})]})
+        for call in (lambda: client.video_model("a/b"), client.limit_remaining, lambda: client.submit({}),
+                     lambda: client.wait(job, interval=0, sleep=lambda s: None),
+                     lambda: client.download({"id": "j1"}, "unused.mp4"),
+                     lambda: client.download({"id": "j1", "unsigned_urls": []}, "unused.mp4")):
+            with self.assertRaises(OpenRouterError):
+                call()
+
+    def test_non_object_and_non_json_bodies_raise(self):
+        client, _ = self.client({("GET", "/key"): [(200, b"[1]")], ("GET", "/videos/models"): [(200, b"<html>")]})
+        with self.assertRaises(OpenRouterError):
+            client.limit_remaining()
+        with self.assertRaises(OpenRouterError):
+            client.video_model("a/b")
+
+    def test_key_only_goes_to_the_base_host(self):
+        done = {"id": "j1", "unsigned_urls": ["https://cdn.example.com/v.mp4", "http://openrouter.ai/v.mp4",
+                                              "https://openrouter.ai/api/v1/videos/j1/content"]}
+        client, transport = self.client({("GET", "cdn.example.com"): [(200, b"A")],
+                                         ("GET", "http://openrouter.ai"): [(200, b"B")],
+                                         ("GET", "https://openrouter.ai"): [(200, b"C")]})
+        with tempfile.TemporaryDirectory() as tmp:
+            for index in range(3):
+                client.download(done, Path(tmp) / "v.mp4", index=index)
+        self.assertNotIn("Authorization", transport.calls[0][2])
+        self.assertNotIn("Authorization", transport.calls[1][2])
+        self.assertEqual(transport.calls[2][2]["Authorization"], "Bearer key")

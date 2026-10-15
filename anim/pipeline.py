@@ -124,7 +124,8 @@ def cmd_generate(a):
     outputs.update({f"candidate{c['index']}": Path(c["video"]) for c in record["candidates"]})
     ledger.record("generate", {"image": ledger.output("reference", "image")}, outputs,
                   {"model": a.model_id, "spentUsd": record["spentUsd"]})
-    emit({"ok": True, "spentUsd": record["spentUsd"], "strips": [c["strip"] for c in record["candidates"]],
+    emit({"ok": True, "spentUsd": record["spentUsd"], "warnings": record["warnings"],
+          "strips": [c["strip"] for c in record["candidates"]],
           "next": "Open every strip and several full frames of each candidate, then run `accept`."})
 
 
