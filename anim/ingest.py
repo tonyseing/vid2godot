@@ -54,10 +54,30 @@ def unique_indices(frames, tol=4.0):
     return [0] + [i for i in range(1, len(frames)) if frame_difference(frames[i], frames[i - 1]) > tol]
 
 
-def true_rate(n_unique, n_total, container_fps):
-    rate = container_fps * n_unique / n_total
+def snap_rate(rate):
     nearest = min(FRAME_RATES, key=lambda r: abs(r - rate))
     return float(nearest) if abs(nearest - rate) / rate <= 0.03 else rate
+
+
+def true_rate(n_unique, n_total, container_fps):
+    return snap_rate(container_fps * n_unique / n_total)
+
+
+def cadence(unique, n_total, container_fps):
+    """Which frames to keep, their rate and their times (s), from the gaps between consecutive unique frames.
+
+    Median gap 1: the video is native-rate, so a held frame is real stillness: keep every frame at the container rate.
+    Median gap above 1: pulldown: keep the unique frames at the container rate over the mean gap, leaving out the
+    gaps above twice the median (frozen runs), so a long hold does not slow the whole clip.
+    """
+    gaps = np.diff(unique)
+    median = float(np.median(gaps)) if len(gaps) else 1.0
+    if median <= 1.0:
+        keep, fps = list(range(n_total)), float(container_fps)
+    else:
+        keep = list(unique)
+        fps = snap_rate(container_fps / float(gaps[gaps <= 2 * median].mean()))
+    return keep, fps, [i / container_fps for i in keep]
 
 
 def background_colour(img, border=8):
@@ -109,8 +129,7 @@ def run_ingest(video, ref_mask_png, camera, out_dir, work_scale=0.5, threshold=4
     out_dir = Path(out_dir)
     info = probe(video)
     arrays = [np.array(Image.open(p).convert("RGB")) for p in extract_frames(video, out_dir / "raw")]
-    keep = unique_indices(arrays)
-    fps = true_rate(len(keep), len(arrays), info["fps"])
+    keep, fps, times = cadence(unique_indices(arrays), len(arrays), info["fps"])
     ref_mask = model_mask(ref_mask_png)
     work_shape = (round(ref_mask.shape[0] * work_scale), round(ref_mask.shape[1] * work_scale))
     clear_pngs(out_dir / "registered")
@@ -145,6 +164,7 @@ def run_ingest(video, ref_mask_png, camera, out_dir, work_scale=0.5, threshold=4
         subprocess.run(["ffmpeg", "-v", "error", "-y", "-i", str(video), "-vn", "-c:a", "pcm_s16le", str(audio)],
                        check=True)
     meta = {"video": str(video), "container": info, "uniqueIndices": keep, "frames": len(keep), "fps": fps,
+            "frameTimes": times,
             "registration": reg, "workScale": work_scale, "camera": camera.scaled(work_scale).to_json(),
             "fullCamera": camera.to_json(), "flags": flags, "warnings": warnings,
             "audio": str(audio) if audio else None}

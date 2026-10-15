@@ -6,6 +6,7 @@ from pathlib import Path
 
 import numpy as np
 from PIL import Image
+from scipy import ndimage
 
 from anim import ingest
 from anim.camera import SideCamera
@@ -28,9 +29,33 @@ class IngestUnitTests(unittest.TestCase):
         for i, img in enumerate(unique):
             sixty += [img] * (2 if i % 2 == 0 else 3)
         sixty = sixty[:60]
-        keep = ingest.unique_indices(sixty)
+        unique = ingest.unique_indices(sixty)
+        self.assertEqual(len(unique), 24)
+        self.assertEqual(ingest.true_rate(len(unique), len(sixty), 60.0), 24.0)
+        keep, fps, times = ingest.cadence(unique, len(sixty), 60.0)
+        self.assertEqual(keep, unique)
+        self.assertEqual(fps, 24.0)
+        self.assertEqual(times, [i / 60.0 for i in unique])
+
+    def test_held_frames_kept_at_container_rate(self):
+        clip = [frame(40)] * 6 + [frame(40 + 3 * i) for i in range(1, 19)]
+        unique = ingest.unique_indices(clip)
+        self.assertEqual(len(unique), 19)
+        keep, fps, times = ingest.cadence(unique, len(clip), 24.0)
+        self.assertEqual(keep, list(range(24)))
+        self.assertEqual(fps, 24.0)
+        self.assertEqual(times, [i / 24.0 for i in range(24)])
+
+    def test_pulldown_rate_ignores_a_frozen_run(self):
+        unique = [frame(40 + 3 * i) for i in range(24)]
+        sixty = []
+        for i, img in enumerate(unique):
+            sixty += [img] * (2 if i % 2 == 0 else 3)
+            if i == 10:
+                sixty += [img] * 15
+        keep, fps, _ = ingest.cadence(ingest.unique_indices(sixty), len(sixty), 60.0)
         self.assertEqual(len(keep), 24)
-        self.assertEqual(ingest.true_rate(len(keep), len(sixty), 60.0), 24.0)
+        self.assertEqual(fps, 24.0)
 
     def test_rate_not_snapped_when_far(self):
         self.assertAlmostEqual(ingest.true_rate(20, 60, 60.0), 20.0)
@@ -57,10 +82,15 @@ class IngestUnitTests(unittest.TestCase):
         self.assertAlmostEqual(half.sum(), ref.sum() / 4, delta=ref.sum() * 0.03)
 
     def test_boundary_points(self):
-        mask = ingest.silhouette(frame(100), np.array(GREY, dtype=float))
+        mask = np.zeros((180, 320), dtype=bool)
+        mask[100:140, 200:260] = True        # rows 100-139, columns 200-259: not square in index space
         points = ingest.boundary_points(mask, max_points=50)
         self.assertEqual(points.shape, (50, 2))
-        self.assertTrue(np.all(points[:, 0] >= 100) and np.all(points[:, 0] < 160))
+        u, v = points[:, 0].astype(int), points[:, 1].astype(int)
+        self.assertTrue(np.all((u >= 200) & (u < 260)), "column 0 must be u (the image column)")
+        self.assertTrue(np.all((v >= 100) & (v < 140)), "column 1 must be v (the image row)")
+        interior = ndimage.binary_erosion(mask)
+        self.assertTrue(np.all(mask[v, u]) and not np.any(interior[v, u]), "every point must be on the boundary")
 
 
 class IngestVideoTests(unittest.TestCase):
@@ -79,6 +109,7 @@ class IngestVideoTests(unittest.TestCase):
             meta = ingest.run_ingest(tmp / "clip.mp4", tmp / "mask.png", camera, tmp / "ingest")
             self.assertEqual(meta["frames"], 30)
             self.assertEqual(meta["fps"], 24.0)
+            self.assertEqual(meta["frameTimes"], [i / 24.0 for i in range(30)])
             data = np.load(tmp / "ingest" / "masks.npz")
             self.assertEqual(data["masks"].shape, (30, 360, 640))
             self.assertEqual(len(data["offsets"]), 31)
