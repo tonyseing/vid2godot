@@ -63,6 +63,8 @@ class Ledger:
         self.data["stages"][stage] = {"inputs": {k: self._entry(v) for k, v in inputs.items()},
                                       "outputs": {k: self._entry(v) for k, v in outputs.items()},
                                       "facts": facts or {}}
+        for later in STAGES[STAGES.index(stage) + 1:]:
+            self.data["stages"].pop(later, None)
         self.path.write_text(json.dumps(self.data, indent=2) + "\n")
 
     def _own_state(self, stage):

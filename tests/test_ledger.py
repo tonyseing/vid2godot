@@ -61,3 +61,12 @@ class LedgerTests(unittest.TestCase):
         rig.write_text("changed")
         self.assertEqual(self.ledger.state("brief"), "stale")
         self.assertEqual(self.ledger.next(), "contract")
+
+    def test_rerecord_upstream_invalidates_later(self):
+        rig = self.write("rig.json", "{}")
+        self.ledger.record("contract", {}, {"rig": rig})
+        brief = self.write("brief.json", "{}")
+        self.ledger.record("brief", {}, {"brief": brief})
+        self.ledger.record("contract", {}, {"rig": rig})
+        self.assertEqual(self.ledger.state("brief"), "missing")
+        self.assertEqual(self.ledger.next(), "brief")
