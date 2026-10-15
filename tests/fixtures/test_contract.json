@@ -1,0 +1,10 @@
+{"schemaVersion": 1, "units": "metres", "forward": "+X", "up": "+Y",
+ "rootBone": "root", "pelvisBone": "pelvis", "headBone": "head",
+ "requiredBones": ["root", "pelvis", "chest", "head", "upper_fl", "lower_fl", "paw_fl", "upper_fr", "lower_fr", "paw_fr",
+                   "upper_hl", "lower_hl", "paw_hl", "upper_hr", "lower_hr", "paw_hr"],
+ "chains": {"spine": ["pelvis", "chest"], "neck": ["head"],
+            "front_L": ["upper_fl", "lower_fl", "paw_fl"], "front_R": ["upper_fr", "lower_fr", "paw_fr"],
+            "hind_L": ["upper_hl", "lower_hl", "paw_hl"], "hind_R": ["upper_hr", "lower_hr", "paw_hr"]},
+ "legPairs": [["front_L", "front_R"], ["hind_L", "hind_R"]],
+ "paws": {"front_L": "paw_fl", "front_R": "paw_fr", "hind_L": "paw_hl", "hind_R": "paw_hr"},
+ "sheet": {"background": "#6b5b9f", "pxPerMetre": 75}}
