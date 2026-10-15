@@ -34,9 +34,30 @@ class BriefTests(unittest.TestCase):
 
     def test_bad_values(self):
         for change in ({"videoSeconds": 2}, {"videoSeconds": 31}, {"iouThreshold": 0}, {"fitChains": ["wings"]},
-                       {"limitsDeg": {"upper_fl": [10, -10]}}, {"backgrounds": ["grey"]}, {"loop": "yes"}):
+                       {"limitsDeg": {"upper_fl": [10, -10]}}, {"backgrounds": ["grey"]}, {"loop": "yes"},
+                       {"resolution": "hd"}, {"resolution": 720}, {"aspectRatio": "wide"}, {"aspectRatio": 1.7},
+                       {"targetSpeedMps": 0}, {"targetSpeedMps": -1}, {"targetSpeedMps": True},
+                       {"targetSpeedMps": "fast"},
+                       {"iouThreshold": "0.9"}, {"iouThreshold": True}, {"iouThreshold": None},
+                       {"limitsDeg": [1]}, {"limitsDeg": {"a": [1]}}, {"limitsDeg": {"a": ["x", "y"]}},
+                       {"limitsDeg": {"a": [True, 5]}}, {"limitsDeg": {"a": 5}},
+                       {"backgrounds": [1]}, {"backgrounds": "#c8c8c8"},
+                       {"fitChains": []}, {"fitChains": "spine"}, {"fitChains": [1]}):
             with self.subTest(change=change), self.assertRaises(BriefError):
                 self.load(**change)
+
+    def test_valid_optional_values(self):
+        brief = self.load(resolution="1080p", aspectRatio="9:16", targetSpeedMps=1.5, iouThreshold=1,
+                          limitsDeg={"upper_fl": [-30, 45.5]}, fitChains=["spine"])
+        self.assertEqual(brief["fitChains"], ["spine"])
+        self.assertEqual(self.load(fitChains=None)["fitChains"], list(PROJECT["chains"]))
+
+    def test_top_level_must_be_an_object(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "brief.json"
+            path.write_text(json.dumps([GOOD]))
+            with self.assertRaises(BriefError):
+                load_brief(path, PROJECT, "walk")
 
     def test_missing_field(self):
         with tempfile.TemporaryDirectory() as tmp:

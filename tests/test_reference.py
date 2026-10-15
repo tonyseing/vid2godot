@@ -39,6 +39,14 @@ class BackgroundChoiceTests(unittest.TestCase):
         with self.assertRaises(StageError):
             choose_background({"#7f7f7f": self.tmp / "grey.png"}, self.mask)
 
+    def test_empty_mask_is_a_clean_error(self):
+        image(self.tmp / "grey.png", (127, 127, 127), (128, 128, 128))
+        blank = np.full((90, 160), 255, dtype=np.uint8)
+        Image.fromarray(blank).save(self.tmp / "blank.png")
+        with self.assertRaises(StageError) as caught:
+            choose_background({"#7f7f7f": self.tmp / "grey.png"}, model_mask(self.tmp / "blank.png"))
+        self.assertIn("empty or too thin", str(caught.exception))
+
 
 @requires_blender
 class ReferenceRenderTests(unittest.TestCase):

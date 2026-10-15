@@ -17,8 +17,14 @@ class BriefError(StageError):
     pass
 
 
+def is_number(value):
+    return isinstance(value, (int, float)) and not isinstance(value, bool)
+
+
 def load_brief(path, project, clip):
     data = json.loads(Path(path).read_text())
+    if not isinstance(data, dict):
+        raise BriefError("The brief must be a JSON object")
     missing = [key for key in REQUIRED if key not in data]
     if missing:
         raise BriefError(f"The brief lacks {missing}")
@@ -31,16 +37,32 @@ def load_brief(path, project, clip):
         raise BriefError("loop must be true or false")
     if not isinstance(brief["videoSeconds"], int) or not 4 <= brief["videoSeconds"] <= 30:
         raise BriefError("videoSeconds must be an integer from 4 to 30")
-    if not 0 < brief["iouThreshold"] <= 1:
-        raise BriefError("iouThreshold must be in (0, 1]")
-    chains = brief["fitChains"] or list(project["chains"])
+    if not is_number(brief["iouThreshold"]) or not 0 < brief["iouThreshold"] <= 1:
+        raise BriefError("iouThreshold must be a number in (0, 1]")
+    if not isinstance(brief["resolution"], str) or not re.fullmatch(r"\d{3,4}p", brief["resolution"]):
+        raise BriefError("resolution must look like '720p'")
+    if not isinstance(brief["aspectRatio"], str) or not re.fullmatch(r"\d+:\d+", brief["aspectRatio"]):
+        raise BriefError("aspectRatio must look like '16:9'")
+    speed = brief["targetSpeedMps"]
+    if speed is not None and (not is_number(speed) or speed <= 0):
+        raise BriefError("targetSpeedMps must be null or a number above 0")
+    chains = brief["fitChains"]
+    if chains is None:
+        chains = list(project["chains"])
+    elif not isinstance(chains, list) or not chains or not all(isinstance(c, str) for c in chains):
+        raise BriefError("fitChains must be null (all chains) or a non-empty list of chain names")
     unknown = [chain for chain in chains if chain not in project["chains"]]
     if unknown:
         raise BriefError(f"fitChains names unknown chains {unknown}")
     brief["fitChains"] = chains
+    if not isinstance(brief["limitsDeg"], dict):
+        raise BriefError("limitsDeg must be an object of bone: [low, high]")
     for bone, limits in brief["limitsDeg"].items():
-        if len(limits) != 2 or not -180 <= limits[0] < limits[1] <= 180:
+        if not isinstance(limits, list) or len(limits) != 2 or not all(is_number(v) for v in limits):
+            raise BriefError(f"limitsDeg[{bone}] must be a list of two numbers [low, high]")
+        if not -180 <= limits[0] < limits[1] <= 180:
             raise BriefError(f"limitsDeg[{bone}] must be [low, high] degrees with low < high")
-    if not brief["backgrounds"] or not all(re.fullmatch(r"#[0-9a-fA-F]{6}", c) for c in brief["backgrounds"]):
+    if not isinstance(brief["backgrounds"], list) or not brief["backgrounds"] or not all(
+            isinstance(c, str) and re.fullmatch(r"#[0-9a-fA-F]{6}", c) for c in brief["backgrounds"]):
         raise BriefError("backgrounds must be a non-empty list of #rrggbb colours")
     return brief
