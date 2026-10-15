@@ -14,6 +14,7 @@ from anim import generate as generate_mod  # noqa: E402
 from anim import ingest as ingest_mod  # noqa: E402
 from anim import raster as raster_mod  # noqa: E402
 from anim import reference as reference_mod  # noqa: E402
+from anim import review as review_mod  # noqa: E402
 from anim import sheet as sheet_mod  # noqa: E402
 from anim.blender_run import run_blender  # noqa: E402
 from anim.camera import SideCamera  # noqa: E402
@@ -30,7 +31,8 @@ ARGS = {"init": [("--model", {"required": True, "type": Path}), ("--clip", {"req
         "accept": [("--candidate", {"required": True, "type": int}), ("--checks", {"required": True, "type": Path})],
         "ingest": [("--work-scale", {"type": float, "default": 0.5})],
         "gridframe": [("--frame", {"required": True, "type": int})],
-        "fit": [("--marks", {"type": Path}), ("--span", {})], "facts": [], "bake": []}
+        "fit": [("--marks", {"type": Path}), ("--span", {})], "facts": [], "bake": [], "lab": [],
+        "review": [("--template", {"action": "store_true"}), ("--file", {"type": Path})]}
 
 
 def command(name):
@@ -260,6 +262,66 @@ def cmd_bake(a):
                   {"glb": out, "sheet": folder / "sheet.png", "closeup": folder / "closeup.png"},
                   {"actions": result["actions"]})
     emit({"ok": True, "glb": str(out), "sheet": str(folder / "sheet.png"), "closeup": str(folder / "closeup.png")})
+
+
+def build_lab(ledger):
+    folder = ledger.work / "review"
+    poses = load_json(ledger.output("fit", "poses"))
+    report = load_json(ledger.output("fit", "report"))
+    brief = load_json(ledger.output("brief", "brief"))
+    review_mod.draw_overlays(ledger.work, poses, ledger.output("fit", "projection"), ledger.output("ingest", "masks"),
+                             folder / "overlays")
+    hashes = {name: ledger.require("fit")["outputs"][name]["sha256"] for name in ("poses", "projection")}
+    page = review_mod.lab_page(ledger.clip, report, brief["iouThreshold"],
+                               review_mod.contact_timeline(poses, project_contract(ledger)), hashes)
+    (folder / "lab.html").write_text(page)
+    return folder / "lab.html", report
+
+
+@command("lab")
+def cmd_lab(a):
+    lab, report = build_lab(Ledger(a.work))
+    emit({"lab": str(lab), "lowFrames": report["lowFrames"],
+          "next": "Open lab.html; open every low frame's overlay; mark (`gridframe`, marks file) and refit spans."})
+
+
+@command("review")
+def cmd_review(a):
+    ledger = Ledger(a.work)
+    folder = ledger.work / "review"
+    history_path = folder / "history.json"
+    history = load_json(history_path) if history_path.is_file() else []
+    if a.template:
+        lab, report = build_lab(ledger)
+        bound = {"poses": ledger.output("fit", "poses"), "facts": ledger.output("facts", "facts"),
+                 "glb": ledger.output("bake", "glb"), "sheet": ledger.output("bake", "sheet"),
+                 "closeup": ledger.output("bake", "closeup"), "lab": lab}
+        template = review_mod.make_template(ledger.clip, bound, report, len(history) + 1)
+        (folder / "template.json").write_text(json.dumps(template, indent=2))
+        emit({"template": str(folder / "template.json"), "lab": str(lab), "lowFrames": report["lowFrames"]})
+        return
+    if not a.file:
+        raise StageError("review needs --template or --file")
+    template = load_json(folder / "template.json")
+    filled = load_json(a.file)
+    problems = review_mod.validate(filled, template)
+    if problems:
+        raise StageError("The review is not complete:\n- " + "\n- ".join(problems))
+    history.append({"round": template["artisticRound"], "verdict": filled["verdict"],
+                    "reviewer": filled["reviewer"], "observations": filled.get("observations", "")})
+    history_path.write_text(json.dumps(history, indent=2))
+    if filled["verdict"] != "pass":
+        rounds = sum(1 for item in history if item["verdict"] == "fail")
+        ask = rounds >= review_mod.ARTISTIC_ROUNDS
+        emit({"ok": False, "failedRounds": rounds,
+              "next": "Ask the owner whether to continue or park this clip." if ask else "Revise and review again."})
+        return
+    if Path(a.file).resolve() != (folder / "review.json").resolve():
+        shutil.copyfile(a.file, folder / "review.json")
+    inputs = {name: Path(item["path"]) for name, item in template["bound"].items()}
+    ledger.record("review", {**inputs, "template": folder / "template.json"}, {"review": folder / "review.json"},
+                  {"round": template["artisticRound"]})
+    emit({"ok": True, "next": "verify"})
 
 
 def build_parser():
