@@ -14,6 +14,7 @@ from anim import generate as generate_mod  # noqa: E402
 from anim import ingest as ingest_mod  # noqa: E402
 from anim import raster as raster_mod  # noqa: E402
 from anim import reference as reference_mod  # noqa: E402
+from anim import sheet as sheet_mod  # noqa: E402
 from anim.blender_run import run_blender  # noqa: E402
 from anim.camera import SideCamera  # noqa: E402
 from anim.ledger import Ledger, StageError  # noqa: E402
@@ -29,7 +30,7 @@ ARGS = {"init": [("--model", {"required": True, "type": Path}), ("--clip", {"req
         "accept": [("--candidate", {"required": True, "type": int}), ("--checks", {"required": True, "type": Path})],
         "ingest": [("--work-scale", {"type": float, "default": 0.5})],
         "gridframe": [("--frame", {"required": True, "type": int})],
-        "fit": [("--marks", {"type": Path}), ("--span", {})], "facts": []}
+        "fit": [("--marks", {"type": Path}), ("--span", {})], "facts": [], "bake": []}
 
 
 def command(name):
@@ -220,6 +221,45 @@ def cmd_facts(a):
                   {"facts": folder / "facts.json", "entry": folder / "anim-entry.json"},
                   {"speedMps": result["speedMps"], "period": result["period"], "warnings": result["warnings"]})
     emit({"ok": True, **{k: result[k] for k in ("start", "period", "speedMps", "strideM", "warnings")}})
+
+
+@command("bake")
+def cmd_bake(a):
+    ledger = Ledger(a.work)
+    project = project_contract(ledger)
+    facts_path = ledger.output("facts", "facts")
+    cycle = load_json(facts_path)["cycle"]
+    poses = load_json(ledger.output("fit", "poses"))
+    brief = load_json(ledger.output("brief", "brief"))
+    folder = ledger.work / "bake"
+    folder.mkdir(exist_ok=True)
+    out = folder / f"{ledger.model.stem}-{ledger.clip}-eval.glb"
+    result = run_blender("bake_clip", {"model": str(ledger.model), "out": str(out), "cycle": str(facts_path),
+                                       "clip": ledger.clip, "loop": brief["loop"],
+                                       "pelvisBone": project["pelvisBone"], "bones": poses["bones"],
+                                       "names": poses["names"]}, folder, a.blender)
+    if ledger.clip not in result["actions"]:
+        raise StageError(f"The re-imported GLB has no clip {ledger.clip!r}: {sorted(result['actions'])}")
+    bounds = load_json(ledger.output("contract", "rig"))["bounds"]
+    background = project["sheet"]["background"]
+    camera = sheet_mod.game_camera(bounds, project["sheet"]["pxPerMetre"])
+    n = len(cycle["frames"]) - 1
+    offsets = sorted({round(i * n / 8) for i in range(8)})
+    frames = run_blender("render_frames", {"model": str(out), "clip": ledger.clip, "camera": camera.to_json(),
+                                           "background": background, "frames": offsets, "fps": cycle["fps"],
+                                           "outDir": str(folder / "sheet-frames")}, folder / "sheet-frames", a.blender)
+    sheet_mod.compose(frames["frames"], background, folder / "sheet.png")
+    close = SideCamera(camera.width, camera.height, camera.px_per_m * 4, camera.center_x,
+                       (0.6 * camera.height - camera.height / 2) / (camera.px_per_m * 4))
+    closeup = run_blender("render_frames", {"model": str(out), "clip": ledger.clip, "camera": close.to_json(),
+                                            "background": background, "frames": [0], "fps": cycle["fps"],
+                                            "outDir": str(folder / "closeup-frames")}, folder / "closeup-frames",
+                          a.blender)
+    sheet_mod.compose(closeup["frames"], background, folder / "closeup.png")
+    ledger.record("bake", {"poses": ledger.output("fit", "poses"), "facts": facts_path},
+                  {"glb": out, "sheet": folder / "sheet.png", "closeup": folder / "closeup.png"},
+                  {"actions": result["actions"]})
+    emit({"ok": True, "glb": str(out), "sheet": str(folder / "sheet.png"), "closeup": str(folder / "closeup.png")})
 
 
 def build_parser():

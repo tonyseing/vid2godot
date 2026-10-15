@@ -1,0 +1,149 @@
+import json
+import shutil
+import struct
+import tempfile
+import unittest
+from pathlib import Path
+
+import numpy as np
+
+from anim.blender_run import run_blender
+from anim.contract import load_project_contract
+from anim.ledger import Ledger
+from PIL import Image
+from tests.blender_case import BLENDER, FIXTURE_CONTRACT, fixture_glb, requires_blender
+from tests.test_pipeline import run
+
+WIDTH = {"SCALAR": 1, "VEC3": 3, "VEC4": 4}
+
+
+def read_glb(path):
+    """The glTF JSON and its binary chunk."""
+    data = Path(path).read_bytes()
+    length = struct.unpack_from("<I", data, 12)[0]
+    doc = json.loads(data[20:20 + length])
+    return doc, data[20 + length + 8:]
+
+
+def accessor(doc, binary, index):
+    acc = doc["accessors"][index]
+    view = doc["bufferViews"][acc["bufferView"]]
+    assert acc["componentType"] == 5126, "float accessors only"
+    width = WIDTH[acc["type"]]
+    start = view.get("byteOffset", 0) + acc.get("byteOffset", 0)
+    flat = np.frombuffer(binary, np.float32, acc["count"] * width, start)
+    return flat.reshape(acc["count"], width) if width > 1 else flat
+
+
+def channels(path):
+    """{animation: {(node name, path): (times, values, interpolation)}} plus each node's rest translation."""
+    doc, binary = read_glb(path)
+    out = {}
+    for anim in doc.get("animations", []):
+        out[anim["name"]] = {}
+        for channel in anim["channels"]:
+            sampler = anim["samplers"][channel["sampler"]]
+            node = doc["nodes"][channel["target"]["node"]]["name"]
+            out[anim["name"]][(node, channel["target"]["path"])] = (
+                accessor(doc, binary, sampler["input"]), accessor(doc, binary, sampler["output"]),
+                sampler.get("interpolation", "LINEAR"))
+    rest = {node["name"]: np.array(node.get("translation", [0.0, 0.0, 0.0])) for node in doc["nodes"]}
+    return out, rest
+
+
+def fixture_cycle(n=24, fps=24.0, period=23.6):
+    """A cycle block like facts.json's, keyed from the fixture walk's known angles: a sub-frame period, so the
+    cycle's rate is not an integer."""
+    _, truth_path = fixture_glb()
+    truth = json.loads(truth_path.read_text())
+    bones = [b for chain in load_project_contract(FIXTURE_CONTRACT)["chains"].values() for b in chain]
+    keys = [[0.01 * k, 0.0] + [truth[str(k)].get(b, 0.0) for b in bones] for k in range(n)]
+    keys.append(list(keys[0]))                     # a loop's last key equals its first
+    return bones, ["dx", "dz"] + bones, {"frames": keys, "fps": n * fps / period, "periodFrames": period,
+                                         "start": 3.25}
+
+
+@requires_blender
+class BakeTests(unittest.TestCase):
+    def test_bake_adds_clip_and_keeps_others(self):
+        glb, _ = fixture_glb()
+        n, fps, period = 24, 24.0, 23.6
+        bones, names, cycle = fixture_cycle(n, fps, period)
+        rate = cycle["fps"]
+        with tempfile.TemporaryDirectory() as tmp:
+            tmp = Path(tmp)
+            (tmp / "facts.json").write_text(json.dumps({"cycle": cycle}))
+            out = tmp / "eval.glb"
+            result = run_blender("bake_clip", {"model": str(glb), "out": str(out), "cycle": str(tmp / "facts.json"),
+                                               "clip": "walk_fit", "loop": True, "pelvisBone": "pelvis",
+                                               "bones": bones, "names": names}, tmp, BLENDER)
+            self.assertIn("walk", result["actions"])
+            first, last = result["actions"]["walk_fit"]
+            self.assertAlmostEqual(first, 0.0, places=4)
+            self.assertAlmostEqual(last, float(n), places=4)
+            baked, rest = channels(out)
+            original, _ = channels(glb)
+            fit = baked["walk_fit"]
+            # Godot's clip length: key k at k / cycle fps, so n / cycle fps = period / fps.
+            times, _, interpolation = fit[("upper_fl", "rotation")]
+            np.testing.assert_allclose(times, np.arange(n + 1) / rate, atol=1e-5)
+            self.assertAlmostEqual(float(times[-1]), period / fps, places=5)
+            self.assertEqual(interpolation, "LINEAR")
+            # Key k is cycle frame k: the fixture's walk was keyed with the same side-axis angles at frame k.
+            for bone in ("upper_fl", "lower_fl", "upper_hr", "lower_hr"):
+                want_times, want, _ = original["walk"][(bone, "rotation")]
+                got = fit[(bone, "rotation")][1]
+                np.testing.assert_allclose(np.abs(np.sum(got[:n] * want[:n], axis=1)), 1.0, atol=1e-5,
+                                           err_msg=bone)
+                np.testing.assert_allclose(got[n], got[0], atol=1e-6)            # the seam closes
+            # In place: the pelvis offsets (0.01 k m along X) lose their mean over keys 0..n-1.
+            _, moves, _ = fit[("pelvis", "translation")]
+            np.testing.assert_allclose(np.linalg.norm(moves[:n] - moves[0], axis=1), 0.01 * np.arange(n), atol=1e-5)
+            np.testing.assert_allclose(moves[:n].mean(axis=0), rest["pelvis"], atol=1e-5)
+            # The other clips are kept: same key times (the GLB's length) and the same values.
+            for channel, (want_times, want, _) in original["walk"].items():
+                got_times, got, _ = baked["walk"][channel]
+                np.testing.assert_allclose(got_times, want_times, atol=1e-5, err_msg=str(channel))
+                np.testing.assert_allclose(got, want, atol=1e-5, err_msg=str(channel))
+
+    def test_bake_command_writes_glb_sheet_and_closeup(self):
+        glb, _ = fixture_glb()
+        bones, names, cycle = fixture_cycle()
+        tmp = Path(tempfile.mkdtemp())
+        self.addCleanup(shutil.rmtree, tmp)
+        work = tmp / "w"
+        brief = tmp / "brief.json"
+        brief.write_text(json.dumps({"clip": "walk_fit", "subject": "box quadruped", "motion": "walking",
+                                     "gait": "4-beat lateral walk", "loop": True, "planar": True,
+                                     "videoSeconds": 5}))
+        run("init", "--work", str(work), "--model", str(glb), "--clip", "walk_fit")
+        self.assertEqual(run("contract", "--work", str(work), "--project-contract", str(FIXTURE_CONTRACT))[0], 0)
+        self.assertEqual(run("brief", "--work", str(work), "--file", str(brief))[0], 0)
+        self.assertEqual(run("reference", "--work", str(work))[0], 0)
+        # The video stages are stood in by files: bake reads only fit/poses.json and facts/facts.json.
+        ledger = Ledger(work)
+        stub = tmp / "stub.json"
+        stub.write_text("{}")
+        for stage in ("generate", "accept", "ingest"):
+            ledger.record(stage, {}, {"stub": stub})
+        (work / "fit").mkdir()
+        (work / "fit" / "poses.json").write_text(json.dumps({"bones": bones, "names": names, "fps": 24.0}))
+        ledger.record("fit", {}, {"poses": work / "fit" / "poses.json"})
+        (work / "facts").mkdir()
+        (work / "facts" / "facts.json").write_text(json.dumps({"cycle": cycle}))
+        ledger.record("facts", {}, {"facts": work / "facts" / "facts.json"})
+        code, data, err = run("bake", "--work", str(work))
+        self.assertEqual(code, 0, err)
+        self.assertEqual(Path(data["glb"]).name, "test_rig-walk_fit-eval.glb")
+        self.assertIn("walk", channels(data["glb"])[0])
+        with Image.open(data["sheet"]) as image:
+            sheet = np.array(image.convert("RGB"))
+        offsets = [0, 3, 6, 9, 12, 15, 18, 21]          # 8 poses across cycle frames 0..n-1
+        frames = sorted((work / "bake" / "sheet-frames").glob("*.png"))
+        self.assertEqual([int(p.stem) for p in frames], offsets)
+        tile = sheet.shape[1] // 8
+        self.assertEqual(sheet.shape[1], 8 * tile)
+        self.assertTrue(np.any(sheet[:, :tile] != sheet[:, 3 * tile:4 * tile]), "the poses differ across the cycle")
+        self.assertTrue(np.all(sheet[0, 0] == [0x6b, 0x5b, 0x9f]), "the palette background")
+        self.assertTrue(Path(data["closeup"]).is_file())
+        self.assertEqual(run("next", "--work", str(work))[1]["next"], "review")

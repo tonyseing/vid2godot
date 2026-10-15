@@ -23,8 +23,13 @@ def write_result(args, result):
 
 
 def set_fps(scene, fps):
-    scene.render.fps = int(round(fps))
-    scene.render.fps_base = scene.render.fps / fps
+    """Set the rate the glTF add-on uses to turn frames into seconds and back.
+
+    Blender 5.2's glTF importer and exporter both take the rate as `fps * fps_base` (Blender itself plays at
+    `fps / fps_base`), so `fps_base` is chosen for the add-on's formula: frame k is then k / `fps` seconds in the GLB,
+    and a non-integer cycle rate keeps its exact length."""
+    scene.render.fps = max(int(round(fps)), 1)
+    scene.render.fps_base = fps / scene.render.fps
 
 
 def load_glb(path, fps=None):
