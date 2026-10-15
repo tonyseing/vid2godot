@@ -64,19 +64,21 @@ def true_rate(n_unique, n_total, container_fps):
 
 
 def cadence(unique, n_total, container_fps):
-    """Which frames to keep, their rate and their times (s), from the gaps between consecutive unique frames.
+    """Which frames to keep, their rate and their times (s), from the runs of identical frames.
 
-    Median gap 1: the video is native-rate, so a held frame is real stillness: keep every frame at the container rate.
-    Median gap above 1: pulldown: keep the unique frames at the container rate over the mean gap, leaving out the
-    gaps above twice the median (frozen runs), so a long hold does not slow the whole clip.
+    A run starts at each unique index and lasts until the next one. Runs longer than twice the median run are holds
+    (real stillness), left out of the rate estimate: content rate = container rate * runs / frames over the steady
+    runs, snapped. If that equals the container rate (within 3%) the video is native: keep every frame at the container
+    rate, held frames included. Otherwise it is pulldown: keep the first frame of each run at the content rate.
     """
-    gaps = np.diff(unique)
-    median = float(np.median(gaps)) if len(gaps) else 1.0
-    if median <= 1.0:
+    starts = list(unique)
+    runs = np.diff(starts + [n_total])
+    steady = runs[runs <= 2 * float(np.median(runs))]
+    rate = snap_rate(container_fps * len(steady) / float(steady.sum()))
+    if abs(rate - container_fps) / container_fps <= 0.03:
         keep, fps = list(range(n_total)), float(container_fps)
     else:
-        keep = list(unique)
-        fps = snap_rate(container_fps / float(gaps[gaps <= 2 * median].mean()))
+        keep, fps = starts, float(rate)
     return keep, fps, [i / container_fps for i in keep]
 
 

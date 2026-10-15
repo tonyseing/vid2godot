@@ -57,6 +57,39 @@ class IngestUnitTests(unittest.TestCase):
         self.assertEqual(len(keep), 24)
         self.assertEqual(fps, 24.0)
 
+    def pulldown(self, content_fps, container_fps, seconds):
+        """A clip at container_fps whose frame i shows content frame floor(i * content / container)."""
+        n = container_fps * seconds
+        return [frame(40 + 3 * (i * content_fps // container_fps), w=640) for i in range(n)]
+
+    def assert_pulldown(self, content_fps, container_fps, seconds=2):
+        clip = self.pulldown(content_fps, container_fps, seconds)
+        unique = ingest.unique_indices(clip)
+        keep, fps, times = ingest.cadence(unique, len(clip), float(container_fps))
+        self.assertEqual(len(keep), content_fps * seconds, f"{content_fps}-in-{container_fps}: kept per second")
+        self.assertEqual(keep, unique, "pulldown keeps the first frame of each run")
+        self.assertEqual(fps, float(content_fps))
+        self.assertEqual(times, [i / container_fps for i in keep])
+
+    def test_24_in_30_pulldown(self):
+        self.assert_pulldown(24, 30)
+
+    def test_25_in_30_pulldown(self):
+        self.assert_pulldown(25, 30)
+
+    def test_48_in_60_pulldown(self):
+        self.assert_pulldown(48, 60)
+
+    def test_24_in_60_pulldown(self):
+        self.assert_pulldown(24, 60)
+
+    def test_native_30_no_repeats_kept_whole(self):
+        clip = [frame(40 + 3 * i) for i in range(30)]
+        keep, fps, times = ingest.cadence(ingest.unique_indices(clip), len(clip), 30.0)
+        self.assertEqual(keep, list(range(30)))
+        self.assertEqual(fps, 30.0)
+        self.assertEqual(times, [i / 30.0 for i in range(30)])
+
     def test_rate_not_snapped_when_far(self):
         self.assertAlmostEqual(ingest.true_rate(20, 60, 60.0), 20.0)
 
