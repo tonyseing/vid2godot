@@ -11,6 +11,7 @@ from anim import brief as brief_mod  # noqa: E402
 from anim import contract as contract_mod  # noqa: E402
 from anim import generate as generate_mod  # noqa: E402
 from anim import ingest as ingest_mod  # noqa: E402
+from anim import raster as raster_mod  # noqa: E402
 from anim import reference as reference_mod  # noqa: E402
 from anim.blender_run import run_blender  # noqa: E402
 from anim.camera import SideCamera  # noqa: E402
@@ -26,7 +27,8 @@ ARGS = {"init": [("--model", {"required": True, "type": Path}), ("--clip", {"req
                      ("--seed", {"type": int, "default": 1000}), ("--max-cost", {"type": float})],
         "accept": [("--candidate", {"required": True, "type": int}), ("--checks", {"required": True, "type": Path})],
         "ingest": [("--work-scale", {"type": float, "default": 0.5})],
-        "gridframe": [("--frame", {"required": True, "type": int})]}
+        "gridframe": [("--frame", {"required": True, "type": int})],
+        "fit": [("--marks", {"type": Path}), ("--span", {})]}
 
 
 def command(name):
@@ -169,6 +171,39 @@ def cmd_gridframe(a):
     (folder / "grid").mkdir(exist_ok=True)
     out = ingest_mod.grid_image(folder / "registered" / f"{a.frame:05d}.png", folder / "grid" / f"{a.frame:05d}.png")
     emit({"grid": str(out)})
+
+
+@command("fit")
+def cmd_fit(a):
+    ledger = Ledger(a.work)
+    meta = load_json(ledger.output("ingest", "meta"))
+    brief = load_json(ledger.output("brief", "brief"))
+    masks = ledger.output("ingest", "masks")
+    folder = ledger.work / "fit"
+    folder.mkdir(exist_ok=True)
+    marks_path = folder / "marks.json"
+    if a.marks:
+        shutil.copyfile(a.marks, marks_path)
+    elif not marks_path.exists():
+        marks_path.write_text(json.dumps({"frames": {}}))
+    args = {"model": str(ledger.model), "project": project_contract(ledger), "brief": brief,
+            "camera": meta["camera"], "masks": str(masks), "marks": load_json(marks_path)["frames"],
+            "workScale": meta["workScale"], "fps": meta["fps"], "out": str(folder / "poses.json"),
+            "projection": str(folder / "projection.npz")}
+    if a.span:
+        start, end = (int(x) for x in a.span.split(":"))
+        if not (folder / "poses.json").is_file():
+            raise StageError("--span refits part of an existing fit; run a full `fit` first")
+        args.update({"span": [start, end], "init": str(folder / "poses.json")})
+    run_blender("fit_clip", args, folder, a.blender)
+    report = raster_mod.score_fit(load_json(folder / "poses.json"), folder / "projection.npz", masks,
+                                  brief["iouThreshold"], meta["flags"])
+    (folder / "report.json").write_text(json.dumps(report, indent=2))
+    ledger.record("fit", {"masks": masks, "marks": marks_path},
+                  {"poses": folder / "poses.json", "projection": folder / "projection.npz",
+                   "report": folder / "report.json"}, {"meanIoU": report["meanIoU"], "lowFrames": report["lowFrames"]})
+    emit({"ok": True, "meanIoU": report["meanIoU"], "lowFrames": report["lowFrames"],
+          "next": "Run `lab`, open the overlay of every low frame, mark or refit, then run `facts`."})
 
 
 def build_parser():
