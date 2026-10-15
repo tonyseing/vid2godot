@@ -10,8 +10,10 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 from anim import brief as brief_mod  # noqa: E402
 from anim import contract as contract_mod  # noqa: E402
 from anim import generate as generate_mod  # noqa: E402
+from anim import ingest as ingest_mod  # noqa: E402
 from anim import reference as reference_mod  # noqa: E402
 from anim.blender_run import run_blender  # noqa: E402
+from anim.camera import SideCamera  # noqa: E402
 from anim.ledger import Ledger, StageError  # noqa: E402
 from anim.openrouter import Client  # noqa: E402
 
@@ -22,7 +24,9 @@ ARGS = {"init": [("--model", {"required": True, "type": Path}), ("--clip", {"req
         "brief": [("--file", {"required": True, "type": Path})], "reference": [],
         "generate": [("--model-id", {"required": True}), ("--candidates", {"type": int, "default": 2}),
                      ("--seed", {"type": int, "default": 1000}), ("--max-cost", {"type": float})],
-        "accept": [("--candidate", {"required": True, "type": int}), ("--checks", {"required": True, "type": Path})]}
+        "accept": [("--candidate", {"required": True, "type": int}), ("--checks", {"required": True, "type": Path})],
+        "ingest": [("--work-scale", {"type": float, "default": 0.5})],
+        "gridframe": [("--frame", {"required": True, "type": int})]}
 
 
 def command(name):
@@ -140,6 +144,31 @@ def cmd_accept(a):
     ledger.record("accept", {"checks": folder / "checks.json", "video": Path(accepted["candidate"]["video"])},
                   {"accepted": folder / "accepted.json"}, {"candidate": a.candidate})
     emit({"ok": True, "video": accepted["candidate"]["video"]})
+
+
+@command("ingest")
+def cmd_ingest(a):
+    ledger = Ledger(a.work)
+    video = Path(load_json(ledger.output("accept", "accepted"))["candidate"]["video"])
+    camera = SideCamera.from_json(load_json(ledger.output("reference", "meta"))["camera"])
+    folder = ledger.work / "ingest"
+    meta = ingest_mod.run_ingest(video, ledger.output("reference", "mask"), camera, folder, a.work_scale)
+    outputs = {"masks": folder / "masks.npz", "meta": folder / "ingest.json"}
+    if meta["audio"]:
+        outputs["audio"] = Path(meta["audio"])
+    ledger.record("ingest", {"video": video, "mask": ledger.output("reference", "mask")}, outputs,
+                  {"frames": meta["frames"], "fps": meta["fps"], "warnings": meta["warnings"]})
+    emit({"ok": True, "frames": meta["frames"], "fps": meta["fps"], "flags": meta["flags"],
+          "warnings": meta["warnings"]})
+
+
+@command("gridframe")
+def cmd_gridframe(a):
+    ledger = Ledger(a.work)
+    folder = ledger.work / "ingest"
+    (folder / "grid").mkdir(exist_ok=True)
+    out = ingest_mod.grid_image(folder / "registered" / f"{a.frame:05d}.png", folder / "grid" / f"{a.frame:05d}.png")
+    emit({"grid": str(out)})
 
 
 def build_parser():
