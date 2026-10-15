@@ -83,6 +83,19 @@ class IngestUnitTests(unittest.TestCase):
     def test_24_in_60_pulldown(self):
         self.assert_pulldown(24, 60)
 
+    # Clean pulldown at a non-standard content rate keeps that rate, as computed.
+    def test_20_in_60_pulldown(self):
+        self.assert_pulldown(20, 60)
+
+    def test_16_in_24_pulldown(self):
+        self.assert_pulldown(16, 24)
+
+    def test_10_in_30_pulldown(self):
+        self.assert_pulldown(10, 30)
+
+    def test_8_in_24_pulldown(self):
+        self.assert_pulldown(8, 24)
+
     def test_native_30_no_repeats_kept_whole(self):
         clip = [frame(40 + 3 * i) for i in range(30)]
         keep, fps, times = ingest.cadence(ingest.unique_indices(clip), len(clip), 30.0)

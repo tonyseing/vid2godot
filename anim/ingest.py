@@ -11,6 +11,8 @@ from anim.ledger import StageError
 from anim.reference import model_mask
 
 FRAME_RATES = (12, 15, 24, 25, 30, 48, 50, 60)
+# The least share of repeated frames in the steady runs that reads as pulldown (24-in-30 repeats 20%).
+PULLDOWN_MIN_DUPLICATES = 0.10
 
 
 class IngestError(StageError):
@@ -67,19 +69,21 @@ def cadence(unique, n_total, container_fps):
     """Which frames to keep, their rate and their times (s), from the runs of identical frames.
 
     A run starts at each unique index and lasts until the next one. Runs longer than twice the median run are holds
-    (real stillness), left out of the rate estimate: content rate = container rate * runs / frames over the steady
-    runs. The video is pulldown only when there are at least 2 steady runs and that rate snaps (within 3%) to a standard
-    rate in FRAME_RATES that differs (by more than 3%) from the container rate: then keep the first frame of each run
-    at the standard rate. Everything else is native (a few stray repeats, a frozen clip, one or two unique frames):
-    keep every frame at the container rate, held frames included.
+    (real stillness), left out of the estimate. The steady region (the remaining runs) is pulldown iff it has at least
+    2 runs and its duplicate fraction, 1 - runs / frames, is at least PULLDOWN_MIN_DUPLICATES: then keep the first frame
+    of each run (holds included) at snap_rate(container rate * runs / frames). A rate that does not snap, such as 16 or
+    20, is kept as computed. Everything else is native (no or a few stray repeats, a frozen clip, a single run): keep
+    every frame at the container rate, held frames included.
+
+    Known limits, from run counts alone: 24-in-25 repeats only 4% of frames, so it stays native (every frame kept at
+    25); and native 30 with every 5th frame repeated is indistinguishable from 24-in-30, so it reads as 24.
     """
     starts = list(unique)
     runs = np.diff(starts + [n_total])
     steady = runs[runs <= 2 * float(np.median(runs))]
-    rate = snap_rate(container_fps * len(steady) / float(steady.sum()))
-    standard = rate in FRAME_RATES
-    if len(steady) >= 2 and standard and abs(rate - container_fps) / container_fps > 0.03:
-        keep, fps = starts, float(rate)
+    duplicates = 1.0 - len(steady) / float(steady.sum())
+    if len(steady) >= 2 and duplicates >= PULLDOWN_MIN_DUPLICATES:
+        keep, fps = starts, float(snap_rate(container_fps * len(steady) / float(steady.sum())))
     else:
         keep, fps = list(range(n_total)), float(container_fps)
     return keep, fps, [i / container_fps for i in keep]
