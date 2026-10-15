@@ -39,7 +39,7 @@ class FakeClient:
     def wait(self, job, **kwargs):
         if self.fail_second and job["id"] == "j2":
             raise OpenRouterError("Video job j2 failed: provider error")
-        return {**job, "status": "completed", "generation_id": f"g{job['id']}", "usage": {"cost": self.cost},
+        return {**job, "status": "completed", "generation_id": f"g{job['id']}", "usage": {} if self.cost is None else {"cost": self.cost},
                 "unsigned_urls": ["u"], "model": self.job_model}
 
     def download(self, job, path, index=0):
@@ -188,3 +188,35 @@ class GenerateTests(unittest.TestCase):
             generate.accept(record, 1, {**checks, "noCuts": False})
         with self.assertRaises(StageError):
             generate.accept(record, 2, checks)
+
+    def test_unknown_price_bounds_later_candidates_by_observed_cost(self):
+        info = {k: v for k, v in INFO.items() if k != "pricing_skus"}
+        client = FakeClient(info=info, cost=1.0)
+        with self.assertRaises(StageError) as caught:
+            generate.run_generate(client, self.tmp / "gen", "m", BRIEF, self.png, "#c8c8c8", max_cost=1.5)
+        self.assertEqual(len(client.submitted), 1)
+        self.assertIn("spent so far: $1.00", str(caught.exception))
+
+    def test_unknown_price_rechecks_remaining_with_observed_cost(self):
+        info = {k: v for k, v in INFO.items() if k != "pricing_skus"}
+        client = FakeClient(info=info, cost=1.0)
+        reads = iter([100.0, 1.2])
+        client.limit_remaining = lambda: next(reads)
+        with self.assertRaises(StageError):
+            generate.run_generate(client, self.tmp / "gen", "m", BRIEF, self.png, "#c8c8c8", max_cost=50.0)
+        self.assertEqual(len(client.submitted), 1)
+
+    def test_unknown_price_and_missing_cost_stops_before_next_submit(self):
+        info = {k: v for k, v in INFO.items() if k != "pricing_skus"}
+        client = FakeClient(info=info, cost=None)
+        with self.assertRaises(StageError) as caught:
+            generate.run_generate(client, self.tmp / "gen", "m", BRIEF, self.png, "#c8c8c8", max_cost=50.0)
+        self.assertEqual(len(client.submitted), 1)
+        self.assertIn("bound", str(caught.exception))
+        partial = json.loads((self.tmp / "gen" / "record.partial.json").read_text())
+        self.assertIn("job j1 reported no cost", partial["warnings"])
+
+    def test_known_price_and_missing_cost_warns(self):
+        client = FakeClient(cost=None)
+        record = generate.run_generate(client, self.tmp / "gen", "m", BRIEF, self.png, "#c8c8c8")
+        self.assertEqual(record["warnings"], ["job j1 reported no cost", "job j2 reported no cost"])

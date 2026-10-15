@@ -3,7 +3,9 @@ import tempfile
 import unittest
 from pathlib import Path
 
-from anim.openrouter import Client, OpenRouterError
+import urllib.request
+
+from anim.openrouter import BASE, Client, OpenRouterError, StripKeyOnRedirect, is_trusted
 
 
 class FakeTransport:
@@ -97,3 +99,34 @@ class ClientTests(unittest.TestCase):
         self.assertNotIn("Authorization", transport.calls[0][2])
         self.assertNotIn("Authorization", transport.calls[1][2])
         self.assertEqual(transport.calls[2][2]["Authorization"], "Bearer key")
+
+
+class TrustAndRedirectTests(unittest.TestCase):
+    def test_lookalike_hosts_are_untrusted(self):
+        for url in ("https://openrouter.ai.evil.com/api/v1/x", "https://user@evil.com/x",
+                    "https://openrouter.ai@evil.com/x", "https://evil.com/openrouter.ai", "http://openrouter.ai/x",
+                    "https://notopenrouter.ai/x", "https://openrouter.ai:8443/x", "ftp://openrouter.ai/x", "",
+                    "https://openrouter.ai:bad/x"):
+            self.assertFalse(is_trusted(url, BASE), url)
+        for url in ("https://openrouter.ai/api/v1/videos/j1", "https://OPENROUTER.ai/api/v1/key"):
+            self.assertTrue(is_trusted(url, BASE), url)
+
+    def redirect(self, newurl, unredirected=False):
+        request = urllib.request.Request("https://openrouter.ai/api/v1/videos/j1/content")
+        if unredirected:
+            request.add_unredirected_header("authorization", "Bearer key")
+        else:
+            request.add_header("authorization", "Bearer key")
+        return StripKeyOnRedirect(BASE).redirect_request(request, None, 302, "Found", {}, newurl)
+
+    def test_redirect_off_host_drops_the_key(self):
+        for newurl in ("https://cdn.example.com/v.mp4", "http://openrouter.ai/v.mp4",
+                       "https://openrouter.ai.evil.com/v.mp4", "https://user@evil.com/v.mp4"):
+            for unredirected in (False, True):
+                new = self.redirect(newurl, unredirected)
+                self.assertFalse(new.has_header("Authorization"), newurl)
+                self.assertFalse(any(k.lower() == "authorization" for k in {**new.headers, **new.unredirected_hdrs}))
+
+    def test_redirect_on_host_keeps_the_key(self):
+        new = self.redirect("https://openrouter.ai/api/v1/videos/j1/content?index=0")
+        self.assertEqual(new.get_header("Authorization"), "Bearer key")

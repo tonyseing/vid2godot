@@ -61,10 +61,11 @@ def strip(video, out_png, count=8):
 
 
 def cost_of(done):
-    try:
-        return float((done.get("usage") or {}).get("cost") or 0)
-    except (TypeError, ValueError):
-        return 0.0
+    """The job's reported cost in dollars, or None when it reported none (or not a number)."""
+    cost = (done.get("usage") or {}).get("cost")
+    if isinstance(cost, bool) or not isinstance(cost, (int, float)):
+        return None
+    return float(cost)
 
 
 def returned_model(client, done, sleep, warnings, index):
@@ -108,17 +109,19 @@ def run_generate(client, out_dir, model_id, brief, reference_png, background, ca
         warnings.append("first candidate's cost is unbounded (price unknown)")
     record = {"modelRequested": model_id, "estimateUsd": estimate, "prompt": prompt, "size": [w, h],
               "candidates": [], "jobs": [], "warnings": warnings}
-    spent = 0.0
+    spent, observed, unpriced = 0.0, 0.0, []
     for index in range(1, candidates + 1):
         try:
             if index > 1:
-                if each is not None and max_cost is not None and spent + each > max_cost:
-                    raise StageError(f"Another candidate (${each:.2f}) would take spending past --max-cost "
+                if each is None and unpriced:
+                    raise StageError(f"Job {unpriced[0]} reported no cost and the model lists no price, so further "
+                                     f"spending cannot be bounded")
+                bound = each if each is not None else observed
+                if max_cost is not None and spent + bound > max_cost:
+                    raise StageError(f"Another candidate (about ${bound:.2f}) would take spending past --max-cost "
                                      f"${max_cost:.2f}")
-                if each is None and max_cost is not None and spent >= max_cost:
-                    raise StageError(f"Spending has reached --max-cost ${max_cost:.2f} (price unknown)")
                 remaining = client.limit_remaining()
-                if remaining is not None and (each or 0) * 1.5 > remaining:
+                if remaining is not None and bound * 1.5 > remaining:
                     raise StageError(f"Another candidate (x1.5 margin) exceeds the key's remaining ${remaining:.2f}")
             payload = {"model": model_id, "prompt": prompt, "duration": brief["videoSeconds"],
                        "resolution": brief["resolution"], "aspect_ratio": brief["aspectRatio"],
@@ -128,7 +131,13 @@ def run_generate(client, out_dir, model_id, brief, reference_png, background, ca
             job = client.submit(payload)
             record["jobs"].append({"index": index, "jobId": job["id"], "pollingUrl": job["polling_url"]})
             done = client.wait(job, interval=interval, timeout=timeout, sleep=sleep)
-            spent += cost_of(done)
+            cost = cost_of(done)
+            if cost is None:
+                unpriced.append(job["id"])
+                warnings.append(f"job {job['id']} reported no cost")
+            else:
+                spent += cost
+                observed = max(observed, cost)
             video = client.download(done, out_dir / f"candidate-{index}.mp4")
             model_returned = returned_model(client, done, sleep, warnings, index)
             strip_png = out_dir / f"candidate-{index}-strip.png"

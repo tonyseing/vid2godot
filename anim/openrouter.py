@@ -1,11 +1,12 @@
 """OpenRouter video API: submit, poll, download. Paid; never called by tests."""
 import json
 import os
+import functools
 import time
 import urllib.error
 import urllib.request
 from pathlib import Path
-from urllib.parse import urljoin, urlparse
+from urllib.parse import urljoin, urlsplit
 
 from anim.ledger import StageError
 
@@ -16,10 +17,36 @@ class OpenRouterError(StageError):
     pass
 
 
-def urllib_transport(method, url, headers, data, timeout=120):
-    request = urllib.request.Request(url, data=data, headers=headers, method=method)
+def is_trusted(url, base):
+    """True only for https on exactly the base host (no userinfo, same port): the only place the key may go."""
     try:
-        with urllib.request.urlopen(request, timeout=timeout) as response:
+        target, home = urlsplit(url), urlsplit(base)
+        return (target.scheme == "https" and home.scheme == "https" and bool(target.hostname)
+                and target.hostname == home.hostname and "@" not in target.netloc and target.port == home.port)
+    except ValueError:
+        return False
+
+
+class StripKeyOnRedirect(urllib.request.HTTPRedirectHandler):
+    """urllib copies Authorization to any redirect target; keep it only for https on the base host."""
+
+    def __init__(self, base=BASE):
+        self.base = base
+
+    def redirect_request(self, req, fp, code, msg, headers, newurl):
+        new = super().redirect_request(req, fp, code, msg, headers, newurl)
+        if new is not None and not is_trusted(newurl, self.base):
+            for table in (new.headers, new.unredirected_hdrs):
+                for name in [k for k in table if k.lower() == "authorization"]:
+                    del table[name]
+        return new
+
+
+def urllib_transport(method, url, headers, data, timeout=120, base=BASE):
+    request = urllib.request.Request(url, data=data, headers=headers, method=method)
+    opener = urllib.request.build_opener(StripKeyOnRedirect(base))
+    try:
+        with opener.open(request, timeout=timeout) as response:
             return response.status, response.read()
     except urllib.error.HTTPError as error:
         return error.code, error.read()
@@ -38,16 +65,13 @@ class Client:
         self.key = os.environ.get("OPENROUTER_API_KEY", "") if api_key is None else api_key
         if not self.key:
             raise OpenRouterError("OPENROUTER_API_KEY is not set")
-        self.transport, self.base = transport or urllib_transport, base
-
-    def _trusted(self, url):
-        target, home = urlparse(url), urlparse(self.base)
-        return target.scheme == "https" and home.scheme == "https" and target.netloc == home.netloc
+        self.transport = transport or functools.partial(urllib_transport, base=base)
+        self.base = base
 
     def _call(self, method, url, body=None, raw=False):
         url = resolve(self.base, url)
         headers = {"Content-Type": "application/json"}
-        if self._trusted(url):
+        if is_trusted(url, self.base):
             headers["Authorization"] = f"Bearer {self.key}"
         status, data = self.transport(method, url, headers, json.dumps(body).encode() if body is not None else None)
         if status >= 400:
