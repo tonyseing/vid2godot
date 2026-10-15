@@ -21,7 +21,7 @@ nothing by code.
 
 ## The plan
 
-From this skill's directory: `python3 anim/pipeline.py <command> --work asset-work/<area>/<slug>/anim/<clip>`
+From the project root (relative paths resolve there): `python3 <skill>/anim/pipeline.py <command> --work asset-work/<area>/<slug>/anim/<clip>`
 (optional `--blender <path>`). `status` and `next` show where you are.
 
 | Command | What you do |
@@ -32,7 +32,7 @@ From this skill's directory: `python3 anim/pipeline.py <command> --work asset-wo
 | `reference` | Open `reference/reference.png` |
 | `generate --model-id <id> [--max-cost USD]` | Two candidates |
 | `accept --candidate N --checks <json>` | After opening both strips and full frames; checks in `reference/prompting.md` |
-| `ingest` | Drops pulldown/held frames by cadence. Read `flags`, `warnings` |
+| `ingest` | Drops pulldown repeats by cadence. Read `flags`, `warnings` |
 | `fit` | Solves a clip-wide camera scale and leg identity. Prints `lowFrames` |
 | `lab` | Open `review/lab.html` and every low frame's overlay |
 | `gridframe --frame N`; `fit --marks <json> --span A:B` | Fix flips (below) |
@@ -46,7 +46,7 @@ From this skill's directory: `python3 anim/pipeline.py <command> --work asset-wo
 
 Near and far legs cast one silhouette. A pair exchanged for the whole clip is a valid mirrored lead; a flip
 partway through fails: a leg jumps sides at a `leg_crossing:` flag, or `facts` says a paw touches down
-twice per cycle. Recipe: `gridframe --frame N` just after the crossing, read both paws off `ingest/grid/<N>.png`,
+twice per cycle. Recipe: `gridframe --frame N` just after the crossing, read both paws off `ingest/grid/<NNNNN>.png`,
 add them to one marks file (`--marks` replaces the last), `fit --marks marks.json --span A:B` (B exclusive), `lab`.
 
 ```json

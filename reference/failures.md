@@ -14,7 +14,7 @@
 | Symptom | Cause | Fix |
 |---|---|---|
 | Legs speed up and slow down in a rhythm | The file claims a higher rate than its motion (24 in 30, 24 in 60) | `ingest` finds repeated frames by cadence and keeps one per pose at the snapped rate; check `fps` in its output. Known limits: 24-in-25 stays at 25, and native 30 with every fifth frame repeated reads as 24 |
-| A held pose is kept | A run of identical frames much longer than the cadence is a hold (real stillness) | Expected; holds are kept |
+| A held pose lasts one frame | In pulldown footage `ingest` keeps the first frame of every run of identical frames, holds included; a hold (a run much longer than the cadence, real stillness) is only left out of the rate estimate | Expected; native footage keeps every held frame |
 | `border_touch` flags | The camera fell behind and cut the animal | Accept the other candidate or generate again, or fit around those frames and explain them in the review |
 | "Silhouette height varies" warning | The video zoomed | Reject the candidate (it should have failed `noZoom`) |
 | "No animal found in video frame N" | The background or lighting changed | Reject the candidate |

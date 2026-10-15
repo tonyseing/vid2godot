@@ -16,8 +16,8 @@ size for its `resolution` and `aspectRatio`. Each candidate records the model th
 The estimate comes from the model's listed `video_tokens` price. A model with no listed price needs
 `--max-cost`. `generate` refuses when the estimate is above `--max-cost`, or when 1.5 times it exceeds the
 OpenRouter key's remaining limit, and checks again before each further candidate. A failure mid-run writes
-`generate/record.partial.json` with what was spent. Two candidates per clip (`--candidates 2`, seeds from
-`--seed 1000`).
+`generate/record.partial.json` with what was spent. Two candidates per clip (`--candidates 2`); candidate N uses seed
+`--seed` + N (1001 and 1002 by default).
 
 ## The prompt
 

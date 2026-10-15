@@ -26,7 +26,8 @@ Rollback: `python3 ~/.vid2godot/repo/install.py --rollback <backup directory pri
 - Blender 5.2 (`--blender <path>` or `VID2GODOT_BLENDER`)
 - The Godot 4.7 and 4.5 engines, and the project's activation-suppressed launcher
 - `OPENROUTER_API_KEY` for `generate`
-- game-asset-3d-pipeline installed (img2godot); `verify` uses its `forge/godot/verify.py`
+- game-asset-3d-pipeline installed (img2godot); `verify` uses its `forge/godot/verify.py` from
+  `~/.agents/skills/game-asset-3d-pipeline`, or the path given to `--threed-verify`
 
 ## Tests
 
