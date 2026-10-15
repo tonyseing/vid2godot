@@ -14,7 +14,10 @@ class ContractError(StageError):
 
 
 def load_project_contract(path):
-    data = json.loads(Path(path).read_text())
+    try:
+        data = json.loads(Path(path).read_text())
+    except (OSError, ValueError) as error:
+        raise ContractError(f"Cannot read project contract {path}: {error}") from error
     missing = [key for key in KEYS if key not in data]
     if missing:
         raise ContractError(f"Project contract {path} lacks {missing}")

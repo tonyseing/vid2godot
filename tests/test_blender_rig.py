@@ -5,7 +5,7 @@ from pathlib import Path
 
 from anim.blender_run import run_blender
 from anim.contract import check_rig, load_project_contract
-from tests.blender_case import BLENDER, FIXTURE_CONTRACT, fixture_glb, requires_blender
+from tests.blender_case import BLENDER, FIXTURE_CONTRACT, bad_fixture_glb, fixture_glb, requires_blender
 
 
 @requires_blender
@@ -20,3 +20,14 @@ class RigInspectionTests(unittest.TestCase):
         self.assertEqual(rig["forwardSign"], 1)
         self.assertTrue(all(item["edges"] == 0 for item in rig["collapse"]))
         self.assertEqual(check_rig(rig, project), ([], []))
+
+    def test_joint_collapse_is_detected(self):
+        glb = bad_fixture_glb()
+        project = load_project_contract(FIXTURE_CONTRACT)
+        with tempfile.TemporaryDirectory() as tmp:
+            rig = run_blender("inspect_rig", {"model": str(glb), "chains": project["chains"], "headBone": "head",
+                                              "pelvisBone": "pelvis"}, Path(tmp), BLENDER)
+        collapse = {item["bone"]: item["edges"] for item in rig["collapse"]}
+        self.assertGreater(collapse["lower_fl"], 0)
+        problems, _ = check_rig(rig, project)
+        self.assertTrue(any("Joint collapse at lower_fl" in problem for problem in problems))

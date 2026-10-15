@@ -8,6 +8,9 @@ import bpy  # noqa: E402
 import numpy as np  # noqa: E402
 import rigutil  # noqa: E402
 
+BEND_DEGREES = 45       # side bend applied to every chain bone, both directions
+COLLAPSE_RATIO = 0.1    # an edge shorter than this fraction of its rest length counts as collapsed
+
 args = rigutil.load_args()
 arm, skinned, others = rigutil.load_glb(args["model"])
 result = {"armature": arm.name if arm else None, "bones": [], "meshes": [], "triangles": 0, "collapse": [],
@@ -42,11 +45,11 @@ if arm:
         worst = 0
         for sign in (1, -1):
             rigutil.rest_pose(arm)
-            rigutil.set_angle(arm, name, rigutil.side_axis_local(arm, name), sign * math.radians(45))
+            rigutil.set_angle(arm, name, rigutil.side_axis_local(arm, name), sign * math.radians(BEND_DEGREES))
             bpy.context.view_layer.update()
             posed = rigutil.evaluated_vertices(skinned)
             length = np.linalg.norm(posed[pairs[:, 0]] - posed[pairs[:, 1]], axis=1)
-            worst = max(worst, int(np.count_nonzero(length[valid] < 0.1 * rest_length[valid])))
+            worst = max(worst, int(np.count_nonzero(length[valid] < COLLAPSE_RATIO * rest_length[valid])))
         result["collapse"].append({"bone": name, "edges": worst})
     rigutil.rest_pose(arm)
     bones = arm.data.bones

@@ -2,7 +2,7 @@ import json
 import shutil
 import tempfile
 import unittest
-from contextlib import redirect_stdout
+from contextlib import redirect_stderr, redirect_stdout
 from io import StringIO
 from pathlib import Path
 
@@ -11,10 +11,10 @@ from tests.blender_case import FIXTURE_CONTRACT, fixture_glb, requires_blender
 
 
 def run(*argv):
-    buffer = StringIO()
-    with redirect_stdout(buffer):
+    out, err = StringIO(), StringIO()
+    with redirect_stdout(out), redirect_stderr(err):
         code = main(list(argv))
-    return code, json.loads(buffer.getvalue() or "{}")
+    return code, json.loads(out.getvalue() or "{}"), err.getvalue()
 
 
 class PipelineTests(unittest.TestCase):
@@ -28,17 +28,30 @@ class PipelineTests(unittest.TestCase):
         model = self.tmp / "m.glb"
         model.write_bytes(b"x")
         self.assertEqual(run("init", "--work", str(self.tmp / "w"), "--model", str(model), "--clip", "lope")[0], 0)
-        code, data = run("status", "--work", str(self.tmp / "w"))
+        code, data, _ = run("status", "--work", str(self.tmp / "w"))
         self.assertEqual((code, data["next"]), (0, "contract"))
 
     def test_status_without_ledger_is_an_error(self):
-        self.assertEqual(run("status", "--work", str(self.tmp / "none"))[0], 1)
+        code, _, err = run("status", "--work", str(self.tmp / "none"))
+        self.assertEqual(code, 1)
+        self.assertIn("No ledger", err)
+
+    def test_contract_with_missing_file_is_an_error(self):
+        model = self.tmp / "m.glb"
+        model.write_bytes(b"x")
+        work = str(self.tmp / "w")
+        run("init", "--work", work, "--model", str(model), "--clip", "lope")
+        code, _, err = run("contract", "--work", work, "--project-contract", str(self.tmp / "missing.json"))
+        self.assertEqual(code, 1)
+        self.assertTrue(err.startswith("error: "))
+        self.assertIn("missing.json", err)
+        self.assertNotIn("Traceback", err)
 
     @requires_blender
     def test_contract_on_fixture(self):
         glb, _ = fixture_glb()
         work = str(self.tmp / "w")
         run("init", "--work", work, "--model", str(glb), "--clip", "walk")
-        code, data = run("contract", "--work", work, "--project-contract", str(FIXTURE_CONTRACT))
+        code, data, _ = run("contract", "--work", work, "--project-contract", str(FIXTURE_CONTRACT))
         self.assertEqual((code, data["ok"]), (0, True))
         self.assertEqual(run("next", "--work", work)[1]["next"], "brief")

@@ -2,6 +2,7 @@
 import argparse
 import json
 import shutil
+import subprocess
 import sys
 from pathlib import Path
 
@@ -80,7 +81,7 @@ def main(argv=None):
     args = build_parser().parse_args(argv)
     try:
         COMMANDS[args.command](args)
-    except StageError as error:
+    except (StageError, OSError, ValueError, subprocess.SubprocessError) as error:
         print(f"error: {error}", file=sys.stderr)
         return 1
     return 0

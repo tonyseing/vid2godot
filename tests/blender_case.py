@@ -16,3 +16,10 @@ def fixture_glb():
     if not glb.is_file():
         run_blender(FIXTURES / "build_test_rig.py", {"out": str(glb), "truth": str(truth)}, OUT, BLENDER)
     return glb, truth
+
+
+def bad_fixture_glb():
+    glb = OUT / "bad_rig.glb"
+    if not glb.is_file():
+        run_blender(FIXTURES / "build_bad_rig.py", {"out": str(glb)}, OUT, BLENDER)
+    return glb

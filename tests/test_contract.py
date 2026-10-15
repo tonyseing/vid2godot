@@ -61,3 +61,13 @@ class ContractTests(unittest.TestCase):
             path.write_text(json.dumps({**PROJECT, "forward": "-Z"}))
             with self.assertRaises(ContractError):
                 load_project_contract(path)
+
+    def test_malformed_or_missing_contract_file(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "c.json"
+            path.write_text("{not json")
+            with self.assertRaises(ContractError) as caught:
+                load_project_contract(path)
+            self.assertIn("c.json", str(caught.exception))
+            with self.assertRaises(ContractError):
+                load_project_contract(Path(tmp) / "absent.json")
