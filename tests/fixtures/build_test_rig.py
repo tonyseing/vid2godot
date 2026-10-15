@@ -44,28 +44,36 @@ bpy.ops.object.mode_set(mode="OBJECT")
 mesh = bpy.data.meshes.new("body")
 body = bpy.data.objects.new("body", mesh)
 scene.collection.objects.link(body)
-bm = bmesh.new()
-parts = []
+coords, faces, indices = [], [], []
 
 
-def box(center, size, group):
+def box(center, size, group, cuts=8):
+    """A box with every edge cut `cuts` times, so its outline carries vertices (the fitter's chamfer reads vertices,
+    as it would on a real, denser model)."""
+    bm = bmesh.new()
     verts = bmesh.ops.create_cube(bm, size=1.0)["verts"]
     for vert in verts:
         vert.co = Vector(center) + Vector((vert.co.x * size[0], vert.co.y * size[1], vert.co.z * size[2]))
-    parts.append((group, verts))
+    bmesh.ops.subdivide_edges(bm, edges=list(bm.edges), cuts=cuts, use_grid_fill=True)
+    bm.verts.index_update()
+    first = len(coords)
+    coords.extend(tuple(v.co) for v in bm.verts)
+    faces.extend([first + v.index for v in face.verts] for face in bm.faces)
+    indices.append((group, list(range(first, len(coords)))))
+    bm.free()
 
 
+# The parts overlap so the side silhouette is one connected shape, like a real animal's: ingest keeps only the
+# largest connected silhouette component, so a detached head or paw would vanish from the "video".
 box((-0.2, 0, 0.55), (0.2, 0.16, 0.18), "pelvis")
 box((0.1, 0, 0.55), (0.4, 0.18, 0.2), "chest")
-box((0.42, 0, 0.63), (0.18, 0.1, 0.1), "head")
+box((0.39, 0, 0.62), (0.2, 0.1, 0.1), "head")
 for key, (x, y, _) in LEGS.items():
-    box((x, y, 0.39), (0.05, 0.04, 0.22), f"upper_{key}")
+    box((x, y, 0.38), (0.05, 0.04, 0.24), f"upper_{key}")
     box((x, y, 0.17), (0.04, 0.035, 0.22), f"lower_{key}")
-    box((x + 0.03, y, 0.03), (0.08, 0.04, 0.04), f"paw_{key}")
-bm.verts.index_update()
-indices = [(group, [v.index for v in verts]) for group, verts in parts]
-bm.to_mesh(mesh)
-bm.free()
+    box((x + 0.03, y, 0.04), (0.08, 0.04, 0.06), f"paw_{key}")
+mesh.from_pydata(coords, [], faces)
+mesh.update()
 for group, members in indices:
     body.vertex_groups.new(name=group).add(members, 1.0, "REPLACE")
 material = bpy.data.materials.new("coat")
