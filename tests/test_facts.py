@@ -29,6 +29,20 @@ def joint_values(poses):
     return np.array([f["values"][2:] for f in poses["frames"]])
 
 
+def gallop_values(period, frames=120, powers=(0.6, 0.3, 0.1)):
+    """Joint angles of a short gait with harmonic content: harmonic h has power powers[h - 1] (amplitude its root)."""
+    t = np.arange(frames)
+    return np.stack([sum(math.sqrt(w) * np.sin(2 * math.pi * h * (t / period - p)) for h, w in enumerate(powers, 1))
+                     for p in PHASES.values()], axis=1)
+
+
+def analytic_values(f, period=9.6, amplitude=0.015):
+    """Every value column as a known function of (real) frame time: the root offsets are linear, so linear
+    interpolation is exact on them and they expose any error in the sample times; the joints are sines whose
+    amplitude keeps the linear-interpolation error, amplitude * (2 pi / period)^2 / 8 ~ 8.0e-4, under 1e-3."""
+    return [-0.125 * f, 0.02 * f] + [amplitude * math.sin(2 * math.pi * (f / period - p)) for p in PHASES.values()]
+
+
 class FactsTests(unittest.TestCase):
     def test_period(self):
         # Changed with fix round 1: period_frames now returns the sub-frame period (a float), not an int.
@@ -91,6 +105,33 @@ class FactsTests(unittest.TestCase):
                 self.assertEqual(entry["footfall_phase"]["paw_hl"], 0.0)
                 self.assertAlmostEqual(entry["authored_speed_mps"], 3.0, delta=0.02 * 3.0)
                 self.assertAlmostEqual(entry["stride_m"], 3.0 * truth / 24.0, delta=0.03 * 3.0 * truth / 24.0)
+
+    def test_short_harmonic_period_is_the_fundamental(self):
+        # Fix round 2: the gate is on the parabola-refined score, not on the whole-frame lag's raw score. 7.2 frames
+        # is the brief's 0.3 s gallop; 7.5 frames (0.3125 s) puts the true period halfway between whole-frame lags,
+        # where both neighbours score over PERIOD_MAX_SCORE and the old gate returned the double period (~15).
+        for truth in (7.2, 7.5):
+            with self.subTest(period=truth):
+                self.assertAlmostEqual(facts.period_frames(gallop_values(truth), 24.0), truth, delta=0.15)
+
+    def test_cycle_samples_the_clip_at_its_period(self):
+        # Fix round 2: the bake (Task 11) keys cycle.frames, so check them against the analytic clip.
+        poses = synthetic(frames=120, period=9.6)
+        for entry in poses["frames"]:
+            entry["values"] = analytic_values(entry["index"])
+        result = facts.clip_facts(poses, PROJECT, LOPE)
+        cycle = result["cycle"]
+        period, start, keys = cycle["periodFrames"], cycle["start"], cycle["frames"]
+        n = len(keys) - 1
+        self.assertAlmostEqual(period, 9.6, delta=0.1)
+        self.assertEqual(n, 10)
+        self.assertEqual(n, result["entry"]["frames"])
+        for k in range(n):
+            np.testing.assert_allclose(keys[k], analytic_values(start + k * period / n), rtol=0, atol=1e-3,
+                                       err_msg=f"cycle frame {k}")
+        self.assertEqual(keys[n], keys[0])
+        self.assertAlmostEqual(cycle["fps"], n * 24.0 / period, delta=1e-9)
+        self.assertAlmostEqual(result["entry"]["fps"], cycle["fps"], delta=1e-9)
 
     def test_no_full_cycle_in_range(self):
         values = joint_values(synthetic(frames=50, period=30))

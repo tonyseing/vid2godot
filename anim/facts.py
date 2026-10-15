@@ -15,9 +15,10 @@ def period_frames(values, fps, min_s=0.25, max_s=2.5):
     """The fundamental period in frames, at sub-frame precision.
 
     The lag score (mean squared difference between the clip and itself shifted by the lag) is normalised by twice the
-    mean total variance, so 0 is a perfect repeat and about 1 is no relation. The first local minimum in range below
-    PERIOD_MAX_SCORE is the fundamental (its multiples come later); a parabola through it and its neighbours gives the
-    sub-frame period."""
+    mean total variance, so 0 is a perfect repeat and about 1 is no relation. A parabola through each whole-frame local
+    minimum and its neighbours gives the sub-frame period and the score there; the first local minimum in range whose
+    refined score is below PERIOD_MAX_SCORE is the fundamental (its multiples come later). Gating on the refined score,
+    not the whole-frame one, keeps a short period that falls between frames from losing to its double."""
     x = values - values.mean(axis=0)
     low, high = max(2, int(np.ceil(min_s * fps))), min(int(max_s * fps), len(x) // 2)
     if high < low + 1:
@@ -27,10 +28,13 @@ def period_frames(values, fps, min_s=0.25, max_s=2.5):
               for lag in range(low - 1, high + 2) if 0 < lag < len(x)}
     for lag in range(low, high + 1):
         before, here, after = scores.get(lag - 1, np.inf), scores[lag], scores.get(lag + 1, np.inf)
-        if here < PERIOD_MAX_SCORE and here <= before and here <= after:
+        if here <= before and here <= after:
             curve = before - 2 * here + after
-            offset = 0.5 * (before - after) / curve if np.isfinite(curve) and curve > 0 else 0.0
-            return float(lag + min(0.5, max(-0.5, offset)))
+            fitted = np.isfinite(curve) and curve > 0
+            vertex = here - (before - after) ** 2 / (8 * curve) if fitted else here
+            if vertex < PERIOD_MAX_SCORE:
+                offset = 0.5 * (before - after) / curve if fitted else 0.0
+                return float(lag + min(0.5, max(-0.5, offset)))
     raise FactsError(f"no full cycle found between {min_s} s and {max_s} s; the clip must hold at least two cycles")
 
 
