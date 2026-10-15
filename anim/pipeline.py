@@ -9,15 +9,20 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 from anim import brief as brief_mod  # noqa: E402
 from anim import contract as contract_mod  # noqa: E402
+from anim import generate as generate_mod  # noqa: E402
 from anim import reference as reference_mod  # noqa: E402
 from anim.blender_run import run_blender  # noqa: E402
 from anim.ledger import Ledger, StageError  # noqa: E402
+from anim.openrouter import Client  # noqa: E402
 
 COMMANDS = {}
 ARGS = {"init": [("--model", {"required": True, "type": Path}), ("--clip", {"required": True})],
         "status": [], "next": [],
         "contract": [("--project-contract", {"required": True, "type": Path})],
-        "brief": [("--file", {"required": True, "type": Path})], "reference": []}
+        "brief": [("--file", {"required": True, "type": Path})], "reference": [],
+        "generate": [("--model-id", {"required": True}), ("--candidates", {"type": int, "default": 2}),
+                     ("--seed", {"type": int, "default": 1000}), ("--max-cost", {"type": float})],
+        "accept": [("--candidate", {"required": True, "type": int}), ("--checks", {"required": True, "type": Path})]}
 
 
 def command(name):
@@ -105,6 +110,35 @@ def cmd_reference(a):
                   {"image": folder / "reference.png", "mask": folder / "mask.png", "meta": folder / "reference.json"},
                   {"background": colour})
     emit({"ok": True, "background": colour, "contrast": report, "image": str(folder / "reference.png")})
+
+
+@command("generate")
+def cmd_generate(a):
+    ledger = Ledger(a.work)
+    brief = load_json(ledger.output("brief", "brief"))
+    meta = load_json(ledger.output("reference", "meta"))
+    folder = ledger.work / "generate"
+    record = generate_mod.run_generate(Client(), folder, a.model_id, brief, ledger.output("reference", "image"),
+                                       meta["background"], candidates=a.candidates, seed=a.seed, max_cost=a.max_cost)
+    outputs = {"record": folder / "record.json"}
+    outputs.update({f"candidate{c['index']}": Path(c["video"]) for c in record["candidates"]})
+    ledger.record("generate", {"image": ledger.output("reference", "image")}, outputs,
+                  {"model": a.model_id, "spentUsd": record["spentUsd"]})
+    emit({"ok": True, "spentUsd": record["spentUsd"], "strips": [c["strip"] for c in record["candidates"]],
+          "next": "Open every strip and several full frames of each candidate, then run `accept`."})
+
+
+@command("accept")
+def cmd_accept(a):
+    ledger = Ledger(a.work)
+    record = load_json(ledger.output("generate", "record"))
+    accepted = generate_mod.accept(record, a.candidate, load_json(a.checks))
+    folder = ledger.work / "generate"
+    shutil.copyfile(a.checks, folder / "checks.json")
+    (folder / "accepted.json").write_text(json.dumps(accepted, indent=2))
+    ledger.record("accept", {"checks": folder / "checks.json", "video": Path(accepted["candidate"]["video"])},
+                  {"accepted": folder / "accepted.json"}, {"candidate": a.candidate})
+    emit({"ok": True, "video": accepted["candidate"]["video"]})
 
 
 def build_parser():
