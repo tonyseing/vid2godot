@@ -7,14 +7,17 @@ import sys
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
+from anim import brief as brief_mod  # noqa: E402
 from anim import contract as contract_mod  # noqa: E402
+from anim import reference as reference_mod  # noqa: E402
 from anim.blender_run import run_blender  # noqa: E402
 from anim.ledger import Ledger, StageError  # noqa: E402
 
 COMMANDS = {}
 ARGS = {"init": [("--model", {"required": True, "type": Path}), ("--clip", {"required": True})],
         "status": [], "next": [],
-        "contract": [("--project-contract", {"required": True, "type": Path})]}
+        "contract": [("--project-contract", {"required": True, "type": Path})],
+        "brief": [("--file", {"required": True, "type": Path})], "reference": []}
 
 
 def command(name):
@@ -63,6 +66,45 @@ def cmd_contract(a):
     ledger.record("contract", {"projectContract": folder / "project-contract.json"},
                   {"rig": folder / "rig.json", "report": folder / "report.json"}, {"warnings": warnings})
     emit({"ok": True, "warnings": warnings})
+
+
+def project_contract(ledger):
+    return contract_mod.load_project_contract(ledger.output("contract", "rig").parent / "project-contract.json")
+
+
+def load_json(path):
+    return json.loads(Path(path).read_text())
+
+
+@command("brief")
+def cmd_brief(a):
+    ledger = Ledger(a.work)
+    brief = brief_mod.load_brief(a.file, project_contract(ledger), ledger.clip)
+    folder = ledger.work / "brief"
+    folder.mkdir(exist_ok=True)
+    shutil.copyfile(a.file, folder / "source.json")
+    (folder / "brief.json").write_text(json.dumps(brief, indent=2))
+    ledger.record("brief", {"source": folder / "source.json"}, {"brief": folder / "brief.json"})
+    emit({"ok": True, "brief": brief})
+
+
+@command("reference")
+def cmd_reference(a):
+    ledger = Ledger(a.work)
+    brief = load_json(ledger.output("brief", "brief"))
+    folder = ledger.work / "reference"
+    folder.mkdir(exist_ok=True)
+    result = run_blender("render_reference", {"model": str(ledger.model), "outDir": str(folder),
+                                              "backgrounds": brief["backgrounds"]}, folder, a.blender)
+    mask = reference_mod.model_mask(result["mask"])
+    colour, report = reference_mod.choose_background({c: Path(p) for c, p in result["renders"].items()}, mask)
+    shutil.copyfile(result["renders"][colour], folder / "reference.png")
+    (folder / "reference.json").write_text(json.dumps({"camera": result["camera"], "background": colour,
+                                                       "contrast": report}, indent=2))
+    ledger.record("reference", {"brief": ledger.output("brief", "brief")},
+                  {"image": folder / "reference.png", "mask": folder / "mask.png", "meta": folder / "reference.json"},
+                  {"background": colour})
+    emit({"ok": True, "background": colour, "contrast": report, "image": str(folder / "reference.png")})
 
 
 def build_parser():

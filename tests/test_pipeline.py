@@ -55,3 +55,19 @@ class PipelineTests(unittest.TestCase):
         code, data, _ = run("contract", "--work", work, "--project-contract", str(FIXTURE_CONTRACT))
         self.assertEqual((code, data["ok"]), (0, True))
         self.assertEqual(run("next", "--work", work)[1]["next"], "brief")
+
+    @requires_blender
+    def test_brief_and_reference_on_fixture(self):
+        glb, _ = fixture_glb()
+        work = str(self.tmp / "w")
+        brief = self.tmp / "brief.json"
+        brief.write_text(json.dumps({"clip": "walk", "subject": "box quadruped", "motion": "walking",
+                                     "gait": "4-beat lateral walk", "loop": True, "planar": True,
+                                     "videoSeconds": 5}))
+        run("init", "--work", work, "--model", str(glb), "--clip", "walk")
+        run("contract", "--work", work, "--project-contract", str(FIXTURE_CONTRACT))
+        self.assertEqual(run("brief", "--work", work, "--file", str(brief))[0], 0)
+        code, data, _ = run("reference", "--work", work)
+        self.assertEqual((code, data["background"]), (0, "#c8c8c8"))
+        self.assertTrue((Path(work) / "reference" / "reference.png").is_file())
+        self.assertEqual(run("next", "--work", work)[1]["next"], "generate")
