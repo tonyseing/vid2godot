@@ -68,17 +68,20 @@ def cadence(unique, n_total, container_fps):
 
     A run starts at each unique index and lasts until the next one. Runs longer than twice the median run are holds
     (real stillness), left out of the rate estimate: content rate = container rate * runs / frames over the steady
-    runs, snapped. If that equals the container rate (within 3%) the video is native: keep every frame at the container
-    rate, held frames included. Otherwise it is pulldown: keep the first frame of each run at the content rate.
+    runs. The video is pulldown only when there are at least 2 steady runs and that rate snaps (within 3%) to a standard
+    rate in FRAME_RATES that differs (by more than 3%) from the container rate: then keep the first frame of each run
+    at the standard rate. Everything else is native (a few stray repeats, a frozen clip, one or two unique frames):
+    keep every frame at the container rate, held frames included.
     """
     starts = list(unique)
     runs = np.diff(starts + [n_total])
     steady = runs[runs <= 2 * float(np.median(runs))]
     rate = snap_rate(container_fps * len(steady) / float(steady.sum()))
-    if abs(rate - container_fps) / container_fps <= 0.03:
-        keep, fps = list(range(n_total)), float(container_fps)
-    else:
+    standard = rate in FRAME_RATES
+    if len(steady) >= 2 and standard and abs(rate - container_fps) / container_fps > 0.03:
         keep, fps = starts, float(rate)
+    else:
+        keep, fps = list(range(n_total)), float(container_fps)
     return keep, fps, [i / container_fps for i in keep]
 
 

@@ -90,6 +90,37 @@ class IngestUnitTests(unittest.TestCase):
         self.assertEqual(fps, 30.0)
         self.assertEqual(times, [i / 30.0 for i in range(30)])
 
+    def native_with_repeats(self, n, repeats):
+        """A native clip of n frames, every frame moving, except that each frame in repeats repeats the one before."""
+        content, c = [], 0
+        for i in range(n):
+            if i and i not in repeats:
+                c += 1
+            content.append(c)
+        return [frame(40 + 2 * c, w=640) for c in content]
+
+    def assert_native(self, clip, fps):
+        keep, out_fps, times = ingest.cadence(ingest.unique_indices(clip), len(clip), fps)
+        self.assertEqual(keep, list(range(len(clip))), "native keeps every frame")
+        self.assertEqual(out_fps, fps)
+        self.assertEqual(times, [i / fps for i in range(len(clip))])
+
+    def test_native_24_one_stray_repeat_per_second_kept_whole(self):
+        clip = self.native_with_repeats(48, {12, 36})
+        self.assertEqual(len(ingest.unique_indices(clip)), 46)
+        self.assert_native(clip, 24.0)
+
+    def test_native_24_three_scattered_repeats_kept_whole(self):
+        clip = self.native_with_repeats(96, {17, 50, 81})
+        self.assertEqual(len(ingest.unique_indices(clip)), 93)
+        self.assert_native(clip, 24.0)
+
+    def test_all_identical_frames_kept_at_container_rate(self):
+        self.assert_native([frame(40)] * 24, 24.0)
+        self.assert_native([frame(40)] * 30, 30.0)
+        # One run of 5 at 60 fps would read as 12 fps, a standard rate: one run is never enough for pulldown.
+        self.assert_native([frame(40)] * 5, 60.0)
+
     def test_rate_not_snapped_when_far(self):
         self.assertAlmostEqual(ingest.true_rate(20, 60, 60.0), 20.0)
 
