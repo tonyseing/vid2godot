@@ -128,6 +128,31 @@ class IngestUnitTests(unittest.TestCase):
         self.assertEqual(len(ingest.unique_indices(clip)), 93)
         self.assert_native(clip, 24.0)
 
+    def test_native_24_irregular_repeats_kept_whole(self):
+        # 12.5% duplicates, clustered at the start: no regular cadence, so native.
+        clip = self.native_with_repeats(48, {3, 5, 7, 9, 11, 13})
+        self.assertEqual(len(ingest.unique_indices(clip)), 42)
+        self.assert_native(clip, 24.0)
+        # The ruling's example: paired repeats make runs of 3, holds, so no steady duplicates at all.
+        clip = self.native_with_repeats(48, {3, 4, 11, 12, 30, 31})
+        self.assertEqual(len(ingest.unique_indices(clip)), 42)
+        self.assert_native(clip, 24.0)
+
+    def test_two_pose_clip_kept_whole(self):
+        clip = [frame(40, w=640)] * 12 + [frame(100, w=640)] * 12
+        self.assertEqual(ingest.unique_indices(clip), [0, 12])
+        self.assert_native(clip, 24.0)
+
+    def test_native_30_ten_percent_even_repeats_reads_as_pulldown(self):
+        # Exactly 10% duplicates (1 - 54/60 rounds to 0.0999...), evenly placed: the boundary reads as pulldown.
+        clip = self.native_with_repeats(60, {5, 15, 25, 35, 45, 55})
+        unique = ingest.unique_indices(clip)
+        self.assertEqual(len(unique), 54)
+        keep, fps, times = ingest.cadence(unique, len(clip), 30.0)
+        self.assertEqual(keep, unique)
+        self.assertEqual(fps, 27.0)
+        self.assertEqual(times, [i / 30.0 for i in keep])
+
     def test_all_identical_frames_kept_at_container_rate(self):
         self.assert_native([frame(40)] * 24, 24.0)
         self.assert_native([frame(40)] * 30, 30.0)

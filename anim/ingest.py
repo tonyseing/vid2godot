@@ -13,6 +13,8 @@ from anim.reference import model_mask
 FRAME_RATES = (12, 15, 24, 25, 30, 48, 50, 60)
 # The least share of repeated frames in the steady runs that reads as pulldown (24-in-30 repeats 20%).
 PULLDOWN_MIN_DUPLICATES = 0.10
+# The fewest steady runs that can show a cadence (two poses are not pulldown).
+PULLDOWN_MIN_RUNS = 8
 
 
 class IngestError(StageError):
@@ -65,28 +67,51 @@ def true_rate(n_unique, n_total, container_fps):
     return snap_rate(container_fps * n_unique / n_total)
 
 
+def regular_cadence(starts, steady, step):
+    """Each steady run starts within 1 container frame of the grid s_0 + k * step. A hold splits the steady runs into
+    segments; each segment is checked from its own first start."""
+    first, k = None, 0
+    for s, ok in zip(starts, steady):
+        if not ok:
+            first = None
+            continue
+        if first is None:
+            first, k = s, 0
+        if abs(s - first - k * step) > 1.0 + 1e-9:
+            return False
+        k += 1
+    return True
+
+
 def cadence(unique, n_total, container_fps):
     """Which frames to keep, their rate and their times (s), from the runs of identical frames.
 
     A run starts at each unique index and lasts until the next one. Runs longer than twice the median run are holds
-    (real stillness), left out of the estimate. The steady region (the remaining runs) is pulldown iff it has at least
-    2 runs and its duplicate fraction, 1 - runs / frames, is at least PULLDOWN_MIN_DUPLICATES: then keep the first frame
-    of each run (holds included) at snap_rate(container rate * runs / frames). A rate that does not snap, such as 16 or
-    20, is kept as computed. Everything else is native (no or a few stray repeats, a frozen clip, a single run): keep
-    every frame at the container rate, held frames included.
+    (real stillness), left out of the estimate. The steady region (the remaining runs) is pulldown iff all of:
+    - it has at least PULLDOWN_MIN_RUNS runs;
+    - its duplicate fraction, 1 - runs / frames, is at least PULLDOWN_MIN_DUPLICATES (with a 1e-9 float allowance);
+    - its cadence is regular: with step = container rate / rate, every steady run start s_k lies within 1 container
+      frame of s_0 + k * step, each segment between holds checked from its own first start.
+    Then keep the first frame of each run (holds included) at rate = snap_rate(container rate * runs / frames). A rate
+    that does not snap, such as 16 or 20, is kept as computed. Everything else is native (no or a few stray repeats,
+    irregular repeats, a frozen clip, few runs): keep every frame at the container rate, held frames included.
 
     Known limits, from run counts alone: 24-in-25 repeats only 4% of frames, so it stays native (every frame kept at
-    25); and native 30 with every 5th frame repeated is indistinguishable from 24-in-30, so it reads as 24.
+    25); native 30 with every 5th frame repeated is indistinguishable from 24-in-30, so it reads as 24; and more
+    generally a near-periodic sprinkle of sub-tolerance repeats (10% or more) in native footage is indistinguishable
+    from pulldown, so it reads as pulldown at the lower rate.
     """
     starts = list(unique)
     runs = np.diff(starts + [n_total])
-    steady = runs[runs <= 2 * float(np.median(runs))]
+    is_steady = runs <= 2 * float(np.median(runs))
+    steady = runs[is_steady]
     duplicates = 1.0 - len(steady) / float(steady.sum())
-    if len(steady) >= 2 and duplicates >= PULLDOWN_MIN_DUPLICATES:
-        keep, fps = starts, float(snap_rate(container_fps * len(steady) / float(steady.sum())))
-    else:
-        keep, fps = list(range(n_total)), float(container_fps)
-    return keep, fps, [i / container_fps for i in keep]
+    if len(steady) >= PULLDOWN_MIN_RUNS and duplicates >= PULLDOWN_MIN_DUPLICATES - 1e-9:
+        fps = float(snap_rate(container_fps * len(steady) / float(steady.sum())))
+        if regular_cadence(starts, is_steady, container_fps / fps):
+            return starts, fps, [i / container_fps for i in starts]
+    keep = list(range(n_total))
+    return keep, float(container_fps), [i / container_fps for i in keep]
 
 
 def background_colour(img, border=8):
