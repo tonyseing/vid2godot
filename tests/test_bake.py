@@ -11,10 +11,11 @@ from anim.blender_run import run_blender
 from anim.contract import load_project_contract
 from anim.ledger import Ledger
 from PIL import Image
-from tests.blender_case import BLENDER, FIXTURE_CONTRACT, fixture_glb, requires_blender
+from tests.blender_case import BLENDER, FIXTURE_CONTRACT, FIXTURES, fixture_glb, requires_blender
 from tests.test_pipeline import run
 
 WIDTH = {"SCALAR": 1, "VEC3": 3, "VEC4": 4}
+PROBE = FIXTURES / "probe_pelvis.py"
 
 
 def read_glb(path):
@@ -51,16 +52,52 @@ def channels(path):
     return out, rest
 
 
-def fixture_cycle(n=24, fps=24.0, period=23.6):
+def wave(k, n, amplitude, phase=0.0):
+    return amplitude * np.cos(2 * np.pi * k / n + phase)
+
+
+def fixture_cycle(n=24, fps=24.0, period=23.6, dx=None, dz=None):
     """A cycle block like facts.json's, keyed from the fixture walk's known angles: a sub-frame period, so the
-    cycle's rate is not an integer."""
+    cycle's rate is not an integer. The pelvis travels `dx(k)` forward and `dz(k)` up at key k; key n is one period
+    on (the travel continues; the bones repeat key 0)."""
+    dx = dx or (lambda k: 0.01 * k + wave(k, n, 0.004))
+    dz = dz or (lambda k: wave(k, n, 0.005, -np.pi / 2))          # 0.005 sin(2 pi k / n)
     _, truth_path = fixture_glb()
     truth = json.loads(truth_path.read_text())
     bones = [b for chain in load_project_contract(FIXTURE_CONTRACT)["chains"].values() for b in chain]
-    keys = [[0.01 * k, 0.0] + [truth[str(k)].get(b, 0.0) for b in bones] for k in range(n)]
-    keys.append(list(keys[0]))                     # a loop's last key equals its first
+    keys = [[float(dx(k)), float(dz(k))] + [truth[str(k)].get(b, 0.0) for b in bones] for k in range(n)]
+    keys.append([float(dx(n)), float(dz(n))] + keys[0][2:])
     return bones, ["dx", "dz"] + bones, {"frames": keys, "fps": n * fps / period, "periodFrames": period,
                                          "start": 3.25}
+
+
+def in_place(dx, loop):
+    """The expected in-place forward offsets for keys 0..n, computed independently of the bake: a loop loses the
+    least-squares line through keys 0..n-1 (zero mean, zero slope) and its key n repeats key 0; a one-shot loses
+    only the mean over keys 0..n-1."""
+    dx = np.asarray(dx, float)
+    n = len(dx) - 1
+    k = np.arange(n + 1)
+    if not loop:
+        return dx - dx[:n].mean()
+    slope, intercept = np.polyfit(k[:n], dx[:n], 1)
+    out = dx - (slope * k + intercept)
+    out[n] = out[0]
+    return out
+
+
+def bake(tmp, cycle, bones, names, loop=True):
+    """Bake `cycle` onto the fixture rig; return the bake result, the eval GLB path and the pelvis head's world
+    displacement from rest at each key 0..n, measured on a fresh re-import of the GLB."""
+    glb, _ = fixture_glb()
+    (tmp / "facts.json").write_text(json.dumps({"cycle": cycle}))
+    out = tmp / "eval.glb"
+    result = run_blender("bake_clip", {"model": str(glb), "out": str(out), "cycle": str(tmp / "facts.json"),
+                                       "clip": "walk_fit", "loop": loop, "pelvisBone": "pelvis",
+                                       "bones": bones, "names": names}, tmp, BLENDER)
+    probe = run_blender(PROBE, {"model": str(out), "fps": cycle["fps"], "clip": "walk_fit", "bone": "pelvis",
+                                "keys": len(cycle["frames"]) - 1}, tmp / "probe", BLENDER)
+    return result, out, np.array(probe["displacement"])
 
 
 @requires_blender
@@ -72,16 +109,12 @@ class BakeTests(unittest.TestCase):
         rate = cycle["fps"]
         with tempfile.TemporaryDirectory() as tmp:
             tmp = Path(tmp)
-            (tmp / "facts.json").write_text(json.dumps({"cycle": cycle}))
-            out = tmp / "eval.glb"
-            result = run_blender("bake_clip", {"model": str(glb), "out": str(out), "cycle": str(tmp / "facts.json"),
-                                               "clip": "walk_fit", "loop": True, "pelvisBone": "pelvis",
-                                               "bones": bones, "names": names}, tmp, BLENDER)
+            result, out, moves = bake(tmp, cycle, bones, names)
             self.assertIn("walk", result["actions"])
             first, last = result["actions"]["walk_fit"]
             self.assertAlmostEqual(first, 0.0, places=4)
             self.assertAlmostEqual(last, float(n), places=4)
-            baked, rest = channels(out)
+            baked, _ = channels(out)
             original, _ = channels(glb)
             fit = baked["walk_fit"]
             # Godot's clip length: key k at k / cycle fps, so n / cycle fps = period / fps.
@@ -96,15 +129,42 @@ class BakeTests(unittest.TestCase):
                 np.testing.assert_allclose(np.abs(np.sum(got[:n] * want[:n], axis=1)), 1.0, atol=1e-5,
                                            err_msg=bone)
                 np.testing.assert_allclose(got[n], got[0], atol=1e-6)            # the seam closes
-            # In place: the pelvis offsets (0.01 k m along X) lose their mean over keys 0..n-1.
-            _, moves, _ = fit[("pelvis", "translation")]
-            np.testing.assert_allclose(np.linalg.norm(moves[:n] - moves[0], axis=1), 0.01 * np.arange(n), atol=1e-5)
-            np.testing.assert_allclose(moves[:n].mean(axis=0), rest["pelvis"], atol=1e-5)
+            # In place, in world axes: the pelvis head moves forward (+X) by the in-place dx, up (+Z) by dz, and
+            # never sideways (Y), measured on the re-imported GLB.
+            dx = [values[0] for values in cycle["frames"]]
+            dz = [values[1] for values in cycle["frames"][:n]] + [cycle["frames"][0][1]]
+            np.testing.assert_allclose(moves[:, 0], in_place(dx, True), atol=1e-4, err_msg="forward")
+            np.testing.assert_allclose(moves[:, 2], dz, atol=1e-4, err_msg="up")
+            np.testing.assert_allclose(moves[:, 1], 0.0, atol=1e-4, err_msg="lateral")
+            self.assertGreater(np.ptp(moves[:, 0]), 0.005)                  # the checks are not vacuous
+            self.assertGreater(np.ptp(moves[:, 2]), 0.005)
             # The other clips are kept: same key times (the GLB's length) and the same values.
             for channel, (want_times, want, _) in original["walk"].items():
                 got_times, got, _ = baked["walk"][channel]
                 np.testing.assert_allclose(got_times, want_times, atol=1e-5, err_msg=str(channel))
                 np.testing.assert_allclose(got, want, atol=1e-5, err_msg=str(channel))
+
+    def test_loop_removes_drift_so_the_seam_does_not_pop(self):
+        # The camera tracked a little slower than the creature: dx drifts 0.002 m a key on top of its periodic sway.
+        n = 24
+        sway = [wave(k, n, 0.001) for k in range(n + 1)]
+        step = max(abs(sway[k + 1] - sway[k]) for k in range(n))
+        bones, names, cycle = fixture_cycle(n, dx=lambda k: 0.002 * k + wave(k, n, 0.001), dz=lambda k: 0.0)
+        with tempfile.TemporaryDirectory() as tmp:
+            _, _, moves = bake(Path(tmp), cycle, bones, names)
+        forward = moves[:, 0]
+        self.assertLessEqual(abs(forward[n - 1] - forward[0]), step + 1e-6, "a pop at the seam")
+        self.assertAlmostEqual(forward[n], forward[0], places=5)
+        np.testing.assert_allclose(forward, in_place([v[0] for v in cycle["frames"]], True), atol=1e-4)
+
+    def test_one_shot_removes_only_the_mean(self):
+        n = 24
+        bones, names, cycle = fixture_cycle(n, dx=lambda k: 0.002 * k, dz=lambda k: 0.0)
+        with tempfile.TemporaryDirectory() as tmp:
+            _, _, moves = bake(Path(tmp), cycle, bones, names, loop=False)
+        dx = [values[0] for values in cycle["frames"]]
+        np.testing.assert_allclose(moves[:, 0], in_place(dx, False), atol=1e-4)
+        self.assertAlmostEqual(moves[n, 0] - moves[0, 0], 0.002 * n, places=4)   # a one-shot keeps its travel shape
 
     def test_bake_command_writes_glb_sheet_and_closeup(self):
         glb, _ = fixture_glb()

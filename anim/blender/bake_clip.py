@@ -33,11 +33,18 @@ arm.animation_data.action = action
 frames = [list(values) for values in cycle["frames"]]
 if args["loop"]:
     frames[-1] = frames[0]                       # the last key equals the first: a seamless loop
-mean_dx = float(np.mean([values[0] for values in frames[:-1]]))
+# In place: a loop loses the least-squares line through dx over keys 0..n-1 (zero mean and zero slope), so a camera
+# that tracked slightly off the creature's speed leaves no pop at the seam; a one-shot loses only the mean.
+keys = np.arange(len(frames) - 1, dtype=float)
+dx = np.array([values[0] for values in frames[:-1]], float)
+slope, intercept = np.polyfit(keys, dx, 1) if args["loop"] and len(dx) > 1 else (0.0, float(dx.mean()))
+forward = [float(values[0] - (slope * key + intercept)) for key, values in enumerate(frames)]
+if args["loop"]:
+    forward[-1] = forward[0]
 pelvis = args["pelvisBone"]
-to_pelvis = rigutil.rest_rotation(arm, pelvis).inverted()
+to_pelvis = rigutil.rest_rotation(arm, pelvis).inverted()      # world (Blender: +X forward, +Z up) to pelvis-local
 for key, values in enumerate(frames):
-    arm.pose.bones[pelvis].location = to_pelvis @ Vector((values[0] - mean_dx, 0.0, values[1]))
+    arm.pose.bones[pelvis].location = to_pelvis @ Vector((forward[key], 0.0, values[1]))
     arm.pose.bones[pelvis].keyframe_insert("location", frame=key)
     for name, axis in zip(bones, axes):
         rigutil.set_angle(arm, name, axis, values[index[name]])

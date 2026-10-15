@@ -5,6 +5,7 @@ import numpy as np
 from PIL import Image
 
 from anim.camera import SideCamera
+from anim.ledger import StageError
 
 
 def game_camera(bounds, px_per_m, width=1280, height=800):
@@ -21,6 +22,8 @@ def compose(paths, background_hex, out, margin=8):
     union = np.zeros(images[0].shape[:2], bool)
     for image in images:
         union |= np.abs(image.astype(int) - target).sum(axis=2) > 12
+    if not union.any():
+        raise StageError("The sheet render shows nothing but background; check the model is in frame and visible")
     rows, cols = np.nonzero(union.any(axis=1))[0], np.nonzero(union.any(axis=0))[0]
     v0, v1 = max(rows.min() - margin, 0), min(rows.max() + 1 + margin, union.shape[0])
     u0, u1 = max(cols.min() - margin, 0), min(cols.max() + 1 + margin, union.shape[1])

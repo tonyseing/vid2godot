@@ -6,6 +6,7 @@ import numpy as np
 from PIL import Image
 
 from anim import sheet
+from anim.ledger import StageError
 
 
 class SheetTests(unittest.TestCase):
@@ -22,6 +23,15 @@ class SheetTests(unittest.TestCase):
             with Image.open(out) as image:
                 self.assertEqual(image.height, 20 + 16)
                 self.assertEqual(image.width, 3 * (60 + 16))
+
+    def test_compose_of_only_background_is_a_stage_error(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            pixels = np.zeros((100, 200, 3), np.uint8)
+            pixels[:] = (0x6b, 0x5b, 0x9f)
+            path = Path(tmp) / "0.png"
+            Image.fromarray(pixels).save(path)
+            with self.assertRaisesRegex(StageError, "nothing but background"):
+                sheet.compose([path], "#6b5b9f", Path(tmp) / "sheet.png")
 
     def test_game_camera_puts_ground_at_78_percent(self):
         cam = sheet.game_camera({"min": [-0.8, -0.2, 0.0], "max": [0.8, 0.2, 1.0]}, 75.0)
