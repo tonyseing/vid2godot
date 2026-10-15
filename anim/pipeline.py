@@ -341,7 +341,8 @@ def cmd_verify(a):
         report = verify_mod.run_verify(script, glb, ledger.work / "verify" / prefix, engine, a.launcher)
         # The clip's length tolerance is 1.5 frames at the baked clip's own (resampled) rate, not the ingest rate.
         problems += [f"[{prefix}] {p}" for p in verify_mod.check_report(
-            report, sha256_file(glb), ledger.clip, facts["entry"]["duration_s"], facts["cycle"]["fps"], prefix)]
+            report, sha256_file(glb), ledger.clip, facts["entry"]["duration_s"], facts["cycle"]["fps"], prefix,
+            launcher_used=True)]
         outputs[f"report{prefix.replace('.', '')}"] = ledger.work / "verify" / prefix / "godot-report.json"
     if problems:
         raise StageError("Godot verification failed:\n- " + "\n- ".join(problems))
@@ -368,6 +369,22 @@ def cmd_export(a):
              "ledger.json": ledger.path}
     if "audio" in ledger.require("ingest")["outputs"]:
         files["candidate-audio.wav"] = ledger.output("ingest", "audio")
+    for prefix in ("4.7", "4.5"):
+        report = load_json(ledger.output("verify", f"report{prefix.replace('.', '')}"))
+        for item in report.get("captures") or []:
+            path = Path(item["path"])
+            name = f"captures/{prefix}/{path.name}"
+            if name in files:
+                raise StageError(f"Two {prefix} captures share the name {path.name}")
+            if "sha256" in item and (not path.is_file() or sha256_file(path) != item["sha256"]):
+                raise StageError(f"Capture changed or missing since verify: {path}")
+            files[name] = path
+    lab = ledger.require("review")["inputs"].get("lab")
+    if lab is None:
+        raise StageError("The review recorded no lab; run `review --template` and review again")
+    files["lab.html"] = lab["path"]
+    for overlay in sorted((Path(lab["path"]).parent / "overlays").glob("*.png")):
+        files[f"overlays/{overlay.name}"] = overlay
     out = verify_mod.export_bundle({k: Path(v) for k, v in files.items()}, a.destination)
     emit({"ok": True, "bundle": str(out),
           "next": "Show the owner the sheet, close-up, captures and lab; ship only after explicit approval."})
