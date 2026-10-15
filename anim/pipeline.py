@@ -9,6 +9,7 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 from anim import brief as brief_mod  # noqa: E402
 from anim import contract as contract_mod  # noqa: E402
+from anim import facts as facts_mod  # noqa: E402
 from anim import generate as generate_mod  # noqa: E402
 from anim import ingest as ingest_mod  # noqa: E402
 from anim import raster as raster_mod  # noqa: E402
@@ -28,7 +29,7 @@ ARGS = {"init": [("--model", {"required": True, "type": Path}), ("--clip", {"req
         "accept": [("--candidate", {"required": True, "type": int}), ("--checks", {"required": True, "type": Path})],
         "ingest": [("--work-scale", {"type": float, "default": 0.5})],
         "gridframe": [("--frame", {"required": True, "type": int})],
-        "fit": [("--marks", {"type": Path}), ("--span", {})]}
+        "fit": [("--marks", {"type": Path}), ("--span", {})], "facts": []}
 
 
 def command(name):
@@ -204,6 +205,21 @@ def cmd_fit(a):
                    "report": folder / "report.json"}, {"meanIoU": report["meanIoU"], "lowFrames": report["lowFrames"]})
     emit({"ok": True, "meanIoU": report["meanIoU"], "lowFrames": report["lowFrames"],
           "next": "Run `lab`, open the overlay of every low frame, mark or refit, then run `facts`."})
+
+
+@command("facts")
+def cmd_facts(a):
+    ledger = Ledger(a.work)
+    brief = load_json(ledger.output("brief", "brief"))
+    result = facts_mod.clip_facts(load_json(ledger.output("fit", "poses")), project_contract(ledger), brief)
+    folder = ledger.work / "facts"
+    folder.mkdir(exist_ok=True)
+    (folder / "facts.json").write_text(json.dumps(result, indent=2))
+    (folder / "anim-entry.json").write_text(json.dumps({ledger.clip: result["entry"]}, indent=2))
+    ledger.record("facts", {"poses": ledger.output("fit", "poses")},
+                  {"facts": folder / "facts.json", "entry": folder / "anim-entry.json"},
+                  {"speedMps": result["speedMps"], "period": result["period"], "warnings": result["warnings"]})
+    emit({"ok": True, **{k: result[k] for k in ("start", "period", "speedMps", "strideM", "warnings")}})
 
 
 def build_parser():
