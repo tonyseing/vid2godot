@@ -1,5 +1,6 @@
 """The motion brief: which clip to make, how it moves and how to judge the fit."""
 import json
+import math
 import re
 from pathlib import Path
 
@@ -44,8 +45,8 @@ def load_brief(path, project, clip):
     if not isinstance(brief["aspectRatio"], str) or not re.fullmatch(r"\d+:\d+", brief["aspectRatio"]):
         raise BriefError("aspectRatio must look like '16:9'")
     speed = brief["targetSpeedMps"]
-    if speed is not None and (not is_number(speed) or speed <= 0):
-        raise BriefError("targetSpeedMps must be null or a number above 0")
+    if speed is not None and (not is_number(speed) or not math.isfinite(speed) or speed <= 0):
+        raise BriefError("targetSpeedMps must be null or a finite number above 0")
     chains = brief["fitChains"]
     if chains is None:
         chains = list(project["chains"])
