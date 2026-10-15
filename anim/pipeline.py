@@ -16,9 +16,10 @@ from anim import raster as raster_mod  # noqa: E402
 from anim import reference as reference_mod  # noqa: E402
 from anim import review as review_mod  # noqa: E402
 from anim import sheet as sheet_mod  # noqa: E402
+from anim import verify as verify_mod  # noqa: E402
 from anim.blender_run import run_blender  # noqa: E402
 from anim.camera import SideCamera  # noqa: E402
-from anim.ledger import Ledger, StageError  # noqa: E402
+from anim.ledger import Ledger, StageError, sha256_file  # noqa: E402
 from anim.openrouter import Client  # noqa: E402
 
 COMMANDS = {}
@@ -32,7 +33,10 @@ ARGS = {"init": [("--model", {"required": True, "type": Path}), ("--clip", {"req
         "ingest": [("--work-scale", {"type": float, "default": 0.5})],
         "gridframe": [("--frame", {"required": True, "type": int})],
         "fit": [("--marks", {"type": Path}), ("--span", {})], "facts": [], "bake": [], "lab": [],
-        "review": [("--template", {"action": "store_true"}), ("--file", {"type": Path})]}
+        "review": [("--template", {"action": "store_true"}), ("--file", {"type": Path})],
+        "verify": [("--godot47", {"required": True, "type": Path}), ("--godot45", {"required": True, "type": Path}),
+                   ("--launcher", {"required": True, "type": Path}), ("--threed-verify", {"type": Path})],
+        "export": [("--destination", {"required": True, "type": Path})]}
 
 
 def command(name):
@@ -323,6 +327,50 @@ def cmd_review(a):
                   {"round": template["artisticRound"]})
     history_path.write_text(json.dumps(history, indent=2))
     emit({"ok": True, "next": "verify"})
+
+
+@command("verify")
+def cmd_verify(a):
+    ledger = Ledger(a.work)
+    ledger.require("review")
+    script = verify_mod.verifier(a.threed_verify)
+    glb = ledger.output("bake", "glb")
+    facts = load_json(ledger.output("facts", "facts"))
+    outputs, problems = {}, []
+    for prefix, engine in (("4.7", a.godot47), ("4.5", a.godot45)):
+        report = verify_mod.run_verify(script, glb, ledger.work / "verify" / prefix, engine, a.launcher)
+        # The clip's length tolerance is 1.5 frames at the baked clip's own (resampled) rate, not the ingest rate.
+        problems += [f"[{prefix}] {p}" for p in verify_mod.check_report(
+            report, sha256_file(glb), ledger.clip, facts["entry"]["duration_s"], facts["cycle"]["fps"], prefix)]
+        outputs[f"report{prefix.replace('.', '')}"] = ledger.work / "verify" / prefix / "godot-report.json"
+    if problems:
+        raise StageError("Godot verification failed:\n- " + "\n- ".join(problems))
+    ledger.record("verify", {"glb": glb}, outputs)
+    emit({"ok": True, "reports": {k: str(v) for k, v in outputs.items()},
+          "next": "Open every capture PNG listed in both reports, then `export`."})
+
+
+@command("export")
+def cmd_export(a):
+    ledger = Ledger(a.work)
+    ledger.require("verify")
+    stem = f"{ledger.model.stem}-{ledger.clip}"
+    files = {f"{stem}-eval.glb": ledger.output("bake", "glb"), "anim-entry.json": ledger.output("facts", "entry"),
+             "facts.json": ledger.output("facts", "facts"), "fit-report.json": ledger.output("fit", "report"),
+             "marks.json": ledger.require("fit")["inputs"]["marks"]["path"],
+             "sheet.png": ledger.output("bake", "sheet"),
+             "closeup.png": ledger.output("bake", "closeup"), "review.json": ledger.output("review", "review"),
+             "godot-4.7.json": ledger.output("verify", "report47"),
+             "godot-4.5.json": ledger.output("verify", "report45"),
+             "generate.json": ledger.output("generate", "record"), "accepted.json": ledger.output("accept", "accepted"),
+             "ingest.json": ledger.output("ingest", "meta"), "reference.png": ledger.output("reference", "image"),
+             "brief.json": ledger.output("brief", "brief"), "rig.json": ledger.output("contract", "rig"),
+             "ledger.json": ledger.path}
+    if "audio" in ledger.require("ingest")["outputs"]:
+        files["candidate-audio.wav"] = ledger.output("ingest", "audio")
+    out = verify_mod.export_bundle({k: Path(v) for k, v in files.items()}, a.destination)
+    emit({"ok": True, "bundle": str(out),
+          "next": "Show the owner the sheet, close-up, captures and lab; ship only after explicit approval."})
 
 
 def build_parser():
