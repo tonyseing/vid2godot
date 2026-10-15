@@ -133,6 +133,43 @@ class FactsTests(unittest.TestCase):
         self.assertAlmostEqual(cycle["fps"], n * 24.0 / period, delta=1e-9)
         self.assertAlmostEqual(result["entry"]["fps"], cycle["fps"], delta=1e-9)
 
+    def test_cycle_drift_is_one_period_of_root_travel(self):
+        # Task 11 fix round 2: the bake removes a loop's linear drift exactly, so facts reports dx and dz one period
+        # on minus at the start, from the resampled values before the closing key is overwritten with key 0.
+        # An integer period (12) keeps the resample on whole frames, so the sine term is exact.
+        poses = synthetic()
+        for entry in poses["frames"]:
+            f = entry["index"]
+            entry["values"][0] = 0.002 * f + 0.001 * math.sin(2 * math.pi * f / 12)
+            entry["values"][1] = -0.0005 * f + 0.001 * math.cos(2 * math.pi * f / 12)
+        result = facts.clip_facts(poses, PROJECT, LOPE)
+        period, drift = result["period"], result["cycle"]["drift"]
+        self.assertEqual(set(drift), {"dx", "dz"})
+        self.assertAlmostEqual(drift["dx"], 0.002 * period, delta=1e-6)
+        self.assertAlmostEqual(drift["dz"], -0.0005 * period, delta=1e-6)
+        self.assertEqual(result["cycle"]["frames"][-1], result["cycle"]["frames"][0])
+
+    def test_purely_periodic_root_has_no_drift(self):
+        poses = synthetic()
+        for entry in poses["frames"]:
+            f = entry["index"]
+            entry["values"][0] = 0.001 * math.sin(2 * math.pi * f / 12)
+            entry["values"][1] = 0.001 * math.cos(2 * math.pi * f / 12)
+        drift = facts.clip_facts(poses, PROJECT, LOPE)["cycle"]["drift"]
+        self.assertAlmostEqual(drift["dx"], 0.0, delta=1e-6)
+        self.assertAlmostEqual(drift["dz"], 0.0, delta=1e-6)
+
+    def test_drift_at_a_sub_frame_period(self):
+        # analytic_values' root offsets are linear in frame time, so the resample at s + P is exact on them.
+        poses = synthetic(frames=120, period=9.6)
+        for entry in poses["frames"]:
+            entry["values"] = analytic_values(entry["index"])
+        result = facts.clip_facts(poses, PROJECT, LOPE)
+        period, drift = result["period"], result["cycle"]["drift"]
+        self.assertNotAlmostEqual(period, round(period), places=3)
+        self.assertAlmostEqual(drift["dx"], -0.125 * period, delta=1e-6)
+        self.assertAlmostEqual(drift["dz"], 0.02 * period, delta=1e-6)
+
     def test_no_full_cycle_in_range(self):
         values = joint_values(synthetic(frames=50, period=30))
         with self.assertRaisesRegex(facts.FactsError, "no full cycle found between 0.25 s and 2.5 s"):
@@ -192,6 +229,7 @@ class FactsTests(unittest.TestCase):
         self.assertEqual(entry["contacts"], {"paw_hl": [0.0, 0.3], "paw_fl": [0.4, 0.6], "paw_hr": [0.0, 1.0],
                                              "paw_fr": [0.7, 1.0]})
         self.assertEqual((result["start"], result["period"]), (0, 10))
+        self.assertEqual(result["cycle"]["drift"], {"dx": 0.0, "dz": 0.0})     # a one-shot keeps its travel
 
     def test_windows(self):
         self.assertEqual(facts.windows(np.array([], bool)), [])

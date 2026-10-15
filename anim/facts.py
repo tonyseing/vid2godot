@@ -137,8 +137,11 @@ def clip_facts(poses, project, brief):
                  "stride_m": round(speed * period / fps, 3), "contacts": contacts, "frames": n, "fps": rate,
                  "footfall_phase": phase, "duty_factor": duty}
         keys = resample(every, start + np.arange(n + 1) * period / n)
+        # The root's travel over one period (the resampled dx, dz at s + P less those at s), taken before the closing
+        # key is overwritten: the bake removes drift * k / n, so a periodic sway is left untouched.
+        drift = {"dx": float(keys[-1][0] - keys[0][0]), "dz": float(keys[-1][1] - keys[0][1])}
         keys[-1] = keys[0]
-        cycle_out = {"frames": keys.tolist(), "fps": rate, "periodFrames": period, "start": start}
+        cycle_out = {"frames": keys.tolist(), "fps": rate, "periodFrames": period, "start": start, "drift": drift}
     else:
         start, period = 0, len(frames) - 1
         masks = {c: contact_mask(paws[c][:, 1]) for c in chains}
@@ -147,7 +150,8 @@ def clip_facts(poses, project, brief):
         entry = {"duration_s": period / fps, "loop": False, "authored_speed_mps": round(speed, 3),
                  "stride_m": 0.0, "contacts": {b: w[0] if w else [0.0, 0.0] for b, w in all_windows.items()},
                  "frames": period, "fps": fps, "contact_windows": all_windows}
-        cycle_out = {"frames": every.tolist(), "fps": fps, "periodFrames": period, "start": start}
+        cycle_out = {"frames": every.tolist(), "fps": fps, "periodFrames": period, "start": start,
+                     "drift": {"dx": 0.0, "dz": 0.0}}
     target = brief.get("targetSpeedMps")
     if target and abs(speed - target) / target > 0.25:
         warnings.append(f"Measured ground speed {speed:.2f} m/s is more than 25% from the brief's {target} m/s")

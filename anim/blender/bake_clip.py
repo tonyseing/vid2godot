@@ -1,7 +1,8 @@
 """Write the fitted cycle as an in-place clip on the rig and export an evaluation GLB (other clips kept).
 
 `cycle` is facts.json's cycle block (or a path to facts.json): n + 1 value vectors in poses.json `names` order,
-resampled at sub-frame precision, played at `cycle.fps`. Key k goes at frame k, so the clip lasts n / cycle.fps."""
+resampled at sub-frame precision, played at `cycle.fps`, and a loop's `drift` (the root's dx, dz travel over one
+period). Key k goes at frame k, so the clip lasts n / cycle.fps."""
 import json
 import sys
 from pathlib import Path
@@ -31,20 +32,26 @@ action.use_fake_user = True
 arm.animation_data_create()
 arm.animation_data.action = action
 frames = [list(values) for values in cycle["frames"]]
+n = len(frames) - 1
+dx = np.array([values[0] for values in frames], float)
+dz = np.array([values[1] for values in frames], float)
 if args["loop"]:
-    frames[-1] = frames[0]                       # the last key equals the first: a seamless loop
-# In place: a loop loses the least-squares line through dx over keys 0..n-1 (zero mean and zero slope), so a camera
-# that tracked slightly off the creature's speed leaves no pop at the seam; a one-shot loses only the mean.
-keys = np.arange(len(frames) - 1, dtype=float)
-dx = np.array([values[0] for values in frames[:-1]], float)
-slope, intercept = np.polyfit(keys, dx, 1) if args["loop"] and len(dx) > 1 else (0.0, float(dx.mean()))
-forward = [float(values[0] - (slope * key + intercept)) for key, values in enumerate(frames)]
-if args["loop"]:
-    forward[-1] = forward[0]
+    # In place without a seam pop: lose the root's drift over the period (facts' cycle.drift, the travel from key 0
+    # to one period on) as drift * k / n at every key, so a periodic sway is untouched; then lose dx's mean over keys
+    # 0..n-1; key n then repeats key 0 exactly.
+    drift = cycle["drift"]
+    ramp = np.arange(n + 1, dtype=float) / n
+    dx = dx - float(drift["dx"]) * ramp
+    dz = dz - float(drift["dz"]) * ramp
+    dx = dx - dx[:n].mean()
+    dx[n], dz[n] = dx[0], dz[0]
+    frames[-1] = list(frames[0])                 # the last key's bones equal the first: a seamless loop
+else:
+    dx = dx - dx[:n].mean()                      # a one-shot loses only its mean dx
 pelvis = args["pelvisBone"]
 to_pelvis = rigutil.rest_rotation(arm, pelvis).inverted()      # world (Blender: +X forward, +Z up) to pelvis-local
 for key, values in enumerate(frames):
-    arm.pose.bones[pelvis].location = to_pelvis @ Vector((forward[key], 0.0, values[1]))
+    arm.pose.bones[pelvis].location = to_pelvis @ Vector((float(dx[key]), 0.0, float(dz[key])))
     arm.pose.bones[pelvis].keyframe_insert("location", frame=key)
     for name, axis in zip(bones, axes):
         rigutil.set_angle(arm, name, axis, values[index[name]])

@@ -52,38 +52,36 @@ def channels(path):
     return out, rest
 
 
-def wave(k, n, amplitude, phase=0.0):
-    return amplitude * np.cos(2 * np.pi * k / n + phase)
-
-
-def fixture_cycle(n=24, fps=24.0, period=23.6, dx=None, dz=None):
+def fixture_cycle(n=24, fps=24.0, period=23.6, dx=None, dz=None, loop=True):
     """A cycle block like facts.json's, keyed from the fixture walk's known angles: a sub-frame period, so the
-    cycle's rate is not an integer. The pelvis travels `dx(k)` forward and `dz(k)` up at key k; key n is one period
-    on (the travel continues; the bones repeat key 0)."""
-    dx = dx or (lambda k: 0.01 * k + wave(k, n, 0.004))
-    dz = dz or (lambda k: wave(k, n, 0.005, -np.pi / 2))          # 0.005 sin(2 pi k / n)
+    cycle's rate is not an integer. The pelvis travels `dx(k)` forward and `dz(k)` up at key k. As facts writes it,
+    a loop's key n repeats key 0 and its drift is the root travel one period on, dx(n) - dx(0) and dz(n) - dz(0);
+    a one-shot's key n is its own last frame and its drift is zero."""
+    dx = dx or (lambda k: 0.01 * k + sway(k, n, 0.004))
+    dz = dz or (lambda k: sway(k, n, 0.005, -np.pi / 2))          # 0.005 sin(2 pi k / n)
     _, truth_path = fixture_glb()
     truth = json.loads(truth_path.read_text())
     bones = [b for chain in load_project_contract(FIXTURE_CONTRACT)["chains"].values() for b in chain]
     keys = [[float(dx(k)), float(dz(k))] + [truth[str(k)].get(b, 0.0) for b in bones] for k in range(n)]
-    keys.append([float(dx(n)), float(dz(n))] + keys[0][2:])
+    if loop:
+        keys.append(list(keys[0]))
+        drift = {"dx": float(dx(n) - dx(0)), "dz": float(dz(n) - dz(0))}
+    else:
+        keys.append([float(dx(n)), float(dz(n))] + keys[0][2:])
+        drift = {"dx": 0.0, "dz": 0.0}
     return bones, ["dx", "dz"] + bones, {"frames": keys, "fps": n * fps / period, "periodFrames": period,
-                                         "start": 3.25}
+                                         "start": 3.25, "drift": drift}
 
 
-def in_place(dx, loop):
-    """The expected in-place forward offsets for keys 0..n, computed independently of the bake: a loop loses the
-    least-squares line through keys 0..n-1 (zero mean, zero slope) and its key n repeats key 0; a one-shot loses
-    only the mean over keys 0..n-1."""
-    dx = np.asarray(dx, float)
-    n = len(dx) - 1
-    k = np.arange(n + 1)
-    if not loop:
-        return dx - dx[:n].mean()
-    slope, intercept = np.polyfit(k[:n], dx[:n], 1)
-    out = dx - (slope * k + intercept)
-    out[n] = out[0]
-    return out
+def sway(k, n, amplitude, phase=0.0):
+    """A purely periodic root sway: one cycle over n keys, so sway(n) = sway(0)."""
+    return amplitude * np.cos(2 * np.pi * np.asarray(k, float) / n + phase)
+
+
+def minus_mean(values, n):
+    """The analytic expectation for an in-place offset: `values` at keys 0..n less their mean over keys 0..n-1."""
+    values = np.asarray(values, float)
+    return values - values[:n].mean()
 
 
 def bake(tmp, cycle, bones, names, loop=True):
@@ -131,10 +129,10 @@ class BakeTests(unittest.TestCase):
                 np.testing.assert_allclose(got[n], got[0], atol=1e-6)            # the seam closes
             # In place, in world axes: the pelvis head moves forward (+X) by the in-place dx, up (+Z) by dz, and
             # never sideways (Y), measured on the re-imported GLB.
-            dx = [values[0] for values in cycle["frames"]]
-            dz = [values[1] for values in cycle["frames"][:n]] + [cycle["frames"][0][1]]
-            np.testing.assert_allclose(moves[:, 0], in_place(dx, True), atol=1e-4, err_msg="forward")
-            np.testing.assert_allclose(moves[:, 2], dz, atol=1e-4, err_msg="up")
+            # The fixture's dx is 0.01 k of drift plus a 4 mm sway; dz is a 5 mm sway with no drift.
+            k = np.arange(n + 1)
+            np.testing.assert_allclose(moves[:, 0], minus_mean(sway(k, n, 0.004), n), atol=1e-4, err_msg="forward")
+            np.testing.assert_allclose(moves[:, 2], sway(k, n, 0.005, -np.pi / 2), atol=1e-4, err_msg="up")
             np.testing.assert_allclose(moves[:, 1], 0.0, atol=1e-4, err_msg="lateral")
             self.assertGreater(np.ptp(moves[:, 0]), 0.005)                  # the checks are not vacuous
             self.assertGreater(np.ptp(moves[:, 2]), 0.005)
@@ -144,26 +142,45 @@ class BakeTests(unittest.TestCase):
                 np.testing.assert_allclose(got_times, want_times, atol=1e-5, err_msg=str(channel))
                 np.testing.assert_allclose(got, want, atol=1e-5, err_msg=str(channel))
 
-    def test_loop_removes_drift_so_the_seam_does_not_pop(self):
-        # The camera tracked a little slower than the creature: dx drifts 0.002 m a key on top of its periodic sway.
+    def test_periodic_sway_bakes_without_a_seam_pop(self):
+        # Fix round 2: a purely periodic sine-phase sway (drift 0) must keep its own step across the seam; the old
+        # least-squares detrend tilted it and added a 1.56 mm pop at n = 24.
         n = 24
-        sway = [wave(k, n, 0.001) for k in range(n + 1)]
-        step = max(abs(sway[k + 1] - sway[k]) for k in range(n))
-        bones, names, cycle = fixture_cycle(n, dx=lambda k: 0.002 * k + wave(k, n, 0.001), dz=lambda k: 0.0)
+        k = np.arange(n + 1)
+        want = sway(k, n, 0.001, -np.pi / 2)                          # 0.001 sin(2 pi k / n)
+        bones, names, cycle = fixture_cycle(n, dx=lambda i: sway(i, n, 0.001, -np.pi / 2), dz=lambda i: 0.0)
+        self.assertAlmostEqual(cycle["drift"]["dx"], 0.0, places=12)
         with tempfile.TemporaryDirectory() as tmp:
             _, _, moves = bake(Path(tmp), cycle, bones, names)
         forward = moves[:, 0]
-        self.assertLessEqual(abs(forward[n - 1] - forward[0]), step + 1e-6, "a pop at the seam")
+        self.assertAlmostEqual(abs(forward[n - 1] - forward[0]), abs(want[n - 1] - want[0]), delta=1e-5,
+                               msg="the seam step is the sway's own step: no added pop")
         self.assertAlmostEqual(forward[n], forward[0], places=5)
-        np.testing.assert_allclose(forward, in_place([v[0] for v in cycle["frames"]], True), atol=1e-4)
+        np.testing.assert_allclose(forward, minus_mean(want, n), atol=1e-4)
+
+    def test_loop_removes_linear_drift_exactly(self):
+        # The camera tracked a little off the creature's speed: dx drifts 2 mm and dz -1 mm a key on top of their
+        # periodic sways. The bake removes drift * k / n exactly, so only each sway is left (dx also loses its mean).
+        n = 24
+        k = np.arange(n + 1)
+        sway_x, sway_z = sway(k, n, 0.001, -np.pi / 2), sway(k, n, 0.002)
+        bones, names, cycle = fixture_cycle(n, dx=lambda i: 0.002 * i + sway(i, n, 0.001, -np.pi / 2),
+                                            dz=lambda i: -0.001 * i + sway(i, n, 0.002))
+        self.assertAlmostEqual(cycle["drift"]["dx"], 0.002 * n, places=9)
+        self.assertAlmostEqual(cycle["drift"]["dz"], -0.001 * n, places=9)
+        with tempfile.TemporaryDirectory() as tmp:
+            _, _, moves = bake(Path(tmp), cycle, bones, names)
+        np.testing.assert_allclose(moves[:, 0], minus_mean(sway_x, n), atol=1e-4, err_msg="forward")
+        np.testing.assert_allclose(moves[:, 2], sway_z, atol=1e-4, err_msg="up")
+        self.assertAlmostEqual(moves[n, 0], moves[0, 0], places=5)
+        self.assertAlmostEqual(moves[n, 2], moves[0, 2], places=5)
 
     def test_one_shot_removes_only_the_mean(self):
         n = 24
-        bones, names, cycle = fixture_cycle(n, dx=lambda k: 0.002 * k, dz=lambda k: 0.0)
+        bones, names, cycle = fixture_cycle(n, dx=lambda k: 0.002 * k, dz=lambda k: 0.0, loop=False)
         with tempfile.TemporaryDirectory() as tmp:
             _, _, moves = bake(Path(tmp), cycle, bones, names, loop=False)
-        dx = [values[0] for values in cycle["frames"]]
-        np.testing.assert_allclose(moves[:, 0], in_place(dx, False), atol=1e-4)
+        np.testing.assert_allclose(moves[:, 0], 0.002 * (np.arange(n + 1) - (n - 1) / 2), atol=1e-4)
         self.assertAlmostEqual(moves[n, 0] - moves[0, 0], 0.002 * n, places=4)   # a one-shot keeps its travel shape
 
     def test_bake_command_writes_glb_sheet_and_closeup(self):
