@@ -651,3 +651,7 @@ The only thing that would cost more money is a new video. That happens only if b
 Skill followed: `/Users/tonyseing/workspace/vid2godot/SKILL.md`, with `/Users/tonyseing/workspace/vid2godot/reference/failures.md`. Project: `/private/tmp/claude-501/-Users-tonyseing-orca-workspaces-chase3d-create-animation-workflow/72b7060c-9d42-4bc7-835d-80c9a4ff6261/scratchpad/baseline-sandbox`.
 
 </details>
+
+## Confirmation run on the final text
+
+8 of 8 runs (S1-S4, 2 reps each) passed every criterion P1-P7 against the final SKILL.md text; graders found no wrong commands (workflow wf_706e5192-a57, 2026-10-15).
