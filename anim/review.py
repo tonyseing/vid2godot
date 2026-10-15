@@ -7,7 +7,7 @@ from PIL import Image
 
 from anim import raster
 from anim.facts import contact_mask
-from anim.ledger import sha256_file
+from anim.ledger import StageError, sha256_file
 
 ARTISTIC_ROUNDS = 2
 TEMPLATE = (Path(__file__).resolve().parent / "lab_template.html").read_text()
@@ -38,8 +38,9 @@ def contact_timeline(poses, project):
 
 def lab_page(clip, report, threshold, timeline, hashes):
     data = {"clip": clip, "report": report, "threshold": threshold, "timeline": timeline, "hashes": hashes}
-    # "<\/" keeps a "</script>" inside a clip name or flag from closing the inline script.
-    return TEMPLATE.replace("__DATA__", json.dumps(data).replace("</", "<\\/"))
+    # No "<" reaches the page, so a "</script>" or "<!--<script" in a clip name or flag cannot end the inline
+    # script or start an HTML comment in it; JSON reads "\u003c" back as "<".
+    return TEMPLATE.replace("__DATA__", json.dumps(data).replace("<", "\\u003c"))
 
 
 def make_template(clip, bound, report, round_number):
@@ -52,8 +53,38 @@ def make_template(clip, bound, report, round_number):
                            "note": ""} for i in report["lowFrames"]]}
 
 
+def _is_frame_item(item):
+    return isinstance(item, dict) and isinstance(item.get("frame"), int) and not isinstance(item["frame"], bool)
+
+
+def check_template(template):
+    """A template is written by `review --template`; a broken one is regenerated, not reviewed."""
+    regenerate = "; regenerate it with `review --template`"
+    if not isinstance(template, dict):
+        raise StageError("The review template is not a JSON object" + regenerate)
+    missing = [key for key in ("clip", "bound", "artisticRound", "lowFrames") if key not in template]
+    if missing:
+        raise StageError(f"The review template lacks {missing}" + regenerate)
+    bound = template["bound"]
+    if not isinstance(bound, dict) or not all(isinstance(item, dict) and isinstance(item.get("path"), str)
+                                              and isinstance(item.get("sha256"), str) for item in bound.values()):
+        raise StageError("The review template's bound files need a path and a sha256 each" + regenerate)
+    if not isinstance(template["artisticRound"], int) or isinstance(template["artisticRound"], bool):
+        raise StageError("The review template's artisticRound is not a number" + regenerate)
+    if not isinstance(template["lowFrames"], list) or not all(map(_is_frame_item, template["lowFrames"])):
+        raise StageError("Every low frame in the review template needs a frame number" + regenerate)
+
+
 def validate(review, template):
+    check_template(template)
+    if not isinstance(review, dict):
+        return ["The review is not a JSON object; fill in a copy of the template"]
     problems = []
+    if review.get("clip") != template["clip"]:
+        problems.append(f"The review is for clip {review.get('clip')!r}, not {template['clip']!r}")
+    if review.get("artisticRound") != template["artisticRound"]:
+        problems.append(f"The review is for round {review.get('artisticRound')!r}, but the template is round "
+                        f"{template['artisticRound']}; fill in the current template")
     if review.get("bound") != template["bound"]:
         problems.append("The review's bound hashes differ from the template; regenerate it with `review --template`")
     for name, item in template["bound"].items():
@@ -63,7 +94,14 @@ def validate(review, template):
         problems.append("reviewer is empty")
     if review.get("verdict") not in ("pass", "fail"):
         problems.append('verdict must be "pass" or "fail"')
-    listed = {item["frame"] for item in review.get("lowFrames", [])}
+    items = review.get("lowFrames", [])
+    if not isinstance(items, list):
+        problems.append("lowFrames must be the template's list of low frames")
+        items = []
+    if not all(map(_is_frame_item, items)):
+        problems.append("Every lowFrames item needs its frame number, as in the template")
+    items = [item for item in items if _is_frame_item(item)]
+    listed = {item["frame"] for item in items}
     missing = [item["frame"] for item in template["lowFrames"] if item["frame"] not in listed]
     if missing:
         problems.append(f"Low or flagged frames missing from the review: {missing}")
@@ -73,7 +111,22 @@ def validate(review, template):
                 problems.append(f"{key} must be true for a pass")
         if not review.get("observations"):
             problems.append("observations are empty")
-        for item in review.get("lowFrames", []):
+        for item in items:
             if item.get("action") != "explained" or not item.get("note"):
                 problems.append(f"Frame {item['frame']} needs an explanation, or a re-mark and refit")
     return problems
+
+
+def record_round(history, template, filled):
+    """Add a validated review to the history: one entry per artistic round. Returns the new history and the number
+    of distinct rounds that failed."""
+    if not isinstance(history, list) or not all(isinstance(item, dict) for item in history):
+        raise StageError("review/history.json is not a list of rounds")
+    round_number = template["artisticRound"]
+    if any(item.get("round") == round_number for item in history):
+        raise StageError(f"Round {round_number} was already reviewed; make a new template with `review --template` "
+                         "after revising")
+    history = history + [{"round": round_number, "verdict": filled["verdict"], "reviewer": filled["reviewer"],
+                          "observations": filled.get("observations", "")}]
+    failed = len({item.get("round") for item in history if item.get("verdict") == "fail"})
+    return history, failed

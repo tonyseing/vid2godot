@@ -302,18 +302,18 @@ def cmd_review(a):
         return
     if not a.file:
         raise StageError("review needs --template or --file")
+    if not (folder / "template.json").is_file():
+        raise StageError("There is no review template yet; run `review --template` first")
     template = load_json(folder / "template.json")
     filled = load_json(a.file)
     problems = review_mod.validate(filled, template)
     if problems:
         raise StageError("The review is not complete:\n- " + "\n- ".join(problems))
-    history.append({"round": template["artisticRound"], "verdict": filled["verdict"],
-                    "reviewer": filled["reviewer"], "observations": filled.get("observations", "")})
-    history_path.write_text(json.dumps(history, indent=2))
+    history, failed = review_mod.record_round(history, template, filled)
     if filled["verdict"] != "pass":
-        rounds = sum(1 for item in history if item["verdict"] == "fail")
-        ask = rounds >= review_mod.ARTISTIC_ROUNDS
-        emit({"ok": False, "failedRounds": rounds,
+        history_path.write_text(json.dumps(history, indent=2))
+        ask = failed >= review_mod.ARTISTIC_ROUNDS
+        emit({"ok": False, "failedRounds": failed,
               "next": "Ask the owner whether to continue or park this clip." if ask else "Revise and review again."})
         return
     if Path(a.file).resolve() != (folder / "review.json").resolve():
@@ -321,6 +321,7 @@ def cmd_review(a):
     inputs = {name: Path(item["path"]) for name, item in template["bound"].items()}
     ledger.record("review", {**inputs, "template": folder / "template.json"}, {"review": folder / "review.json"},
                   {"round": template["artisticRound"]})
+    history_path.write_text(json.dumps(history, indent=2))
     emit({"ok": True, "next": "verify"})
 
 
