@@ -18,7 +18,9 @@ record the change); dx/dz stay in model metres. The first frame has no prior, so
 scales with coarse grid searches over the legs, and the best is polished with local grids at the middle level.
 
 Left and right legs give the same side silhouette, so after the forward pass each leg pair's identity is relabelled
-per frame by dynamic programming (marks plus smooth velocity), and the clip is then refined with a two-sided prior.
+per frame by dynamic programming (marks plus smooth velocity; a span refit also takes up to two fixed frames on
+each side, pinned as fitted, so the span keeps its neighbours' identity), and the clip is then refined with a
+two-sided prior.
 """
 import json
 import math
@@ -41,6 +43,7 @@ SPACING = 0.85                                  # sample spacing in level pixels
 W_IOU, W_CHAMFER, W_MARKS = 40.0, 1.0, 0.5
 W_SMOOTH, W_OFFSET = 20.0, 0.01                 # per rad^2 of prior error; per working px^2 of offset error
 W_SWAP_MARKS, W_SWAP_ACCEL = 1.0, 400.0         # identity relabelling: mark px vs rad^2 of acceleration
+TIE = 1e-9                                      # relabelling costs this close (relative) go to label 0
 VELOCITY = 0.8                                  # share of the last frame's velocity the prior carries forward
 SCALE_STEP = 0.0025                             # camera scale change per "degree" of step
 REFINE_PASSES = 2
@@ -531,20 +534,51 @@ def swapped(x, pair):
     return y
 
 
+def better(c, best):
+    """c beats best by more than a near-tie (TIE, relative): a near-tie keeps the earlier candidate, label 0 first."""
+    if not math.isfinite(best):
+        return c < best
+    return c < best - TIE * max(abs(best), abs(c))
+
+
+def fixed_neighbours(xs, frames):
+    """Up to two fixed frames immediately before and after the frames being relabelled (a span refit has them)."""
+    inside = set(frames)
+    before, after = [], []
+    if not frames:
+        return before, after
+    for g in (frames[0] - 1, frames[0] - 2):
+        if g not in xs or g in inside:
+            break
+        before.insert(0, g)
+    for g in (frames[-1] + 1, frames[-1] + 2):
+        if g not in xs or g in inside:
+            break
+        after.append(g)
+    return before, after
+
+
 def relabel(xs, frames):
     """Left and right legs of a pair cast the same silhouette: choose, per frame, which fitted chain is which, by
-    dynamic programming over (previous label, label) with the marks and the legs' acceleration as costs."""
+    dynamic programming over (previous label, label) with the marks and the legs' acceleration as costs.
+
+    A span refit adds up to two fixed frames on each side with their label pinned to 0 (as fitted), so acceleration
+    ties the span's identity to its neighbours': without them, keeping or exchanging a pair for the whole span costs
+    the same. Near-ties (TIE, relative) go to label 0."""
+    before, after = fixed_neighbours(xs, frames)
+    seq, pinned = before + list(frames) + after, set(before + after)
+    inf = float("inf")
     changed = 0
     for pair in pairs:
         a, b, ia, ib = pair
         paw_a, paw_b = project["paws"].get(a), project["paws"].get(b)
         options = []
-        for f in frames:
+        for f in seq:
             opts = []
             for label in (0, 1):
                 y = swapped(xs[f], pair) if label else xs[f]
-                cost = 0.0
-                if f in marks:
+                cost = inf if label and f in pinned else 0.0
+                if f in marks and f not in pinned:
                     cam = camera_for(y[SCALE])
                     wanted = [p for p in (paw_a, paw_b) if p in marks[f]]
                     if wanted:
@@ -552,32 +586,34 @@ def relabel(xs, frames):
                         cost = W_SWAP_MARKS * float(np.mean([np.hypot(*(pts[p] - marks[f][p])) for p in wanted]))
                 opts.append((y[ia + ib], cost))
             options.append(opts)
-        n = len(frames)
+        n = len(seq)
         if n < 3:
             continue
         # state = (label at t-1, label at t); cost[t][s]
-        inf = float("inf")
-        cost = {(l1, l2): options[0][l1][1] + options[1][l2][1] for l1 in (0, 1) for l2 in (0, 1)}
+        states = [(0, 0), (0, 1), (1, 0), (1, 1)]
+        cost = {(l1, l2): options[0][l1][1] + options[1][l2][1] for l1, l2 in states}
         back = []
         for t in range(2, n):
             new, ptr = {}, {}
-            for l1 in (0, 1):
-                for l2 in (0, 1):
-                    best, arg = inf, None
-                    for l0 in (0, 1):
-                        accel = options[t][l2][0] - 2 * options[t - 1][l1][0] + options[t - 2][l0][0]
-                        c = cost[(l0, l1)] + W_SWAP_ACCEL * float(np.sum(accel ** 2))
-                        if c < best:
-                            best, arg = c, l0
-                    new[(l1, l2)], ptr[(l1, l2)] = best + options[t][l2][1], arg
+            for l1, l2 in states:
+                best, arg = inf, 0
+                for l0 in (0, 1):
+                    accel = options[t][l2][0] - 2 * options[t - 1][l1][0] + options[t - 2][l0][0]
+                    c = cost[(l0, l1)] + W_SWAP_ACCEL * float(np.sum(accel ** 2))
+                    if better(c, best):
+                        best, arg = c, l0
+                new[(l1, l2)], ptr[(l1, l2)] = best + options[t][l2][1], arg
             cost = new
             back.append(ptr)
-        state = min(cost, key=cost.get)
+        state = states[0]
+        for s in states[1:]:
+            if better(cost[s], cost[state]):
+                state = s
         labels = [state[0], state[1]]
         for ptr in reversed(back):
             labels.insert(0, ptr[(labels[0], labels[1])])
-        for f, label in zip(frames, labels):
-            if label:
+        for f, label in zip(seq, labels):
+            if label and f not in pinned:
                 xs[f] = swapped(xs[f], pair)
                 changed += 1
     return changed
