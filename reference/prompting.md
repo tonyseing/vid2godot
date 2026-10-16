@@ -17,12 +17,16 @@ none, the size follows from the resolution and aspect (720p 16:9 is 1280x720). I
 
 `anim.generate.price` estimates one clip from the listing's `pricing_skus` and returns the dollars and the basis,
 which `generate/record.json` keeps as `pricingBasis`. A `video_tokens` price costs w x h x 24 fps x seconds / 1024
-x price. Otherwise a per-second SKU is used: keys with `cents` are in cents, a SKU for the brief's resolution beats
-a generic one, and the with-audio rate applies when sound is requested. Reference, continuation, text-to-video and
-megapixel SKUs are skipped. One image-input fee is added for the first frame, and a per-generation minimum raises
-the total. A model with no price that can be read needs `--max-cost`, and its first candidate is unbounded (a
-warning says so). `generate` refuses when the estimate is above `--max-cost`, or when 1.5 times it exceeds the
-OpenRouter key's remaining limit, and checks again before each further candidate. A failure mid-run writes
+x price, using the brief's resolution's token SKU (such as `video_tokens_1080p`) where one is listed. Otherwise a
+per-second SKU is used: keys with `cents` are in cents, a SKU naming any other resolution (such as `_540p` or
+`_2k`) is skipped, and a SKU for the brief's resolution beats a generic one. When sound is requested the
+with-audio rate applies, else the plain rate; a without-audio rate never prices a clip with sound, so a listing
+with only those has no price. Reference, continuation, text-to-video and megapixel SKUs are skipped. On both
+paths one image-input fee is added for the first frame, and a per-generation minimum raises the total. A model
+with no price that can be read needs `--max-cost`, and its first candidate is unbounded (a warning says so).
+`generate` refuses when the estimate is above `--max-cost`, or when 1.5 times it exceeds the OpenRouter key's
+remaining limit, and checks again before each further candidate, bounding it by the larger of the estimate and
+the largest real charge so far. A failure mid-run writes
 `generate/record.partial.json` with what was spent. Two candidates per clip (`--candidates 2`); candidate N uses
 seed `--seed` + N (1001 and 1002 by default).
 

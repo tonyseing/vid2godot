@@ -1,4 +1,5 @@
 import json
+import shutil
 import tempfile
 import unittest
 from pathlib import Path
@@ -56,6 +57,7 @@ class FakeClient:
 class GenerateTests(unittest.TestCase):
     def setUp(self):
         self.tmp = Path(tempfile.mkdtemp())
+        self.addCleanup(shutil.rmtree, self.tmp, ignore_errors=True)
         self.png = self.tmp / "ref.png"
         Image.fromarray(np.zeros((720, 1280, 3), dtype=np.uint8)).save(self.png)
         self.strip = mock.patch.object(generate, "strip", lambda video, out, count=8: Path(out).write_bytes(b"png"))
@@ -146,6 +148,25 @@ class GenerateTests(unittest.TestCase):
         partial = json.loads((self.tmp / "gen" / "record.partial.json").read_text())
         self.assertEqual([c["jobId"] for c in partial["candidates"]], ["j1"])
 
+    def test_known_price_bounds_later_candidates_by_observed_cost_when_higher(self):
+        each = generate.estimate_cost(INFO, 1280, 720, 5)
+        client = FakeClient(cost=2.0)
+        max_cost = 2.0 + (each + 2.0) / 2
+        self.assertLess(2.0 + each, max_cost)
+        self.assertLess(max_cost, 2.0 + 2.0)
+        with self.assertRaises(StageError) as caught:
+            generate.run_generate(client, self.tmp / "gen", "m", BRIEF, self.png, "#c8c8c8", max_cost=max_cost)
+        self.assertEqual(len(client.submitted), 1)
+        self.assertIn("about $2.00", str(caught.exception))
+
+    def test_known_price_rechecks_remaining_with_observed_cost_when_higher(self):
+        client = FakeClient(cost=2.0)
+        reads = iter([100.0, 2.5])
+        client.limit_remaining = lambda: next(reads)
+        with self.assertRaises(StageError):
+            generate.run_generate(client, self.tmp / "gen", "m", BRIEF, self.png, "#c8c8c8")
+        self.assertEqual(len(client.submitted), 1)
+
     def test_remaining_is_rechecked_before_the_second_candidate(self):
         client = FakeClient(remaining=100.0)
         reads = iter([100.0, 1.0])
@@ -227,9 +248,23 @@ LISTING = {m["id"]: m for m in json.loads((FIXTURES / "openrouter_video_models_2
 COST_TABLE = json.loads((FIXTURES / "bakeoff_cost_table_2026-10-15.json").read_text())
 
 
+class FixtureTests(unittest.TestCase):
+    def test_cost_table_holds_no_account_numbers(self):
+        text = (FIXTURES / "bakeoff_cost_table_2026-10-15.json").read_text().lower()
+        for word in ("keylimit", "remaining", "balance", "credit"):
+            self.assertFalse(word in text, f"cost-table fixture mentions {word!r}")
+
+
+class SubmitCalled(BaseException):
+    """Escapes run_generate's `except Exception`, so a submit cannot be swallowed into a StageError."""
+
+
 class NoSubmitClient(FakeClient):
+    submit_called = False
+
     def submit(self, payload):
-        raise AssertionError("submit must not be called")
+        self.submit_called = True
+        raise SubmitCalled("submit must not be called")
 
 
 class PricingTests(unittest.TestCase):
@@ -274,6 +309,59 @@ class PricingTests(unittest.TestCase):
         with self.assertRaises(StageError):
             generate.size_for(LISTING["black-forest-labs/flux-video-edit"], "720p", "16:9")
 
+    def test_audio_with_only_without_audio_rates_is_unknown(self):
+        info = {"id": "m", "pricing_skus": {"duration_seconds_without_audio": "0.1"}}
+        dollars, basis = generate.price(info, 5, "720p", "16:9", audio=True)
+        self.assertIsNone(dollars)
+        self.assertTrue(basis.startswith("unknown"))
+        self.assertIsNone(generate.estimate_cost(info, 1280, 720, 5))
+        self.assertAlmostEqual(generate.price(info, 5, "720p", "16:9", audio=False)[0], 0.5)
+        resolved = {"id": "m", "pricing_skus": {"duration_seconds_without_audio_720p": "0.1"}}
+        self.assertIsNone(generate.price(resolved, 5, "720p", "16:9", audio=True)[0])
+
+    def test_audio_with_plain_or_with_audio_rate_is_priced(self):
+        plain = {"id": "m", "pricing_skus": {"duration_seconds": "0.1", "duration_seconds_without_audio": "0.05"}}
+        self.assertAlmostEqual(generate.price(plain, 5, "720p", "16:9", audio=True)[0], 0.5)
+        with_audio = {"id": "m", "pricing_skus": {"duration_seconds_with_audio": "0.2",
+                                                  "duration_seconds_without_audio": "0.05"}}
+        self.assertAlmostEqual(generate.price(with_audio, 5, "720p", "16:9", audio=True)[0], 1.0)
+        self.assertAlmostEqual(generate.price(with_audio, 5, "720p", "16:9", audio=False)[0], 0.25)
+
+    def test_other_resolution_per_second_skus_are_skipped(self):
+        for key in ("duration_seconds_540p", "duration_seconds_360p", "cents_per_second_output_2k",
+                    "duration_seconds_with_audio_4k"):
+            with self.subTest(key=key):
+                info = {"id": "m", "pricing_skus": {key: "0.1"}}
+                dollars, basis = generate.price(info, 5, "720p", "16:9", audio=True)
+                self.assertIsNone(dollars)
+                self.assertTrue(basis.startswith("unknown"))
+        info = {"id": "m", "pricing_skus": {"duration_seconds_540p": "0.5", "duration_seconds": "0.1"}}
+        dollars, basis = generate.price(info, 5, "720p", "16:9", audio=True)
+        self.assertAlmostEqual(dollars, 0.5)
+        self.assertIn("duration_seconds =", basis)
+
+    def test_video_tokens_prefers_the_resolution_sku(self):
+        seedance = LISTING["bytedance/seedance-2.0"]
+        dollars, basis = generate.price(seedance, 5, "1080p", "16:9")
+        self.assertAlmostEqual(dollars, 1920 * 1080 * 24 * 5 / 1024 * 0.0000077)
+        self.assertEqual(basis, "video_tokens_1080p: 1920x1080 x 24 fps x 5 s / 1024 x $0.0000077")
+        self.assertAlmostEqual(generate.estimate_cost(seedance, 1920, 1080, 5),
+                               1920 * 1080 * 24 * 5 / 1024 * 0.0000077)
+        dollars, basis = generate.price(seedance, 5, "720p", "16:9")
+        self.assertAlmostEqual(dollars, 1280 * 720 * 24 * 5 / 1024 * 0.000007)
+        self.assertEqual(basis, "video_tokens: 1280x720 x 24 fps x 5 s / 1024 x $0.000007")
+
+    def test_video_tokens_adds_image_fee_and_minimum(self):
+        tokens = 1280 * 720 * 24 * 5 / 1024 * 0.000001
+        info = {**INFO, "pricing_skus": {"video_tokens": "0.000001", "cents_per_image_input": "10"}}
+        dollars, basis = generate.price(info, 5, "720p", "16:9")
+        self.assertAlmostEqual(dollars, tokens + 0.1)
+        self.assertIn("+ cents_per_image_input $0.1 (one first frame)", basis)
+        info = {**INFO, "pricing_skus": {"video_tokens": "0.000001", "minimum_cents_per_generation": "500"}}
+        dollars, basis = generate.price(info, 5, "720p", "16:9")
+        self.assertAlmostEqual(dollars, 5.0)
+        self.assertIn("raised to minimum_cents_per_generation $5", basis)
+
     def test_sends_audio_unless_the_listing_says_it_cannot(self):
         self.assertFalse(generate.sends_audio(LISTING["runway/gen-4.5"]))
         self.assertTrue(generate.sends_audio(LISTING["kwaivgi/kling-v3.0-pro"]))
@@ -290,12 +378,27 @@ class PerSecondGenerateTests(unittest.TestCase):
             generate.run_generate(client, self.tmp / "gen", "kwaivgi/kling-v3.0-pro", BRIEF, self.png, "#c8c8c8",
                                   max_cost=1.0)
         self.assertIn("$1.68", str(caught.exception))
+        self.assertFalse(client.submit_called)
 
     def test_per_second_estimate_checked_against_remaining(self):
         client = NoSubmitClient(info=LISTING["kwaivgi/kling-v3.0-pro"], remaining=2.0)
         with self.assertRaises(StageError) as caught:
             generate.run_generate(client, self.tmp / "gen", "kwaivgi/kling-v3.0-pro", BRIEF, self.png, "#c8c8c8")
         self.assertIn("exceeds the key's remaining $2.00", str(caught.exception))
+        self.assertFalse(client.submit_called)
+
+    def test_audio_without_only_rate_needs_max_cost_and_warns(self):
+        info = {**LISTING["kwaivgi/kling-v3.0-pro"], "pricing_skus": {"duration_seconds_without_audio": "0.1"}}
+        client = NoSubmitClient(info=info)
+        with self.assertRaises(StageError) as caught:
+            generate.run_generate(client, self.tmp / "gen", "m", BRIEF, self.png, "#c8c8c8")
+        self.assertIn("pass --max-cost", str(caught.exception))
+        self.assertFalse(client.submit_called)
+        client = FakeClient(info=info, cost=0.5)
+        record = generate.run_generate(client, self.tmp / "gen2", "m", BRIEF, self.png, "#c8c8c8", max_cost=5.0)
+        self.assertEqual(record["estimateUsd"], 0)
+        self.assertTrue(record["pricingBasis"].startswith("unknown"))
+        self.assertIn("first candidate's cost is unbounded (price unknown)", record["warnings"])
 
     def test_runway_omits_generate_audio_and_prices_plain(self):
         client = FakeClient(info=LISTING["runway/gen-4.5"], cost=0.6)
@@ -305,12 +408,22 @@ class PerSecondGenerateTests(unittest.TestCase):
         self.assertAlmostEqual(record["estimateUsd"], 1.2)
         self.assertIn("cents_per_second_output", record["pricingBasis"])
         self.assertEqual(record["warnings"], [])
+        saved = json.loads((self.tmp / "gen" / "record.json").read_text())
+        self.assertIs(saved["generateAudio"], False)
 
     def test_audio_capable_model_sends_generate_audio(self):
         client = FakeClient(info=LISTING["kwaivgi/kling-v3.0-pro"], cost=0.84)
         record = generate.run_generate(client, self.tmp / "gen", "kwaivgi/kling-v3.0-pro", BRIEF, self.png, "#c8c8c8")
-        self.assertIs(client.submitted[0]["generate_audio"], True)
+        self.assertEqual(len(client.submitted), 2)
+        for payload in client.submitted:
+            self.assertIs(payload["generate_audio"], True)
+        self.assertEqual(client.submitted[1]["seed"], 1002)
+        self.assertEqual((client.submitted[1]["duration"], client.submitted[1]["resolution"],
+                          client.submitted[1]["aspect_ratio"]), (5, "720p", "16:9"))
         self.assertAlmostEqual(record["estimateUsd"], 1.68)
+        saved = json.loads((self.tmp / "gen" / "record.json").read_text())
+        self.assertIs(saved["generateAudio"], True)
+        self.assertEqual(len(saved["candidates"]), 2)
 
     def test_null_sizes_model_generates_at_derived_size(self):
         client = FakeClient(info=LISTING["alibaba/wan-3.0"], cost=0.5)

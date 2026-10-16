@@ -1,6 +1,7 @@
 """Ask the named video model for two candidate clips of our own model, side-on, and record everything."""
 import base64
 import json
+import re
 import shutil
 import subprocess
 import tempfile
@@ -17,8 +18,8 @@ NAMES = {"#c8c8c8": "light grey", "#7f7f7f": "mid grey", "#00b140": "chroma gree
 CHECKS = ("singleAnimal", "noCuts", "sideViewHeld", "noZoom", "legCount", "sameAnimal", "plainBackground")
 RESOLUTION_HEIGHT = {"480p": 480, "720p": 720, "1080p": 1080}
 FPS = 24
-# Resolution words in SKU names; a SKU naming another resolution does not price ours.
-RESOLUTION_TOKENS = {"480p", "720p", "768p", "1080p", "2k", "4k"}
+# A resolution word in a SKU name (480p, 540p, 2k, 4k ...); a SKU naming another resolution does not price ours.
+RESOLUTION_WORD = re.compile(r"\d+[pk]")
 # Per-second SKUs that do not price a first-frame clip: other modes, inputs, and fees handled separately.
 SKIPPED_SKU_WORDS = ("reference", "continuation", "text_to_video", "megapixel", "video_input", "minimum",
                      "image_input")
@@ -70,15 +71,17 @@ def _dollars(key, value):
 def _per_second(info, resolution, audio):
     """(dollars per second, SKU key) for a first-frame clip at this resolution, or None.
 
-    A resolution-specific SKU beats a generic one. With audio, a with-audio rate is used where one is listed;
-    without audio, a without-audio rate. Otherwise the plain rate, and then the other audio rate (as a bound).
+    A SKU naming any other resolution (`_540p`, `_2k`, ...) is skipped, and one naming ours beats a generic one.
+    With audio, a with-audio rate is used where one is listed, otherwise the plain rate; a without-audio rate
+    never prices a clip with sound, so a listing with only those is unknown. Without audio, a without-audio rate,
+    otherwise the plain rate, and then the with-audio rate (as a bound).
     """
     groups = {"with": [], "plain": [], "without": []}
     for key, value in (info.get("pricing_skus") or {}).items():
         k = key.lower()
         if "second" not in k or any(word in k for word in SKIPPED_SKU_WORDS):
             continue
-        named = set(k.split("_")) & RESOLUTION_TOKENS
+        named = {word for word in k.split("_") if RESOLUTION_WORD.fullmatch(word)}
         if named and resolution.lower() not in named:
             continue
         rate = _dollars(key, value)
@@ -86,7 +89,7 @@ def _per_second(info, resolution, audio):
             continue
         kind = "without" if "without_audio" in k else "with" if "with_audio" in k else "plain"
         groups[kind].append((bool(named), rate, key))
-    order = ("with", "plain", "without") if audio else ("without", "plain", "with")
+    order = ("with", "plain") if audio else ("without", "plain", "with")
     entries = next((groups[kind] for kind in order if groups[kind]), None)
     if entries is None:
         return None
@@ -95,33 +98,8 @@ def _per_second(info, resolution, audio):
     return best[1], best[2]
 
 
-def price(info, seconds, resolution, aspect, fps=FPS, audio=None, size=None):
-    """(estimated dollars for one clip, pricing basis), or (None, why the price is unknown).
-
-    `video_tokens`: w x h x fps x seconds / 1024 x price. Otherwise a per-second SKU (keys with `cents` are in
-    cents) x seconds, plus one image-input fee for the first frame, raised to any per-generation minimum.
-    `audio` defaults to what `generate` sends (`sends_audio`).
-    """
-    audio = sends_audio(info) if audio is None else audio
-    skus = info.get("pricing_skus") or {}
-    if "video_tokens" in skus:
-        rate = _number(skus["video_tokens"])
-        if rate is None:
-            return None, f"unknown: video_tokens price {skus['video_tokens']!r} is not a number"
-        if size is None:
-            try:
-                size = size_for(info, resolution, aspect)
-            except StageError:
-                return None, f"unknown: video_tokens but no {resolution} {aspect} size to count tokens"
-        w, h = size
-        return (w * h * fps * seconds / 1024 * rate,
-                f"video_tokens: {w}x{h} x {fps} fps x {seconds} s / 1024 x ${skus['video_tokens']}")
-    per_second = _per_second(info, resolution, audio)
-    if per_second is None:
-        return None, f"unknown: no video_tokens or per-second SKU for {resolution} ({', '.join(skus) or 'none'})"
-    rate, key = per_second
-    cost = rate * seconds
-    basis = f"per second: {key} = ${rate:g}/s x {seconds} s"
+def _fees(skus, cost, basis):
+    """Add one image-input fee for the first frame, then raise the total to any per-generation minimum."""
     for fee_key, value in skus.items():
         fee = _dollars(fee_key, value) if "image_input" in fee_key.lower() else None
         if fee is not None:
@@ -133,6 +111,36 @@ def price(info, seconds, resolution, aspect, fps=FPS, audio=None, size=None):
             cost = minimum
             basis += f", raised to {floor_key} ${cost:g}"
     return cost, basis
+
+
+def price(info, seconds, resolution, aspect, fps=FPS, audio=None, size=None):
+    """(estimated dollars for one clip, pricing basis), or (None, why the price is unknown).
+
+    `video_tokens_<resolution>` (else `video_tokens`): w x h x fps x seconds / 1024 x price. Otherwise a
+    per-second SKU (keys with `cents` are in cents; see `_per_second`) x seconds. Either way, plus one
+    image-input fee for the first frame, raised to any per-generation minimum. `audio` defaults to what
+    `generate` sends (`sends_audio`).
+    """
+    audio = sends_audio(info) if audio is None else audio
+    skus = info.get("pricing_skus") or {}
+    token_key = next((key for key in (f"video_tokens_{resolution.lower()}", "video_tokens") if key in skus), None)
+    if token_key is not None:
+        rate = _number(skus[token_key])
+        if rate is None:
+            return None, f"unknown: {token_key} price {skus[token_key]!r} is not a number"
+        if size is None:
+            try:
+                size = size_for(info, resolution, aspect)
+            except StageError:
+                return None, f"unknown: {token_key} but no {resolution} {aspect} size to count tokens"
+        w, h = size
+        return _fees(skus, w * h * fps * seconds / 1024 * rate,
+                     f"{token_key}: {w}x{h} x {fps} fps x {seconds} s / 1024 x ${skus[token_key]}")
+    per_second = _per_second(info, resolution, audio)
+    if per_second is None:
+        return None, f"unknown: no video_tokens or per-second SKU for {resolution} ({', '.join(skus) or 'none'})"
+    rate, key = per_second
+    return _fees(skus, rate * seconds, f"per second: {key} = ${rate:g}/s x {seconds} s")
 
 
 def _resolution_of(w, h):
@@ -230,7 +238,7 @@ def run_generate(client, out_dir, model_id, brief, reference_png, background, ca
                 if each is None and unpriced:
                     raise StageError(f"Job {unpriced[0]} reported no cost and the model lists no price, so further "
                                      f"spending cannot be bounded")
-                bound = each if each is not None else observed
+                bound = observed if each is None else max(each, observed)
                 if max_cost is not None and spent + bound > max_cost:
                     raise StageError(f"Another candidate (about ${bound:.2f}) would take spending past --max-cost "
                                      f"${max_cost:.2f}")
