@@ -9,7 +9,7 @@ exports a bundle for the owner to approve. It never writes `game/assets`. Agents
 ## Install
 
 ```bash
-git clone --branch anim-pipeline-2026-10-16 https://github.com/tonyseing/vid2godot.git ~/.vid2godot/repo
+git clone --branch anim-pipeline-2026-10-16.1 https://github.com/tonyseing/vid2godot.git ~/.vid2godot/repo
 python3 ~/.vid2godot/repo/install.py
 ```
 
