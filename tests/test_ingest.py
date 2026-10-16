@@ -168,6 +168,34 @@ class IngestUnitTests(unittest.TestCase):
         mask = ingest.silhouette(img, ingest.background_colour(img))
         self.assertEqual(int(mask.sum()), 60 * 40)
 
+    def test_silhouette_keeps_the_gap_between_touching_paws(self):
+        """Two legs whose paws touch close a pocket of background under the body: it stays background."""
+        img = np.zeros((180, 320, 3), dtype=np.uint8)
+        img[:] = GREY
+        dark = (40, 30, 25)
+        img[60:100, 100:220] = dark               # body
+        img[100:150, 110:122] = dark              # back leg
+        img[100:150, 190:202] = dark              # front leg
+        img[140:150, 110:202] = dark              # the two paws touching along the ground
+        gap = np.zeros((180, 320), dtype=bool)
+        gap[100:140, 122:190] = True
+        mask = ingest.silhouette(img, ingest.background_colour(img))
+        self.assertFalse(mask[gap].any(), "background enclosed by the legs was filled")
+        self.assertEqual(int(mask.sum()), int(np.any(img != GREY, axis=2).sum()))
+
+    def test_silhouette_fills_enclosed_subject_coloured_pixels(self):
+        """A thin subject-coloured line inside an enclosed pocket is lost to the opening; it is subject, so it is
+        filled back, while the pocket's background pixels around it stay out."""
+        img = np.zeros((180, 320, 3), dtype=np.uint8)
+        img[:] = GREY
+        dark = (40, 30, 25)
+        img[60:140, 100:220] = dark
+        img[80:120, 130:190] = GREY               # an enclosed background pocket
+        img[100, 140:180] = dark                  # a 1 px subject line in it (the 3x3 opening removes it)
+        mask = ingest.silhouette(img, ingest.background_colour(img))
+        self.assertTrue(mask[100, 140:180].all())
+        self.assertFalse(mask[85:95, 135:185].any())
+
     def test_border_touch_flagged(self):
         mask = ingest.silhouette(frame(290), np.array(GREY, dtype=float))
         self.assertTrue(ingest.touches_border(mask))

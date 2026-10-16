@@ -5,6 +5,8 @@ from anim.ledger import StageError
 
 LEAD_IN = 0.10
 PERIOD_MAX_SCORE = 0.2
+# Cycles whose normalised difference from their neighbour cycles is within this of the steadiest are equally steady.
+STEADY_TOL = 0.01
 
 
 class FactsError(StageError):
@@ -52,6 +54,40 @@ def best_start(values, period):
         raise FactsError("No full cycle after the lead-in; generate a longer video")
     later = resample(values, np.array(candidates, float) + period)
     return min(candidates, key=lambda s: float(np.sum((values[s] - later[s - first]) ** 2)))
+
+
+def steadiest_start(values, period):
+    """The whole frame after the lead-in that starts the steadiest full cycle.
+
+    An AI video starts from the reference pose and settles over a cycle or two, and a small warm-up swing can match
+    its own next swing better than a full one does, so the seam alone (`best_start`) can pick the warm-up. Each start
+    is scored instead by how far its whole cycle is, phase for phase (n samples per period), from the cycle one
+    period later and the cycle one period earlier, wherever the clip holds them (mean squared difference; the seam is
+    the first sample), normalised like the period score (by twice the mean total variance). Only starts with a
+    neighbouring cycle are scored; a clip too short for any falls back to the seam. Among the starts within
+    STEADY_TOL of the steadiest, the cleanest seam wins (as `best_start`), so a clip that repeats exactly keeps the
+    seam choice."""
+    first, length = int(np.ceil(LEAD_IN * len(values))), len(values)
+    candidates = list(range(first, int(np.floor(length - 1 - period)) + 1))
+    if not candidates:
+        raise FactsError("No full cycle after the lead-in; generate a longer video")
+    n = max(2, int(round(period)))
+    phase = np.arange(n) * period / n
+    scores = {}
+    for s in candidates:
+        here = resample(values, s + phase)
+        terms = [float(np.mean(np.sum((here - resample(values, s + shift + phase)) ** 2, axis=1)))
+                 for shift in (period, -period) if 0 <= s + shift and s + shift + period <= length - 1]
+        if terms:
+            scores[s] = float(np.mean(terms))
+    if not scores:
+        return best_start(values, period)
+    x = values - values.mean(axis=0)
+    scale = 2 * float(np.mean(np.sum(x ** 2, axis=1))) or 1.0
+    low = min(scores.values())
+    steady = [s for s, v in scores.items() if v <= low + STEADY_TOL * scale]
+    later = resample(values, np.array(steady, float) + period)
+    return min(steady, key=lambda s: float(np.sum((values[s] - later[steady.index(s)]) ** 2)))
 
 
 def contact_mask(z, tol=0.025):
@@ -113,7 +149,7 @@ def clip_facts(poses, project, brief):
             times = begin + np.arange(n) * period / n
             return {c: resample(paws[c], times) for c in chains}
 
-        start = float(best_start(values, period))
+        start = float(steadiest_start(values, period))
         cycle = cycle_paws(start)
         masks = {c: contact_mask(cycle[c][:, 1]) for c in chains}
         touchdown = int(round(contact_window(masks[origin])[0][0] * n))

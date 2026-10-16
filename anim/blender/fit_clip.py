@@ -17,6 +17,11 @@ median for the refinement. The refined camera goes to poses.json as "camera" ("c
 record the change); dx/dz stay in model metres. The first frame has no prior, so it is solved from several camera
 scales with coarse grid searches over the legs, and the best is polished with local grids at the middle level.
 
+The prior only steadies the tracking (W_SMOOTH is small next to the silhouette term), and a tracked frame does not
+keep the first local minimum it finds: each leg pair is tried exchanged, the spine and neck from rest and every chain
+from random restarts, and a frame still below RESTART_IOU is solved again from scratch like the first frame; when
+that global solution wins, tracking continues from it without the old velocity.
+
 Left and right legs give the same side silhouette, so after the forward pass each leg pair's identity is relabelled
 per frame by dynamic programming (marks plus smooth velocity; a span refit also takes up to two fixed frames on
 each side, pinned as fitted, so the span keeps its neighbours' identity), and the clip is then refined with a
@@ -41,7 +46,7 @@ SWEEPS = 4
 MAX_REPEAT = 6
 SPACING = 0.85                                  # sample spacing in level pixels: no holes when splatting
 W_IOU, W_CHAMFER, W_MARKS = 40.0, 1.0, 0.5
-W_SMOOTH, W_OFFSET = 20.0, 0.01                 # per rad^2 of prior error; per working px^2 of offset error
+W_SMOOTH, W_OFFSET = 2.0, 0.01                  # per rad^2 of prior error; per working px^2 of offset error
 W_SWAP_MARKS, W_SWAP_ACCEL = 1.0, 400.0         # identity relabelling: mark px vs rad^2 of acceleration
 TIE = 1e-9                                      # relabelling costs this close (relative) go to label 0
 VELOCITY = 0.8                                  # share of the last frame's velocity the prior carries forward
@@ -53,6 +58,10 @@ CROSSING_PX = 4.0
 MAX_BOUNDARY = 800
 MAX_VIDEO_POINTS = 300
 FIRST_SCALES = (0.94, 0.96, 0.98, 1.0, 1.02, 1.04, 1.06)   # starts for the first frame's camera scale
+RESTARTS = 4                                    # random restarts per chain on every tracked frame
+RESTART_SIGMA = math.radians(25.0)              # their spread about the tracked pose
+RESTART_IOU = 0.85                              # a tracked frame below this IoU is also solved from scratch
+RESTART_SCALES = (-0.02, 0.0, 0.02)             # that global search's camera-scale starts, about the tracked one
 
 args = rigutil.load_args()
 base_camera = SideCamera.from_json(args["camera"])
@@ -394,8 +403,11 @@ def child_index(i):
 MOVES = [(i, None) for i in range(N)] + [(i, child_index(i)) for i in range(2, N) if child_index(i) is not None]
 
 
-def descend(x, f, prior, free_scale=False, schedule=LEVELS, w_marks=W_MARKS):
+def descend(x, f, prior, free_scale=False, schedule=LEVELS, w_marks=W_MARKS, only=None):
+    """Greedy coordinate descent, coarse to fine. `only` limits the moves to those indices."""
     moves = MOVES + ([(SCALE, None)] if free_scale else [])
+    if only is not None:
+        moves = [(i, c) for i, c in moves if i in only and (c is None or c in only)]
     best = None
     for k in schedule:
         best = score(x, f, prior, k, w_marks)
@@ -477,10 +489,10 @@ def chain_search(x, f):
     return x
 
 
-def first_frame(f, known_scale):
-    """No previous frame: a global start (each start scale, then a coarse grid per leg), solved coarse first; the two
-    best coarse solutions are refined to full resolution."""
-    starts = [known_scale] if known_scale else FIRST_SCALES
+def first_frame(f, known_scale, scales=FIRST_SCALES):
+    """No previous frame: a global start (each start scale, then a coarse grid per leg), solved coarse first; the
+    three best coarse solutions are refined to the middle level and the best of them to full resolution."""
+    starts = [known_scale] if known_scale else scales
     coarse = []
     for s in starts:
         x = chain_search(initial_offset(f, s), f)
@@ -524,6 +536,59 @@ def predict(history):
     out = history[-1] + VELOCITY * (history[-1] - history[-2])
     out[SCALE] = history[-1][SCALE]
     return out
+
+
+chain_indices = {chain: [names.index(b) for b in project["chains"][chain] if b in names]
+                 for chain in brief["fitChains"]}
+trunk = [i for chain in ("spine", "neck") if chain in chain_indices for i in chain_indices[chain]]
+
+
+def frame_iou(x, f):
+    uv, _ = posed_uv(x)
+    return levels[1.0].loss(uv, f)[1]
+
+
+def search(x, f, prior, free_scale):
+    """Leave the tracked pose's local minimum: each leg pair exchanged, the spine and neck from rest, and RESTARTS
+    random restarts of every chain, each solved over its own joints at the middle level and kept when the whole
+    objective (prior included) improves; any change is then polished at full resolution."""
+    k = LEVELS[1]
+    best, start = score(x, f, prior, k), x.copy()
+    candidates = []
+    for pair in pairs:
+        candidates.append((swapped(x, pair), pair[2] + pair[3]))
+    if trunk:
+        y = x.copy()
+        y[trunk] = 0.0
+        candidates.append((y, trunk + [0, 1]))
+    for chain, idx in chain_indices.items():
+        for _ in range(RESTARTS):
+            candidates.append((None, idx))
+    for y, idx in candidates:
+        if y is None:            # a random restart about the best pose so far
+            y = x.copy()
+            y[idx] += rng.normal(0.0, RESTART_SIGMA, len(idx))
+        y, loss = descend(clamp(y), f, prior, schedule=(k,), only=set(idx))
+        if loss < best - 1e-6:
+            x, best = y, loss
+    if not np.array_equal(x, start):
+        x, _ = descend(x, f, prior, free_scale=free_scale, schedule=LEVELS[2:])
+    return x
+
+
+def restart(x, f, free_scale):
+    """A tracked frame still below RESTART_IOU: solve it again from scratch (the first frame's global search, about
+    the tracked camera scale) and keep whichever has the lower silhouette loss. Returns the pose and whether the
+    global solution won (tracking then restarts from it, without the old velocity)."""
+    if frame_iou(x, f) >= RESTART_IOU:
+        return x, False
+    if free_scale:
+        g, _ = first_frame(f, None, tuple(x[SCALE] + d for d in RESTART_SCALES))
+    else:
+        g, _ = first_frame(f, x[SCALE])
+    if score(g, f, None, 1.0) < score(x, f, None, 1.0) - 1e-6:
+        return g, True
+    return x, False
 
 
 # ------------------------------------------------------------------------------------------- identity relabelling
@@ -641,6 +706,11 @@ for f in frames:
         x, loss = first_frame(f, cam_scale)
     else:
         x, loss = descend(clamp(prior.copy()), f, (prior, 1.0), free_scale=scale_free)
+        x = search(x, f, (prior, 1.0), scale_free)
+        x, jumped = restart(x, f, scale_free)
+        loss = score(x, f, None if jumped else (prior, 1.0), 1.0)
+        if jumped:
+            history = []
     xs[f] = x
     history = (history + [x])[-2:]
     print(f"VID2GODOT_FIT frame {f + 1}/{frame_count} loss {loss:.3f} scale {x[SCALE]:.4f} "

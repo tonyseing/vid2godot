@@ -121,13 +121,16 @@ def background_colour(img, border=8):
 
 
 def silhouette(img, bg, threshold=40.0):
-    mask = ndimage.binary_opening(np.linalg.norm(img.astype(float) - bg, axis=2) > threshold,
-                                  structure=np.ones((3, 3)))
+    """The largest subject component. Enclosed pixels are filled only where their colour is the subject's (the same
+    background-distance test): two paws that touch enclose a pocket of background, and that pocket stays out."""
+    subject = np.linalg.norm(img.astype(float) - bg, axis=2) > threshold
+    mask = ndimage.binary_opening(subject, structure=np.ones((3, 3)))
     labels, count = ndimage.label(mask)
     if count == 0:
         return mask
     sizes = ndimage.sum(mask, labels, range(1, count + 1))
-    return ndimage.binary_fill_holes(labels == int(np.argmax(sizes)) + 1)
+    largest = labels == int(np.argmax(sizes)) + 1
+    return largest | (ndimage.binary_fill_holes(largest) & subject)
 
 
 def touches_border(mask, margin=2):

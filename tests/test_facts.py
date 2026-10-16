@@ -245,3 +245,22 @@ class FactsTests(unittest.TestCase):
         poses = synthetic(frames=10)
         with self.assertRaises(facts.FactsError):
             facts.clip_facts(poses, PROJECT, {"clip": "lope", "loop": True, "targetSpeedMps": None})
+
+    def test_steadiest_cycle_skips_the_warm_up(self):
+        """An AI video starts from the reference pose and settles over a couple of cycles. Here the joints swing at
+        a third of their amplitude until frame 26 and reach full amplitude by frame 34: the small warm-up swings
+        give the best-matching seam (two equal small cycles), but the chosen cycle must lie in the steady part."""
+        poses = synthetic(frames=96)
+        for entry in poses["frames"]:
+            f = entry["index"]
+            gain = 0.3 + 0.7 * min(1.0, max(0.0, (f - 26) / 8))
+            entry["values"] = entry["values"][:2] + [gain * v for v in entry["values"][2:]]
+        values = joint_values(poses)
+        period = facts.period_frames(values, 24.0)
+        self.assertAlmostEqual(period, 12, delta=0.1)
+        self.assertLess(facts.best_start(values, period), 26, "the seam alone prefers the warm-up")
+        self.assertGreaterEqual(facts.steadiest_start(values, period), 34)
+        result = facts.clip_facts(poses, PROJECT, LOPE)
+        self.assertGreaterEqual(result["start"], 34)
+        self.assertLessEqual(result["start"] + result["period"], 95)
+        self.assertEqual(result["entry"]["footfall_phase"]["paw_hl"], 0.0)
