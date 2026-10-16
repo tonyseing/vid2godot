@@ -193,6 +193,33 @@ def steady_cycles(masks, period, first):
     return {"starts": starts, "scores": scores, "kept": kept, "ref": min(kept, key=scores.get)}
 
 
+def cycle_periods(masks, starts, period, spread=0.2):
+    """Each cycle's own period (Task 19, the cadence's one-time-scale check): for the frames of the cycle starting at
+    s, the whole-frame lag within `spread` of `period` whose median aligned 1 - IoU against the frame that lag later
+    (earlier, when the clip ends first) is lowest, refined to a sub-frame lag (`refine`)."""
+    flat, area = aligned(masks)
+    count = len(flat)
+    low, high = max(2, int(math.floor(period * (1 - spread)))), int(math.ceil(period * (1 + spread)))
+    out = []
+    for s in starts:
+        frames = np.array([f for f in range(int(math.ceil(s - 1e-9)), count) if f < s + period - 1e-9])
+        if not len(frames):
+            continue
+        scores = {}
+        for lag in range(low - 1, high + 2):
+            later = frames[frames + lag < count]
+            if len(later) >= max(1, len(frames) // 2):
+                scores[lag] = float(np.median(pair_distance(flat, area, later, later + lag)))
+                continue
+            earlier = frames[frames - lag >= 0]
+            if len(earlier):
+                scores[lag] = float(np.median(pair_distance(flat, area, earlier, earlier - lag)))
+        inside = [lag for lag in range(low, high + 1) if lag in scores]
+        if inside:
+            out.append(refine(scores, min(inside, key=scores.get))[0])
+    return out
+
+
 # ------------------------------------------------------------------------------------------------- leg chains
 def leg_chains(project):
     return [c for pair in project.get("legPairs", []) for c in pair]

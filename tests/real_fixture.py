@@ -139,24 +139,36 @@ def leg_period_metrics(poses, fixture, masks):
             "maskMargin": round(found["margin"], 3), **legs}
 
 
+def rig_inspection(model, project, work, blender=None):
+    """The fixture rig's contract rig.json, from the contract stage's own rig inspection."""
+    return run_blender("inspect_rig", {"model": str(model), "chains": project["chains"],
+                                       "headBone": project["headBone"], "pelvisBone": project["pelvisBone"]},
+                       Path(work), blender)
+
+
 def rig_rest(model, project, work, blender=None):
     """The fixture rig's paw rest heights (facts.rest_heights), from the contract stage's own rig inspection."""
-    rig = run_blender("inspect_rig", {"model": str(model), "chains": project["chains"],
-                                      "headBone": project["headBone"], "pelvisBone": project["pelvisBone"]},
-                      Path(work), blender)
-    return facts.rest_heights(rig, project)
+    return facts.rest_heights(rig_inspection(model, project, work, blender), project)
 
 
-def facts_outcome(poses, project, brief, masks=None, render=None, rest=None):
+# Task 19: the fixture measures the fit, not the video's gait (the brief's), so facts' gait gate is reported here,
+# with this recorded reason, instead of refusing the fit.
+FIXTURE_GAIT = "real-fixture fit regression: the gait is reported, not gated"
+
+
+def facts_outcome(poses, project, brief, masks=None, render=None, rest=None, rig=None):
     """The facts stage itself on the fit (its period from the video masks, its averaged cycle rendered with
-    `render` and checked against them, each paw measured from its rest height `rest`): "ok" with its start, period
+    `render` and checked against them, each paw measured from its rest height `rest`; with the contract `rig`, the
+    contacts from the motion and the 60 Hz keys' contact check, as the pipeline runs it): "ok" with its start, period
     and the cycle evidence, or its refusal."""
     try:
-        result = facts.clip_facts(poses, project, brief, rest, masks=masks, render=render)
+        result = facts.clip_facts(poses, project, brief, rest, masks=masks, render=render, rig=rig,
+                                  accept_gait=FIXTURE_GAIT)
     except facts.FactsError as error:
         return {"ok": False, "error": str(error)}
     out = {"ok": True, "start": round(result["start"], 3), "period": round(result["period"], 3)}
-    for key in ("cyclesAveraged", "cycleStarts", "averagedCycleIoU", "maskPeriod", "legPeriod", "cycleCheck"):
+    for key in ("cyclesAveraged", "cycleStarts", "averagedCycleIoU", "maskPeriod", "legPeriod", "cycleCheck",
+                "gaitCheck", "contactCheck"):
         if key in result:
             out[key] = result[key]
     return out
@@ -281,20 +293,21 @@ def measure(fixture, poses, projection, masks_npz, model=None, blender=None, wor
     report = score_fit(poses, projection, masks_npz, fixture["brief"]["iouThreshold"], {})
     ious = {item["index"]: item["iou"] for item in report["frames"]}
     masks = np.load(masks_npz)["masks"]
-    render = rest = None
+    render = rest = rig = None
     if model is not None:
         from anim.pipeline import silhouette_renderer
         folder = Path(work or tempfile.mkdtemp()) / "facts"
         render = silhouette_renderer(model, poses, masks.shape[1:], folder, blender)
         folder.mkdir(parents=True, exist_ok=True)
-        rest = rig_rest(model, fixture["project"], folder, blender)
+        rig = rig_inspection(model, fixture["project"], folder, blender)
+        rest = facts.rest_heights(rig, fixture["project"])
     frames, spans = fixture["evalFrames"], [tuple(s) for s in fixture["spans"]]
     miss, far = forepaw_miss_share(poses, masks, frames=frames)
     swaps = leg_swaps(poses, fixture["project"]["legPairs"], fixture["project"]["chains"])
     return {**iou_metrics(ious, frames, spans), "meanIoUAll": report["meanIoU"], "forepawMissShare": miss,
             "forepawMisses": far, "legSwaps": {pair: len(f) for pair, f in swaps.items()}, "legSwapFrames": swaps,
             "period": period_metrics(poses), "facts": facts_outcome(poses, fixture["project"], fixture["brief"],
-                                                                    masks, render, rest),
+                                                                    masks, render, rest, rig),
             "legPeriod": leg_period_metrics(poses, fixture, masks), "periodicPass": poses.get("periodicPass"),
             "cameraScale": poses.get("cameraScale")}
 

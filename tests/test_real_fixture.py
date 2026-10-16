@@ -112,6 +112,20 @@ class MetricTests(unittest.TestCase):
         self.assertIn("forepaw", problems[1])
         self.assertIn("front_L/front_R", problems[2])
 
+    def test_facts_outcome_runs_the_rig_path_and_reports_the_gait(self):
+        """Task 19: the fixture's facts acceptance runs facts as the pipeline does (the rig: contacts from the motion,
+        the keys' contact check); the fixture measures the fit, so the brief's gait is reported, not gated."""
+        from tests import toy_rig
+        from tests.toy_gait import toy_video
+        poses = toy_rig.toy_gait()
+        masks, render = toy_video(poses)
+        brief = {"clip": "lope", "loop": True, "targetSpeedMps": None, "gait": "a working trot"}
+        out = rf.facts_outcome(poses, toy_rig.PROJECT, brief, masks, render, toy_rig.REST, rig=toy_rig.toy_rig())
+        self.assertIs(out["ok"], True, out.get("error"))
+        self.assertIs(out["gaitCheck"]["matches"], False)
+        self.assertEqual(out["gaitCheck"]["accepted"], rf.FIXTURE_GAIT)
+        self.assertGreaterEqual(min(out["contactCheck"]["agreement"].values()), 0.95)
+
     def test_period_metrics_use_the_facts_search(self):
         names = ["dx", "dz", "a", "b"]
         periodic = [{"index": f, "values": [0.0, 0.0, math.sin(2 * math.pi * f / 15.2),

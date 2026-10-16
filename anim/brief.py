@@ -9,7 +9,7 @@ from anim.ledger import StageError
 REQUIRED = ("clip", "subject", "motion", "gait", "loop", "planar", "videoSeconds")
 DEFAULTS = {"resolution": "720p", "aspectRatio": "16:9", "iouThreshold": 0.90,
             "backgrounds": ["#c8c8c8", "#7f7f7f", "#00b140"], "limitsDeg": {}, "fitChains": None,
-            "targetSpeedMps": None}
+            "targetSpeedMps": None, "massKg": None}
 TWO_VIEW = ("This motion leaves the side plane. One side camera cannot see depth, so the fit would match the "
             "outline while the 3D pose is wrong. It needs the two-view method, which this version does not support.")
 
@@ -47,6 +47,11 @@ def load_brief(path, project, clip):
     speed = brief["targetSpeedMps"]
     if speed is not None and (not is_number(speed) or not math.isfinite(speed) or speed <= 0):
         raise BriefError("targetSpeedMps must be null or a finite number above 0")
+    mass = brief["massKg"]
+    if mass is not None:
+        pair = isinstance(mass, list) and len(mass) == 2 and all(is_number(m) and math.isfinite(m) for m in mass)
+        if not (pair and 0 < mass[0] < mass[1]) and not (is_number(mass) and math.isfinite(mass) and mass > 0):
+            raise BriefError("massKg must be null, a body mass above 0 kg, or [lightest, heaviest] kg")
     chains = brief["fitChains"]
     if chains is None:
         chains = list(project["chains"])

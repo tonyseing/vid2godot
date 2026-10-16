@@ -69,6 +69,23 @@ class ReviewTests(unittest.TestCase):
         self.assertIn("Copy notes", page)
         self.assertNotIn("__DATA__", page)
 
+    def test_lab_page_shows_the_motion_facts(self):
+        """Task 19: the lab states the cadence retime factor, the gait check and the contact check, never silently."""
+        motion = review.motion_summary({"cadence": {"videoHz": 1.589, "hz": 2.51, "retime": 1.5797,
+                                                    "bandHz": [2.41, 2.61], "massKg": [30, 50],
+                                                    "massSource": "facts --mass-kg", "consistent": True},
+                                        "gaitCheck": {"expected": "canter", "matches": False,
+                                                      "accepted": "wolves gallop transversely",
+                                                      "measured": {"text": "4 beats"}},
+                                        "contactCheck": {"agreement": {"paw_hl": 0.97}, "gate": 0.95},
+                                        "entry": {"contacts": {"paw_hl": [0.0, 0.3]}}})
+        self.assertEqual(motion["cadence"]["retime"], 1.5797)
+        page = review.lab_page("lope", REPORT, 0.9, {"paw_hl": [True]}, {"glb": "ab" * 32}, motion)
+        self.assertIn('"retime": 1.5797', page)
+        self.assertIn("wolves gallop transversely", page)
+        self.assertIn('id="motion"', page)
+        self.assertIsNone(review.motion_summary(None))
+
     def test_contact_timeline_is_rest_relative(self):
         """Task 17b fix round 4: the lab's contact strip reads each paw from its own rest-pose tail height, as facts
         does (a front paw resting 2.7 cm over the hinds is still on the ground)."""

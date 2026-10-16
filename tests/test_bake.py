@@ -7,6 +7,7 @@ from pathlib import Path
 
 import numpy as np
 
+from anim import motion
 from anim.blender_run import run_blender
 from anim.contract import load_project_contract
 from anim.ledger import Ledger
@@ -183,9 +184,13 @@ class BakeTests(unittest.TestCase):
         np.testing.assert_allclose(moves[:, 0], 0.002 * (np.arange(n + 1) - (n - 1) / 2), atol=1e-4)
         self.assertAlmostEqual(moves[n, 0] - moves[0, 0], 0.002 * n, places=4)   # a one-shot keeps its travel shape
 
-    def test_bake_command_writes_glb_sheet_and_closeup(self):
+    def bake_command(self, offset=0.0):
+        """`bake` through the CLI on the fixture rig. Changed with Task 19: facts hands the bake periodic keys (no
+        drift, dx mean-free) and its own prediction of every paw at every key, which the bake checks on the
+        re-imported GLB; `offset` moves the prediction to test that check."""
         glb, _ = fixture_glb()
-        bones, names, cycle = fixture_cycle()
+        n = 24
+        bones, names, cycle = fixture_cycle(n, dx=lambda k: sway(k, n, 0.004), dz=lambda k: sway(k, n, 0.005, 1.0))
         tmp = Path(tempfile.mkdtemp())
         self.addCleanup(shutil.rmtree, tmp)
         work = tmp / "w"
@@ -206,11 +211,24 @@ class BakeTests(unittest.TestCase):
         (work / "fit").mkdir()
         (work / "fit" / "poses.json").write_text(json.dumps({"bones": bones, "names": names, "fps": 24.0}))
         ledger.record("fit", {}, {"poses": work / "fit" / "poses.json"})
+        project = load_project_contract(FIXTURE_CONTRACT)
+        rig = motion.PlanarRig(json.loads((work / "contract" / "rig.json").read_text()))
+        predicted = rig.paws(np.array(cycle["frames"]), names, project)
+        cycle["paws"] = {project["paws"][c]: (p + offset).tolist() for c, p in predicted.items()}
         (work / "facts").mkdir()
         (work / "facts" / "facts.json").write_text(json.dumps({"cycle": cycle}))
         ledger.record("facts", {}, {"facts": work / "facts" / "facts.json"})
-        code, data, err = run("bake", "--work", str(work))
+        return work, run("bake", "--work", str(work))
+
+    def test_a_bake_whose_paws_miss_the_facts_prediction_is_refused(self):
+        _, (code, _, err) = self.bake_command(offset=0.005)
+        self.assertEqual(code, 1)
+        self.assertRegex(err, r"paw.*facts.*mm")
+
+    def test_bake_command_writes_glb_sheet_and_closeup(self):
+        work, (code, data, err) = self.bake_command()
         self.assertEqual(code, 0, err)
+        self.assertLess(data["pawErrorMm"], 0.5)
         self.assertEqual(Path(data["glb"]).name, "test_rig-walk_fit-eval.glb")
         self.assertIn("walk", channels(data["glb"])[0])
         with Image.open(data["sheet"]) as image:

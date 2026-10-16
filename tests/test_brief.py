@@ -66,3 +66,12 @@ class BriefTests(unittest.TestCase):
             path.write_text(json.dumps({k: v for k, v in GOOD.items() if k != "gait"}))
             with self.assertRaises(BriefError):
                 load_brief(path, PROJECT, "walk")
+
+    def test_body_mass(self):
+        """Task 19 step 3: an optional massKg (a number, or [lightest, heaviest]) sets the cadence band."""
+        self.assertIsNone(self.load()["massKg"])
+        self.assertEqual(self.load(massKg=40)["massKg"], 40)
+        self.assertEqual(self.load(massKg=[30, 50])["massKg"], [30, 50])
+        for bad in (0, -3, True, "40", [50, 30], [30], [30, 50, 70], [0, 5], float("nan")):
+            with self.subTest(massKg=bad), self.assertRaises(BriefError):
+                self.load(massKg=bad)

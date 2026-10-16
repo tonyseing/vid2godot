@@ -11,10 +11,26 @@ point: a paw that never comes within CONTACT_TOLERANCE of that ground has no con
 lead, suspension and ground speed come from the planted paws only. A one-sample lift inside a stance is bridged.
 Each paw's height is measured from its own rest-pose tail height (`rest_heights`, from the contract's rig.json) before
 the ground and the tolerance apply: a rig's paw tails need not rest at one height (the chase3d wolf's front tails
-rest 2.7 cm over its hind tails), and absolute heights would read the higher-resting paws as never planting."""
+rest 2.7 cm over its hind tails), and absolute heights would read the higher-resting paws as never planting.
+
+Task 19: a paw is on the ground while it is near that ground AND world-still: in the in-place clip a planted paw slides
+back at the body's ground speed, so its in-place x speed is within SLIP_SHARE of minus the ground speed (measured from
+the planted paws). A stance is seeded within CONTACT_TOLERANCE of the ground and carries on while the paw stays still
+within STANCE_TOLERANCE (a side silhouette lets the fit hold a planted paw a few cm up). With the contract's rig
+(`rig`), the motion is the forward kinematics of the smooth periodic cycle (anim/motion.py) at DENSE samples; the
+keys pin every planted paw over that detection on the 60 Hz key grid (two-bone IK), the declared contacts reach half a
+key past the pinned keys at each end (where between keys the paw lands and lifts; so the phase origin's footfall is
+1 - 0.5 / n_keys, half a key before key 0); and the
+keys, played as the clip plays them, are detected again (the same rule, without the fit-error allowance): under
+CONTACT_AGREEMENT per paw facts refuses. The footfall
+pattern is checked against the brief's `gait` (`expected_gait`, `gait_reads`), and the cadence against the
+Heglund-Taylor band for the body mass (`cadence_check`): a slow video with one consistent period is retimed to the band
+centre, recorded in `cadence` and the warnings."""
+import re
+
 import numpy as np
 
-from anim import cycle
+from anim import cycle, motion
 from anim.ledger import StageError
 
 LEAD_IN = 0.10
@@ -31,6 +47,25 @@ CONTACT_TOLERANCE = 0.025
 GROUND_PERCENTILE = 5
 # Touchdowns closer than this (a fraction of the cycle, and never less than one cycle sample) are one beat.
 BEAT_TOLERANCE = 0.07
+# Task 19. A planted paw's world speed (its in-place x speed plus the ground speed) is under SLIP_SHARE of the ground
+# speed: a swinging paw passes the ground at about twice the body's speed, a planted one ~0. A stance seeded within
+# CONTACT_TOLERANCE carries on while the paw stays that still within STANCE_TOLERANCE of the ground. Measured on the
+# real lope (FK of the smooth cycle): the paws are world-still at 3-6 cm for up to 0.15 of a cycle around their
+# lowest point (front_L), sliding at 0.0-0.9 m/s against swings at 2-8 m/s (ground speed 3.6 m/s).
+SLIP_SHARE = 0.3
+STANCE_TOLERANCE = 0.06
+# Free gaps up to this share of the cycle inside a stance are bridged on the dense samples (one sample of the
+# ~15-sample averaged cycle before).
+BRIDGE_PHASE = 0.05
+DENSE = 240                  # samples per cycle the rig's motion is read at
+CONTACT_AGREEMENT = 0.95     # declared contacts vs a re-detection from the baked keys, per paw
+STILL_SPEED = 0.10           # m/s: the report's "still" for a planted paw in the played clip
+MASS_SPREAD = 0.25           # a single massKg m is the range [m (1 - spread), m (1 + spread)]
+CADENCE_CONSISTENCY = 0.10   # every steady cycle's own period within this share of the clip's: one time scale
+GALLOPS = ("canter", "gallop", "transverse gallop", "rotary gallop")
+# The brief's `gait` vocabulary: the earliest of these words (at a word start) names the expected gait.
+GAIT_WORDS = (("transverse gallop", "transverse gallop"), ("rotary gallop", "rotary gallop"), ("gallop", "gallop"),
+              ("canter", "canter"), ("lope", "canter"), ("trot", "trot"), ("pace", "pace"), ("walk", "walk"))
 
 
 class FactsError(StageError):
@@ -114,16 +149,42 @@ def contact_mask(z, ground, tol=CONTACT_TOLERANCE):
     return np.asarray(z, float) <= ground + tol
 
 
-def bridge(mask, circular=False):
-    """One free sample between two contact samples is part of the stance: fit noise lifts a planted paw a few
-    millimetres over the tolerance for a sample (the real lope's hind_L, Task 17b fix round 3), and a paw cannot lift
-    and plant again within one sample. `circular` joins the ends (one loop cycle)."""
+def runs(mask, circular=False):
+    """The True runs of a mask as (start, length); with `circular` a run across the end joins the first."""
     mask = np.asarray(mask, bool)
-    if len(mask) < 3:
-        return mask.copy()
-    before, after = (np.roll(mask, 1), np.roll(mask, -1)) if circular else (
-        np.concatenate([[False], mask[:-1]]), np.concatenate([mask[1:], [False]]))
-    return mask | (before & after)
+    n = len(mask)
+    if not mask.any():
+        return []
+    if mask.all():
+        return [(0, n)]
+    first = int(np.argmin(mask)) if circular else 0
+    out, i = [], 0
+    while i < n:
+        if mask[(first + i) % n]:
+            j = i
+            while j < n and mask[(first + j) % n]:
+                j += 1
+            out.append(((first + i) % n, j - i))
+            i = j
+        else:
+            i += 1
+    return out
+
+
+def bridge(mask, circular=False, gap=1):
+    """Free runs of at most `gap` samples between two contact samples are part of the stance: fit noise lifts a
+    planted paw a few millimetres over the tolerance for a sample (the real lope's hind_L, Task 17b fix round 3), and a
+    paw cannot lift and plant again that fast. `circular` joins the ends (one loop cycle); a clip's ends are open."""
+    mask = np.asarray(mask, bool)
+    out = mask.copy()
+    n = len(mask)
+    if n < 3 or not mask.any():
+        return out
+    for start, length in runs(~mask, circular):
+        bounded = circular or (start > 0 and start + length < n)
+        if length <= gap and bounded:
+            out[(start + np.arange(length)) % n] = True
+    return out
 
 
 def contact_masks(heights, ground=None, circular=False):
@@ -131,6 +192,192 @@ def contact_masks(heights, ground=None, circular=False):
     bridged."""
     ground = ground_height(heights) if ground is None else ground
     return {c: bridge(contact_mask(z, ground), circular) for c, z in heights.items()}
+
+
+def stance_masks(heights, vx, ground, speed, circular=False, gap=1, extent=STANCE_TOLERANCE):
+    """Each paw's stance (Task 19): world-still (in-place x speed within SLIP_SHARE * speed of -speed) and near the
+    shared ground: a run of still samples within STANCE_TOLERANCE that reaches CONTACT_TOLERANCE somewhere. Without
+    a ground speed (under two planted paws) stillness is not known and every sample counts as still."""
+    out = {}
+    for chain, z in heights.items():
+        z = np.asarray(z, float)
+        v = np.asarray(vx[chain], float)
+        still = np.abs(v + speed) <= SLIP_SHARE * speed if speed and speed > 0 else np.ones(len(z), bool)
+        core = still & (z <= ground + CONTACT_TOLERANCE)
+        reach = still & (z <= ground + extent)
+        keep = np.zeros(len(z), bool)
+        for start, length in runs(reach, circular):
+            index = (start + np.arange(length)) % len(z)
+            if core[index].any():
+                keep[index] = True
+        out[chain] = bridge(keep, circular, gap)
+    return out
+
+
+def speed_from(vx, masks):
+    """(speed, reason): minus the median in-place x speed of the planted paws while planted, or (None, why) when
+    fewer than two paws plant (one paw's stance is too little to trust for the clip's speed)."""
+    planted = [c for c in vx if masks[c].any()]
+    if len(planted) < 2:
+        names = ", ".join(planted) or "none"
+        return None, (f"{len(planted)} paw{'' if len(planted) == 1 else 's'} plant{'s' if len(planted) == 1 else ''} "
+                      f"({names}); ground speed needs at least two planted paws")
+    return float(-np.median(np.concatenate([np.asarray(vx[c], float)[masks[c]] for c in planted]))), None
+
+
+def motion_contacts(heights, vx, circular=False, gap=1):
+    """Contacts from the motion: the shared ground, then the ground speed from the paws near it, then each paw's
+    stance (`stance_masks`), the speed measured again from those stances and the stances read with it. Returns
+    (ground, speed, speed reason, masks)."""
+    ground = ground_height(heights)
+    near = {c: bridge(contact_mask(z, ground), circular, gap) for c, z in heights.items()}
+    speed, reason = speed_from(vx, near)
+    masks = stance_masks(heights, vx, ground, speed, circular, gap)
+    if speed is not None:
+        again, why = speed_from(vx, masks)
+        if again is not None and again > 0:
+            speed, reason = again, why
+            masks = stance_masks(heights, vx, ground, speed, circular, gap)
+    return ground, speed, reason, masks
+
+
+def circular_speed(x, dt):
+    """The x speed of one periodic cycle of samples (central differences across the seam)."""
+    x = np.asarray(x, float)
+    return (np.roll(x, -1) - np.roll(x, 1)) / (2 * dt)
+
+
+# ------------------------------------------------------------------------------------------- the gait gate
+def expected_gait(text):
+    """The gait the brief's `gait` text names: the earliest word of GAIT_WORDS in it (at a word start), or None."""
+    text = (text or "").lower()
+    found = []
+    for word, gait in GAIT_WORDS:
+        match = re.search(r"\b" + word, text)
+        if match:
+            found.append((match.start(), -len(word), gait))
+    return min(found)[2] if found else None
+
+
+def _kind(chain):
+    return "front" if chain.startswith("front") else "hind" if chain.startswith("hind") else chain
+
+
+def _side(chain):
+    return chain.rsplit("_", 1)[-1]
+
+
+def gait_reads(gait):
+    """The vocabulary's gaits a measured pattern (`gait_pattern` plus plantedPaws) reads as: walk (four single beats,
+    each hind followed by its own side's fore, no suspension), trot (two diagonal-pair beats), pace (two lateral-pair
+    beats), canter (three beats, one a diagonal pair, a fore lead, one suspension), gallop (four single beats, the
+    hinds together and the fores together, a suspension) and transverse or rotary gallop (its fore lead on the hind
+    lead's side or the other)."""
+    beats, suspensions, lead = gait["beatPaws"], len(gait["suspensions"]), gait["lead"]
+    if len(gait.get("plantedPaws", [])) < 4:
+        return []
+    pair = [b for b in beats if len(b) == 2 and _kind(b[0]) != _kind(b[1])]
+    diagonal = [b for b in pair if _side(b[0]) != _side(b[1])]
+    lateral = [b for b in pair if _side(b[0]) == _side(b[1])]
+    reads = []
+    if len(beats) == 4 and all(len(b) == 1 for b in beats):
+        order = [b[0] for b in beats]
+        hinds = [i for i, c in enumerate(order) if _kind(c) == "hind"]
+        if len(hinds) == 2 and (hinds[1] - hinds[0]) % 4 in (1, 3):
+            if suspensions >= 1:
+                reads.append("gallop")
+                front, hind = lead.get("front"), lead.get("hind")
+                if front and hind:
+                    reads.append("transverse gallop" if _side(front) == _side(hind) else "rotary gallop")
+        elif len(hinds) == 2 and suspensions == 0 and all(
+                _kind(order[(i + 1) % 4]) == "front" and _side(order[(i + 1) % 4]) == _side(order[i]) for i in hinds):
+            reads.append("walk")
+    if len(beats) == 2 and len(diagonal) == 2:
+        reads.append("trot")
+    if len(beats) == 2 and len(lateral) == 2:
+        reads.append("pace")
+    if (len(beats) == 3 and sorted(len(b) for b in beats) == [1, 1, 2] and diagonal and lead.get("front")
+            and suspensions == 1):
+        reads.append("canter")
+    return reads
+
+
+def describe_gait(gait):
+    beats = " | ".join("+".join(b) for b in gait["beatPaws"]) or "no planted paw"
+    lead = gait["lead"]
+    return (f"{gait['beats']} beats ({beats}), lead front {lead.get('front')}, hind {lead.get('hind')}, "
+            f"{len(gait['suspensions'])} suspension{'' if len(gait['suspensions']) == 1 else 's'}")
+
+
+def gait_check(gait, brief, accept_gait=None):
+    """The measured pattern against the brief's gait. A mismatch refuses unless `accept_gait` gives the reason."""
+    expected = expected_gait(brief.get("gait"))
+    reads = gait_reads(gait)
+    out = {"expected": expected, "checked": expected is not None,
+           "measured": {"text": describe_gait(gait), "reads": reads},
+           "matches": None if expected is None else expected in reads, "accepted": None}
+    if expected is not None and expected not in reads:
+        if not accept_gait:
+            raise FactsError(f"The brief's gait is a {expected}, but the motion's footfalls are {describe_gait(gait)}: "
+                             f"they read as {', '.join(reads) or 'none of walk, trot, pace, canter/lope, gallop'}. "
+                             f"Regenerate the video, or record why this motion stands with "
+                             f"`facts --accept-gait <reason>`")
+        out["accepted"] = accept_gait
+    return out
+
+
+# ------------------------------------------------------------------------------------------------ the cadence
+def mass_range(kg):
+    """[lightest, heaviest] kg: a single mass m is [m (1 - MASS_SPREAD), m (1 + MASS_SPREAD)]."""
+    if isinstance(kg, (list, tuple)):
+        return [float(kg[0]), float(kg[1])]
+    return [round(float(kg) * (1 - MASS_SPREAD), 6), round(float(kg) * (1 + MASS_SPREAD), 6)]
+
+
+def cadence_band(kg):
+    """The Heglund-Taylor stride-frequency band (Hz) over a mass range: [f(heaviest), f(lightest)]."""
+    low, high = mass_range(kg)
+    return [motion.heglund_taylor_hz(high), motion.heglund_taylor_hz(low)]
+
+
+def cadence_check(period, fps, gait_name, mass, periods):
+    """The stride frequency against the body-size band (galloping gaits: canter, gallop): the block for facts.json
+    and the warnings. A video under the band whose steady cycles share one period (each within
+    CADENCE_CONSISTENCY of the clip's) is retimed to the band centre; the factor scales the clip's speed."""
+    hz = fps / period
+    out = {"videoHz": round(hz, 4), "massKg": None, "massSource": None, "bandHz": None, "centreHz": None,
+           "checked": False, "consistent": None, "cyclePeriods": [round(p, 3) for p in periods], "retime": 1.0,
+           "hz": round(hz, 4), "law": "Heglund & Taylor 1988: stride frequency at the preferred galloping speed "
+                                      "4.44 M^-0.156 Hz"}
+    warnings = []
+    if mass is not None:
+        out["massKg"], out["massSource"] = mass_range(mass["kg"]), mass["source"]
+    if gait_name not in GALLOPS:
+        out["reason"] = f"no Heglund-Taylor band for a {gait_name or 'gait the brief does not name'}"
+        return out, warnings
+    if mass is None:
+        out["reason"] = "no body mass"
+        warnings.append("Cadence not checked: no body mass (the brief's massKg or `facts --mass-kg`)")
+        return out, warnings
+    band = cadence_band(mass["kg"])
+    centre = sum(band) / 2
+    consistent = bool(periods) and all(abs(p - period) / period <= CADENCE_CONSISTENCY for p in periods)
+    out.update({"bandHz": [round(b, 4) for b in band], "centreHz": round(centre, 4), "checked": True,
+                "consistent": consistent})
+    kg = "-".join(f"{m:g}" for m in out["massKg"])
+    if hz < band[0] and consistent:
+        factor = centre / hz
+        out["retime"], out["hz"] = round(factor, 6), round(centre, 4)
+        warnings.append(f"The video's cadence {hz:.2f} Hz is under the {band[0]:.2f}-{band[1]:.2f} Hz band for "
+                        f"{kg} kg: retimed by {factor:.3f} to {centre:.2f} Hz (the speed by the same factor)")
+    elif hz < band[0]:
+        warnings.append(f"The video's cadence {hz:.2f} Hz is under the {band[0]:.2f}-{band[1]:.2f} Hz band for "
+                        f"{kg} kg and not retimed: the steady cycles' own periods ({out['cyclePeriods']}) are not "
+                        f"one time scale")
+    elif hz > band[1]:
+        warnings.append(f"The video's cadence {hz:.2f} Hz is above the {band[0]:.2f}-{band[1]:.2f} Hz band for "
+                        f"{kg} kg; not retimed (only a slow video is)")
+    return out, warnings
 
 
 def paw_report(heights, masks, ground, project, rest):
@@ -165,21 +412,6 @@ def windows(mask):
             runs.append([round(start / last, 4), round(min(i, last) / last, 4)])
             start = None
     return runs
-
-
-def ground_speed(paw_x, masks, fps):
-    """(speed, reason): the median backward speed of the planted paws while on the ground, or (None, why) when fewer
-    than two paws plant (one paw's stance is too little to trust for the clip's speed)."""
-    planted = [c for c in paw_x if masks[c].any()]
-    if len(planted) < 2:
-        names = ", ".join(planted) or "none"
-        return None, (f"{len(planted)} paw{'' if len(planted) == 1 else 's'} plant{'s' if len(planted) == 1 else ''} "
-                      f"({names}); ground speed needs at least two planted paws")
-    velocities = []
-    for chain in planted:
-        v = np.gradient(paw_x[chain]) * fps
-        velocities.extend(v[masks[chain]])
-    return float(-np.median(velocities)), None
 
 
 def gait_pattern(masks, touchdowns, project, n):
@@ -225,27 +457,33 @@ def gait_pattern(masks, touchdowns, project, n):
             "lead": lead, "suspensions": suspensions, "beatTolerance": round(tol, 4)}
 
 
-def clip_facts(poses, project, brief, rest, masks=None, render=None):
+def clip_facts(poses, project, brief, rest, masks=None, render=None, rig=None, mass=None, accept_gait=None):
     """The clip's facts. `rest` is each paw chain's rest-pose tail height (`rest_heights`); the paws' heights are
     measured from it. A loop needs the video: `masks` (the ingest's working masks, (T, H, W) bool) and `render`
-    (value vectors -> the rig's silhouettes at the masks' size) for the averaged cycle's check."""
+    (value vectors -> the rig's silhouettes at the masks' size) for the averaged cycle's check.
+
+    Task 19: `rig` (the contract's rig.json) reads a loop's contacts from the forward kinematics of its smooth cycle
+    and makes the bake's 60 Hz keys (the pipeline always passes it; without it the averaged cycle's paw columns are
+    read and its samples are the keys, as before). `mass` ({"kg": m or [lo, hi], "source"}; else the brief's massKg)
+    sets the cadence band; `accept_gait` is the recorded reason a gait mismatch stands."""
     fps = float(poses["fps"])
     frames = poses["frames"]
     every = np.array([f["values"] for f in frames], float)
-    values = every[:, 2:]
     chains = list(project["paws"])
     paws = rest_relative({c: np.array([f["paws"][c] for f in frames], float) for c in chains}, rest, project)
     warnings = []
+    if mass is None and brief.get("massKg") is not None:
+        mass = {"kg": brief["massKg"], "source": "brief massKg"}
     if brief["loop"]:
-        found = loop_cycle(poses, project, every, paws, chains, masks, render, rest)
+        found = loop_cycle(poses, project, every, paws, chains, masks, render, rest, rig, brief, mass, accept_gait)
         start, period, entry, cycle_out, extra = found
         speed, speed_reason = entry["authored_speed_mps"], extra.pop("speedReason", None)
+        warnings += extra.pop("warnings", [])
     else:
         start, period = 0, len(frames) - 1
         heights = {c: paws[c][:, 1] for c in chains}
-        ground = ground_height(heights)
-        masks = contact_masks(heights, ground)
-        speed, speed_reason = ground_speed({c: paws[c][:, 0] for c in chains}, masks, fps)
+        vx = {c: np.gradient(paws[c][:, 0]) * fps for c in chains}
+        ground, speed, speed_reason, masks = motion_contacts(heights, vx)
         all_windows = {project["paws"][c]: windows(masks[c]) for c in chains}
         entry = {"duration_s": period / fps, "loop": False,
                  "authored_speed_mps": None if speed is None else round(speed, 3),
@@ -295,11 +533,14 @@ def leg_period(values, names, project, fps, period):
             "gate": PERIOD_MAX_SCORE}
 
 
-def loop_cycle(poses, project, every, paws, chains, masks, render, rest):
-    """The loop's cycle from the video: period, steady cycles, phase average, touchdown roll, the averaged cycle's
-    check against the masks. Returns (start, period, entry, cycle block, extra facts)."""
+def loop_cycle(poses, project, every, paws, chains, masks, render, rest, rig=None, brief=None, mass=None,
+               accept_gait=None):
+    """The loop's cycle from the video: period, steady cycles, phase average, the averaged cycle's check against the
+    masks, the contacts, the gait and cadence checks, and (with `rig`) the 60 Hz keys. Returns (start, period, entry,
+    cycle block, extra facts)."""
     if masks is None or render is None:
         raise FactsError("facts finds a loop's period in the video: it needs the ingest masks and the rig's renderer")
+    brief = brief or {}
     fps = float(poses["fps"])
     names = poses["names"]
     count = len(every)
@@ -336,43 +577,6 @@ def loop_cycle(poses, project, every, paws, chains, masks, render, rest):
     samples, exchanged = cycle.align_identity(samples, swaps, ref)
     # Root and paws are moved to the first averaged cycle, the one the start is read from.
     avg = cycle.phase_average(samples, kinds, 0)
-    origin = project.get("phaseOrigin", chains[0])
-    # One ground for every paw, from the averaged cycle (the same heights the contacts are read from).
-    ground = ground_height({c: avg[:n, paw_cols[c][1]] for c in chains})
-    contacts_of = contact_masks({c: avg[:n, paw_cols[c][1]] for c in chains}, ground, circular=True)
-    # The phase origin's touchdown starts the cycle; if it never plants, the first planted paw's does.
-    origin = next((c for c in [origin] + chains if contacts_of[c].any()), origin)
-    touchdown = int(round(contact_window(contacts_of[origin])[0][0] * n)) if contacts_of[origin].any() else 0
-    rolled = cycle.roll(avg, touchdown, kinds)
-    start = float(kept[0] + touchdown * period / n)
-    rate = n * fps / period
-    cycle_paws = {c: rolled[:n][:, list(paw_cols[c])] for c in chains}
-    heights = {c: cycle_paws[c][:, 1] for c in chains}
-    masks_of = contact_masks(heights, ground, circular=True)
-    speed, speed_reason = ground_speed({c: cycle_paws[c][:, 0] for c in chains}, masks_of, rate)
-    # A paw that never plants has no contact window and no footfall (an empty window would read as a touchdown);
-    # its duty factor is 0.
-    contacts, phase, duty, touchdowns = {}, {}, {}, {}
-    for c in chains:
-        bone = project["paws"][c]
-        if not masks_of[c].any():
-            duty[bone] = 0.0
-            continue
-        window, fraction = contact_window(masks_of[c])
-        contacts[bone], phase[bone], duty[bone] = window, window[0], round(fraction, 4)
-        touchdowns[c] = window[0]
-    entry = {"duration_s": period / fps, "loop": True,
-             "authored_speed_mps": None if speed is None else round(speed, 3),
-             "stride_m": None if speed is None else round(speed * period / fps, 3), "contacts": contacts,
-             "frames": n, "fps": rate, "footfall_phase": phase, "duty_factor": duty}
-    gait = {"plantedPaws": list(touchdowns), "neverPlants": [c for c in chains if c not in touchdowns],
-            "phaseOrigin": origin, **gait_pattern(masks_of, touchdowns, project, n)}
-    keys = rolled[:, :width].copy()
-    # The root's travel over one period (averaged over the cycles), taken before the closing key is overwritten:
-    # the bake removes drift * k / n, so a periodic sway is left untouched.
-    drift = {"dx": float(keys[-1][0] - keys[0][0]), "dz": float(keys[-1][1] - keys[0][1])}
-    keys[-1] = keys[0]
-    cycle_out = {"frames": keys.tolist(), "fps": rate, "periodFrames": period, "start": start, "drift": drift}
     check = check_cycle(avg, samples, exchanged, swaps, kept, period, n, kinds, width, masks, render)
     if check["meanIoU"] < CYCLE_MIN_IOU:
         phases = ", ".join(f"{v:.2f}" for v in check["phaseIoU"])
@@ -380,16 +584,193 @@ def loop_cycle(poses, project, every, paws, chains, masks, render, rest):
                          f"rendered at each frame's phase it scores mean IoU {check['meanIoU']:.3f} against the "
                          f"masks, under the gate {CYCLE_MIN_IOU}; per phase: {phases}. The fitted poses differ "
                          f"from cycle to cycle where the video repeats; refit (marks, spans) or regenerate")
+    # The root's travel over one period (averaged over the cycles): the bake keys the cycle in place.
+    drift = {"dx": float(avg[n][0] - avg[0][0]), "dz": float(avg[n][1] - avg[0][1])}
+    origin = project.get("phaseOrigin", chains[0])
+    if rig is None:
+        contacts = averaged_contacts(avg, n, kinds, paw_cols, chains, origin, fps, period, kept, project, rest)
+    else:
+        contacts = rig_contacts(avg, n, drift, names, project, rig, rest, chains, origin, fps, period, kept)
+    masks_of, touchdowns = contacts["masks"], {}
+    for c in chains:
+        if masks_of[c].any():
+            touchdowns[c] = contact_window(masks_of[c])[0][0]
+    gait = {"plantedPaws": list(touchdowns), "neverPlants": [c for c in chains if c not in touchdowns],
+            "phaseOrigin": contacts["origin"], **gait_pattern(masks_of, touchdowns, project, len(masks_of[chains[0]]))}
+    gate = gait_check(gait, brief, accept_gait)
+    cadence, warnings = cadence_check(period, fps, gate["expected"] or next(iter(gate["measured"]["reads"]), None),
+                                      mass, cycle.cycle_periods(masks, kept, period))
+    factor = cadence["retime"]
+    speed = contacts["speed"]
+    duration = period / fps / factor
     extra = {"periodSource": "video masks", "maskPeriod": found,
              "legPeriod": leg_period(every, names, project, fps, period),
              "cycleStarts": [round(s, 4) for s in kept], "cyclesAveraged": len(kept),
              "cycleScores": {f"{s:.4f}": round(v, 4) for s, v in steady["scores"].items()},
              "identityExchanged": exchanged, "averagedCycleIoU": check["meanIoU"], "cycleCheck": check,
-             "ground": ground_block(ground, "averaged cycle, all paws"),
-             "paws": paw_report(heights, masks_of, ground, project, rest), "gait": gait}
+             "ground": contacts["ground"], "paws": contacts["paws"], "gait": gait, "gaitCheck": gate,
+             "cadence": cadence, "warnings": warnings}
     if speed is None:
-        extra["speedReason"] = speed_reason
-    return start, period, entry, cycle_out, extra
+        extra["speedReason"] = contacts["speedReason"]
+    if rig is None:
+        keys, n_keys, declared = contacts["keys"], n, contacts["windows"]
+        cycle_out = {"frames": keys, "fps": n / duration, "periodFrames": period, "start": contacts["start"],
+                     "drift": contacts["drift"]}
+    else:
+        n_keys = motion.key_count(duration)
+        keys, declared, bake = rig_keys(contacts, n_keys, names, project, rig, rest, period / fps, factor)
+        extra.update({"smooth": contacts["smoothReport"], "contactCheck": bake["check"], "ik": bake["ik"]})
+        cycle_out = {"frames": keys, "fps": n_keys / duration, "periodFrames": period, "start": contacts["start"],
+                     "drift": {"dx": 0.0, "dz": 0.0}, "videoDrift": drift, "keyRate": motion.KEY_RATE,
+                     "retime": factor, "groundLift": round(-contacts["groundHeight"], 6), "paws": bake["paws"]}
+    entry = {"duration_s": duration, "loop": True,
+             "authored_speed_mps": None if speed is None else round(speed * factor, 3),
+             "stride_m": None if speed is None else round(speed * period / fps, 3), "contacts": {},
+             "frames": n_keys, "fps": n_keys / duration, "footfall_phase": {}, "duty_factor": {}}
+    for c in chains:
+        bone = project["paws"][c]
+        if c not in declared:
+            entry["duty_factor"][bone] = 0.0
+            continue
+        on, off = declared[c]
+        entry["contacts"][bone], entry["footfall_phase"][bone] = [round(on, 4), round(off, 4)], round(on, 4)
+        entry["duty_factor"][bone] = round((off - on) % 1.0 or 1.0, 4)
+    if factor != 1.0 and speed is not None:
+        extra["videoSpeedMps"] = round(speed, 3)
+    return contacts["start"], period, entry, cycle_out, extra
+
+
+def averaged_contacts(avg, n, kinds, paw_cols, chains, origin, fps, period, kept, project, rest):
+    """Without the rig: contacts from the averaged cycle's paw columns at its n samples, rolled to the phase
+    origin's touchdown; the keys are the rolled average (as before Task 19)."""
+    rate = n * fps / period
+
+    def read(table):
+        heights = {c: table[:n, paw_cols[c][1]] for c in chains}
+        vx = {c: np.gradient(table[:, paw_cols[c][0]])[:n] * rate for c in chains}
+        return motion_contacts(heights, vx, circular=True), heights
+    (ground, _, _, contacts_of), _ = read(avg)
+    # The phase origin's touchdown starts the cycle; if it never plants, the first planted paw's does.
+    origin = next((c for c in [origin] + chains if contacts_of[c].any()), origin)
+    touchdown = int(round(contact_window(contacts_of[origin])[0][0] * n)) if contacts_of[origin].any() else 0
+    rolled = cycle.roll(avg, touchdown, kinds)
+    (ground, speed, reason, masks), heights = read(rolled)
+    width = len(kinds) - 2 * len(chains)
+    keys = rolled[:, :width].copy()
+    # The root's travel over one period, taken before the closing key is overwritten: the bake removes
+    # drift * k / n, so a periodic sway is left untouched.
+    drift = {"dx": float(keys[-1][0] - keys[0][0]), "dz": float(keys[-1][1] - keys[0][1])}
+    keys[-1] = keys[0]
+    windows_of = {c: tuple(contact_window(masks[c])[0]) for c in chains if masks[c].any()}
+    return {"masks": masks, "speed": speed, "speedReason": reason, "origin": origin, "windows": windows_of,
+            "start": float(kept[0] + touchdown * period / n), "keys": keys.tolist(), "drift": drift,
+            "groundHeight": ground, "ground": ground_block(ground, "averaged cycle, all paws"),
+            "paws": paw_report(heights, masks, ground, project, rest)}
+
+
+def rig_contacts(avg, n, drift, names, project, rig, rest, chains, origin, fps, period, kept):
+    """With the rig: the smooth periodic cycle (motion.SmoothCycle of the averaged values, root drift removed),
+    its paws by forward kinematics at DENSE samples, the contacts from that motion, all rolled to the phase origin's
+    touchdown."""
+    width = len(names)
+    table = np.array(avg[:n, :width], float)
+    k = np.arange(n) / n
+    table[:, 0] -= drift["dx"] * k
+    table[:, 1] -= drift["dz"] * k
+    smooth = motion.SmoothCycle(table, names, project)
+    planar = motion.PlanarRig(rig)
+    grid = np.arange(DENSE) / DENSE
+    gap = max(1, int(round(BRIDGE_PHASE * DENSE)))
+    dt = period / fps / DENSE
+
+    def read(smooth_cycle):
+        paws = planar.paws(smooth_cycle.at(grid), names, project)
+        heights = {c: paws[c][:, 1] - float(rest[c]) for c in chains}
+        vx = {c: circular_speed(paws[c][:, 0], dt) for c in chains}
+        return motion_contacts(heights, vx, circular=True, gap=gap), heights
+    (_, _, _, first), _ = read(smooth)
+    origin = next((c for c in [origin] + chains if first[c].any()), origin)
+    touchdown = contact_window(first[origin])[0][0] if first[origin].any() else 0.0
+    smooth = smooth.roll(touchdown)
+    (ground, speed, reason, masks), heights = read(smooth)
+    report = {"orders": smooth.orders, "keptRange": smooth.kept_range(), "keep": motion.RANGE_KEEP,
+              "overtoneTaper": {k: v for k, v in smooth.taper.items() if v != 1.0},
+              "gain": {k: round(v, 4) for k, v in smooth.gain.items() if v != 1.0},
+              "jerkRatio": smooth.jerk_ratio(), "jerkMax": motion.JERK_MAX, "samplesPerCycle": DENSE}
+    return {"masks": masks, "speed": speed, "speedReason": reason, "origin": origin, "smooth": smooth,
+            "smoothReport": report, "start": float(kept[0] + touchdown * period), "groundHeight": ground,
+            "ground": ground_block(ground, "smooth cycle (forward kinematics of the rig), all paws"),
+            "paws": paw_report(heights, masks, ground, project, rest), "planar": planar}
+
+
+def widened(window, n_keys):
+    """A pinned window's declared contact: half a key interval wider at each end. Between the last key in the air
+    and the first pinned key the paw comes down somewhere; the midpoint is the estimate (likewise at liftoff)."""
+    on, off = window
+    if (on, off) == (0.0, 1.0):
+        return window
+    half = 0.5 / n_keys
+    return round((on - half) % 1.0, 6), round((off + half) % 1.0, 6)
+
+
+def snapped(mask, n_keys):
+    """A dense contact mask's window on the key grid: [on, off] as key phases, at least one key interval long."""
+    (on, off), _ = contact_window(mask)
+    if mask.all():
+        return 0.0, 1.0
+    a, b = int(round(on * n_keys)) % n_keys, int(round(off * n_keys)) % n_keys
+    if a == b:
+        b = (a + 1) % n_keys
+    return a / n_keys, b / n_keys
+
+
+def in_window(phases, window):
+    on, off = window
+    if (on, off) == (0.0, 1.0):
+        return np.ones(len(phases), bool)
+    return (phases >= on) & (phases < off) if off > on else (phases >= on) | (phases < off)
+
+
+def rig_keys(contacts, n_keys, names, project, rig, rest, period_s, factor):
+    """The bake's keys from the smooth cycle: every planted paw pinned (motion.plan_keys) over its detection on the
+    key grid, the declared contacts half a key wider at each end (`widened`), and the check: the keys played as the clip plays them (linear between
+    keys), their paws detected again with the same rule (near the ground within CONTACT_TOLERANCE and world-still;
+    no STANCE_TOLERANCE, which allows for the fit's height error), against the declared contacts. Refuses under
+    CONTACT_AGREEMENT for any paw. Returns (keys, declared windows, {"check", "ik", "paws"})."""
+    planar, speed = contacts["planar"], contacts["speed"]
+    pinned = {c: snapped(m, n_keys) for c, m in contacts["masks"].items() if m.any()}
+    declared = {c: widened(w, n_keys) for c, w in pinned.items()}
+    lift = -contacts["groundHeight"]
+    stride = (speed or 0.0) * period_s
+    keys, paws, ik = motion.plan_keys(planar, contacts["smooth"], names, project, pinned, stride, rest, lift,
+                                      n_keys)
+    played, phases = motion.played(keys)
+    dt = period_s / len(played)
+    heights, vx = {}, {}
+    for chain, track in planar.paws(played, names, project).items():
+        heights[chain] = track[:, 1] - float(rest[chain])
+        vx[chain] = circular_speed(track[:, 0], dt)
+    # The same rule without the fit-error allowance (STANCE_TOLERANCE): a pinned paw in the keys is on the ground.
+    again = stance_masks(heights, vx, 0.0, speed, circular=True, gap=max(1, int(round(BRIDGE_PHASE * len(played)))),
+                         extent=CONTACT_TOLERANCE)
+    agreement, still = {}, {}
+    for chain in heights:
+        bone = project["paws"][chain]
+        want = in_window(phases, declared[chain]) if chain in declared else np.zeros(len(phases), bool)
+        agreement[bone] = round(float(np.mean(want == again[chain])), 4)
+        if want.any() and speed:
+            world = np.abs(vx[chain] + speed) * factor
+            still[bone] = round(float(np.mean(world[want] < STILL_SPEED)), 4)
+    check = {"agreement": agreement, "gate": CONTACT_AGREEMENT, "plantedStillShare": still,
+             "stillSpeedMps": STILL_SPEED, "samples": len(played), "keys": n_keys}
+    low = {b: a for b, a in agreement.items() if a < CONTACT_AGREEMENT}
+    if low:
+        raise FactsError(f"The declared contacts and a re-detection from the baked keys disagree: they agree on "
+                         f"{', '.join(f'{b} {a:.2f}' for b, a in low.items())} of the played cycle, under the gate "
+                         f"{CONTACT_AGREEMENT} (leg IK: {ik}). The keys do not plant those paws where facts "
+                         f"declared them; check the leg chains, the fit's paws and the IK residuals")
+    return keys.tolist(), declared, {"check": check, "ik": ik,
+                                     "paws": {project["paws"][c]: np.round(p, 6).tolist() for c, p in paws.items()}}
 
 
 def check_cycle(avg, samples, exchanged, swaps, kept, period, n, kinds, width, masks, render):

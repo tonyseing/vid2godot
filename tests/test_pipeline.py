@@ -90,3 +90,78 @@ class PipelineTests(unittest.TestCase):
         self.assertEqual((code, data["background"]), (0, "#c8c8c8"))
         self.assertTrue((Path(work) / "reference" / "reference.png").is_file())
         self.assertEqual(run("next", "--work", work)[1]["next"], "generate")
+
+
+class FactsCommandTests(unittest.TestCase):
+    """Task 19: `facts` hands clip_facts the contract's rig (contacts from the motion, the 60 Hz keys), the body
+    mass (--mass-kg, the brief's massKg, or the rig's mesh volume) and an explicit --accept-gait reason, and records
+    the mass and the acceptance in the ledger."""
+
+    def setUp(self):
+        import numpy as np
+        from anim.ledger import Ledger
+        self.tmp = Path(tempfile.mkdtemp())
+        self.addCleanup(shutil.rmtree, self.tmp)
+        model = self.tmp / "m.glb"
+        model.write_bytes(b"x")
+        self.work = work = self.tmp / "w"
+        ledger = Ledger.init(work, model, "lope")
+        (work / "contract").mkdir()
+        shutil.copyfile(FIXTURE_CONTRACT, work / "contract" / "project-contract.json")
+        self.rig = {"bones": [{"name": b, "parent": None, "head": [0, 0, 0.1], "tail": [0.1, 0, 0.0]}
+                              for b in ("paw_fl", "paw_fr", "paw_hl", "paw_hr")]}
+        (work / "contract" / "rig.json").write_text(json.dumps(self.rig))
+        ledger.record("contract", {}, {"rig": work / "contract" / "rig.json"})
+        np.savez(work / "masks.npz", masks=np.zeros((4, 8, 8), bool))
+        (work / "poses.json").write_text(json.dumps({"names": ["dx", "dz"], "frames": [], "fps": 24.0,
+                                                     "camera": {}, "bones": []}))
+        (work / "stub.json").write_text("{}")
+        self.brief({"clip": "lope", "loop": True, "gait": "lope"})
+        self.result = {"start": 1.0, "period": 15.0, "speedMps": 3.0, "strideM": 1.9, "warnings": [],
+                       "entry": {"duration_s": 0.4}, "cycle": {"frames": []},
+                       "gaitCheck": {"expected": "canter", "matches": False, "accepted": "transverse is right"}}
+
+    def brief(self, data):
+        """Write the brief and record it and the stages up to fit again (recording a stage drops the later ones)."""
+        from anim.ledger import Ledger
+        ledger = Ledger(self.work)
+        (self.work / "brief.json").write_text(json.dumps(data))
+        ledger.record("brief", {}, {"brief": self.work / "brief.json"})
+        for stage in ("reference", "generate", "accept"):
+            ledger.record(stage, {}, {"stub": self.work / "stub.json"})
+        ledger.record("ingest", {}, {"masks": self.work / "masks.npz"})
+        ledger.record("fit", {}, {"poses": self.work / "poses.json"})
+
+    def facts(self, *extra):
+        from unittest import mock
+        from anim import pipeline
+        with mock.patch.object(pipeline.facts_mod, "clip_facts", return_value=self.result) as clip, \
+                mock.patch.object(pipeline, "rig_mass", return_value={"kg": 85.0, "source": "rig volume"}) as volume:
+            code, data, err = run("facts", "--work", str(self.work), *extra)
+        return code, err, clip, volume
+
+    def test_the_rig_mass_and_acceptance_reach_facts_and_the_ledger(self):
+        from anim.ledger import Ledger
+        code, err, clip, volume = self.facts("--mass-kg", "40", "--accept-gait", "transverse is right")
+        self.assertEqual(code, 0, err)
+        kwargs = clip.call_args.kwargs
+        self.assertEqual(kwargs["rig"], self.rig)
+        self.assertEqual(kwargs["mass"], {"kg": 40.0, "source": "facts --mass-kg"})
+        self.assertEqual(kwargs["accept_gait"], "transverse is right")
+        volume.assert_not_called()
+        stage = Ledger(self.work).require("facts")
+        self.assertEqual(stage["facts"]["acceptGait"], "transverse is right")
+        self.assertEqual(stage["facts"]["mass"], {"kg": 40.0, "source": "facts --mass-kg"})
+
+    def test_the_brief_mass_then_the_rig_volume(self):
+        self.brief({"clip": "lope", "loop": True, "gait": "lope", "massKg": [30, 50]})
+        code, err, clip, volume = self.facts()
+        self.assertEqual(code, 0, err)
+        self.assertEqual(clip.call_args.kwargs["mass"], {"kg": [30, 50], "source": "brief massKg"})
+        self.assertIsNone(clip.call_args.kwargs["accept_gait"])
+        volume.assert_not_called()
+        self.brief({"clip": "lope", "loop": True, "gait": "lope"})
+        code, err, clip, volume = self.facts()
+        self.assertEqual(code, 0, err)
+        volume.assert_called_once()
+        self.assertEqual(clip.call_args.kwargs["mass"], {"kg": 85.0, "source": "rig volume"})

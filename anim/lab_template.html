@@ -28,6 +28,7 @@ Arrow keys step frames. Flagged or low frames are in orange text.</p>
 <img id="view" alt="Overlay of the video frame and the fitted model">
 <h2>Match per frame</h2><svg id="chart" viewBox="0 0 1000 120" preserveAspectRatio="none"></svg>
 <h2>Paw contacts</h2><div id="contacts"></div>
+<h2>Motion</h2><div id="motion" class="muted">No facts yet: run <code>facts</code>, then build the lab again.</div>
 <h2>Notes</h2>
 <div class="row"><button id="note">Add a note for this frame</button><button id="copy">Copy notes</button></div>
 <textarea id="notes" placeholder="frame 47: the legs jump back"></textarea>
@@ -54,6 +55,23 @@ $("chart").innerHTML = `<line x1="0" x2="1000" y1="${120 - DATA.threshold * 110}
   frames.map((f, i) => (f.flags.length || f.iou < DATA.threshold) ? `<rect x="${i * width}" y="0" width="${width}" height="6" fill="var(--low)"/>` : "").join("");
 $("contacts").innerHTML = Object.entries(DATA.timeline).map(([paw, on]) =>
   `<div class="paw"><span>${paw}</span><div class="bar">${on.map((c) => `<span class="${c ? "on" : ""}"></span>`).join("")}</div></div>`).join("");
+if (DATA.motion) {
+  const m = DATA.motion, c = m.cadence || {}, g = m.gait || {}, k = m.contactCheck || {};
+  const row = (name, value) => `<div class="paw"><span>${name}</span><span>${value}</span></div>`;
+  const text = (v) => String(v).replace(/&/g, "&amp;").replace(/</g, "&lt;");
+  $("motion").className = "";
+  $("motion").innerHTML = [
+    row("Cadence", `video ${c.videoHz} Hz, played ${c.hz} Hz; band ${c.bandHz ? c.bandHz.join("-") + " Hz" : "none"}` +
+      ` (${c.massKg ? c.massKg.join("-") + " kg, " + text(c.massSource) : "no mass"})`),
+    row("Retime", c.retime === 1 ? "none" : `<b class="low">x${c.retime}</b> (speed and duration scaled)`),
+    row("Gait", `brief: ${text(g.expected)}; measured: ${text((g.measured || {}).text)}; reads as ` +
+      `${text(((g.measured || {}).reads || []).join(", ") || "none")}` +
+      (g.accepted ? `; <b class="low">mismatch accepted: ${text(g.accepted)}</b>` : "")),
+    row("Contacts", Object.entries(m.contacts || {}).map(([p, w]) => `${p} ${w[0]}-${w[1]}`).join(" · ")),
+    row("Keys check", Object.entries(k.agreement || {}).map(([p, a]) => `${p} ${a}`).join(" · ") +
+      (k.gate ? ` (gate ${k.gate})` : "")),
+  ].join("");
+}
 $("slider").oninput = (e) => show(Number(e.target.value));
 $("prev").onclick = () => show(index - 1); $("next").onclick = () => show(index + 1);
 document.onkeydown = (e) => { if (e.target.id === "notes") return; if (e.key === "ArrowLeft") show(index - 1); if (e.key === "ArrowRight") show(index + 1); };

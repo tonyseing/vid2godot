@@ -64,6 +64,21 @@ for fcurve in action_get_channelbag_for_slot(action, arm.animation_data.action_s
 bpy.ops.export_scene.gltf(filepath=args["out"], export_format="GLB", export_yup=True, export_animations=True,
                           export_animation_mode="ACTIONS", export_force_sampling=False, export_cameras=False,
                           export_lights=False)
-rigutil.load_glb(args["out"], fps=fps)
+arm, _, _ = rigutil.load_glb(args["out"], fps=fps)
+# Task 19: the re-imported clip's paw tails at every key (world x, z), for the bake's check against facts' IK pins.
+paws = {}
+if args.get("paws"):
+    clip = bpy.data.actions[args["clip"]]
+    arm.animation_data_create()
+    arm.animation_data.action = clip
+    if getattr(clip, "slots", None):
+        arm.animation_data.action_slot = clip.slots[0]
+    start = int(round(clip.frame_range[0]))
+    for bone in args["paws"]:
+        paws[bone] = []
+    for key in range(n + 1):
+        bpy.context.scene.frame_set(start + key)
+        for bone in args["paws"]:
+            paws[bone].append(rigutil.bone_point(arm, bone))
 rigutil.write_result(args, {"actions": {a.name: [float(a.frame_range[0]), float(a.frame_range[1])]
-                                        for a in bpy.data.actions}})
+                                        for a in bpy.data.actions}, "paws": paws})

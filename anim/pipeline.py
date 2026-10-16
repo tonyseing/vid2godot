@@ -34,7 +34,8 @@ ARGS = {"init": [("--model", {"required": True, "type": Path}), ("--clip", {"req
         "accept": [("--candidate", {"required": True, "type": int}), ("--checks", {"required": True, "type": Path})],
         "ingest": [("--work-scale", {"type": float, "default": 0.5})],
         "gridframe": [("--frame", {"required": True, "type": int})],
-        "fit": [("--marks", {"type": Path}), ("--span", {})], "facts": [], "bake": [], "lab": [],
+        "fit": [("--marks", {"type": Path}), ("--span", {})],
+        "facts": [("--mass-kg", {"type": float}), ("--accept-gait", {})], "bake": [], "lab": [],
         "review": [("--template", {"action": "store_true"}), ("--file", {"type": Path})],
         "verify": [("--godot47", {"required": True, "type": Path}), ("--godot45", {"required": True, "type": Path}),
                    ("--launcher", {"required": True, "type": Path}), ("--threed-verify", {"type": Path})],
@@ -235,26 +236,53 @@ def silhouette_renderer(model, poses, shape, folder, blender=None):
     return render
 
 
+def rig_mass(ledger, folder, blender=None):
+    """A rough body mass from the rig: its skinned mesh's rest volume at the density of water (bodies are ~1.0-1.1
+    g/cm3; an open or furred mesh reads heavy). The brief's massKg or `facts --mass-kg` replace it."""
+    found = run_blender("mesh_volume", {"model": str(ledger.model)}, folder, blender)
+    volume = found.get("volumeM3")
+    if not isinstance(volume, (int, float)) or volume <= 0:
+        return None
+    return {"kg": round(1000.0 * volume, 2), "source": "rig mesh volume x 1000 kg/m3 (rough)"}
+
+
+def facts_mass(a, ledger, brief, folder):
+    if a.mass_kg is not None:
+        if not a.mass_kg > 0:
+            raise StageError("--mass-kg must be a body mass above 0 kg")
+        return {"kg": float(a.mass_kg), "source": "facts --mass-kg"}
+    if brief.get("massKg") is not None:
+        return {"kg": brief["massKg"], "source": "brief massKg"}
+    if brief.get("loop"):
+        return rig_mass(ledger, folder, a.blender)
+    return None
+
+
 @command("facts")
 def cmd_facts(a):
     ledger = Ledger(a.work)
     rest = paw_rest(ledger)
+    rig = load_json(ledger.output("contract", "rig"))
     brief = load_json(ledger.output("brief", "brief"))
     poses = load_json(ledger.output("fit", "poses"))
     masks_path = ledger.output("ingest", "masks")
     masks = np.load(masks_path)["masks"]
     folder = ledger.work / "facts"
     folder.mkdir(exist_ok=True)
+    mass = facts_mass(a, ledger, brief, folder / "mass")
     render = silhouette_renderer(ledger.model, poses, masks.shape[1:], folder / "render", a.blender)
-    result = facts_mod.clip_facts(poses, project_contract(ledger), brief, rest, masks=masks, render=render)
+    result = facts_mod.clip_facts(poses, project_contract(ledger), brief, rest, masks=masks, render=render, rig=rig,
+                                  mass=mass, accept_gait=a.accept_gait)
     (folder / "facts.json").write_text(json.dumps(result, indent=2))
     (folder / "anim-entry.json").write_text(json.dumps({ledger.clip: result["entry"]}, indent=2))
     ledger.record("facts", {"poses": ledger.output("fit", "poses"), "masks": masks_path},
                   {"facts": folder / "facts.json", "entry": folder / "anim-entry.json"},
                   {"speedMps": result["speedMps"], "period": result["period"], "warnings": result["warnings"],
-                   "averagedCycleIoU": result.get("averagedCycleIoU")})
+                   "averagedCycleIoU": result.get("averagedCycleIoU"), "mass": mass, "acceptGait": a.accept_gait,
+                   "retime": (result.get("cadence") or {}).get("retime")})
     emit({"ok": True, **{k: result[k] for k in ("start", "period", "speedMps", "strideM", "warnings")},
-          **{k: result[k] for k in ("cyclesAveraged", "averagedCycleIoU") if k in result}})
+          **{k: result[k] for k in ("cyclesAveraged", "averagedCycleIoU", "cadence", "gaitCheck", "contactCheck")
+             if k in result}})
 
 
 @command("bake")
@@ -268,12 +296,16 @@ def cmd_bake(a):
     folder = ledger.work / "bake"
     folder.mkdir(exist_ok=True)
     out = folder / f"{ledger.model.stem}-{ledger.clip}-eval.glb"
+    if not isinstance(cycle.get("paws"), dict):
+        raise StageError("facts.json predicts no paw positions for the keys (it predates the 60 Hz bake); run "
+                         "`facts` again")
     result = run_blender("bake_clip", {"model": str(ledger.model), "out": str(out), "cycle": str(facts_path),
                                        "clip": ledger.clip, "loop": brief["loop"],
                                        "pelvisBone": project["pelvisBone"], "bones": poses["bones"],
-                                       "names": poses["names"]}, folder, a.blender)
+                                       "names": poses["names"], "paws": sorted(cycle["paws"])}, folder, a.blender)
     if ledger.clip not in result["actions"]:
         raise StageError(f"The re-imported GLB has no clip {ledger.clip!r}: {sorted(result['actions'])}")
+    paw_error = paw_check(cycle["paws"], result.get("paws") or {})
     bounds = load_json(ledger.output("contract", "rig"))["bounds"]
     background = project["sheet"]["background"]
     camera = sheet_mod.game_camera(bounds, project["sheet"]["pxPerMetre"])
@@ -292,8 +324,28 @@ def cmd_bake(a):
     sheet_mod.compose(closeup["frames"], background, folder / "closeup.png")
     ledger.record("bake", {"poses": ledger.output("fit", "poses"), "facts": facts_path},
                   {"glb": out, "sheet": folder / "sheet.png", "closeup": folder / "closeup.png"},
-                  {"actions": result["actions"]})
-    emit({"ok": True, "glb": str(out), "sheet": str(folder / "sheet.png"), "closeup": str(folder / "closeup.png")})
+                  {"actions": result["actions"], "pawErrorMm": paw_error})
+    emit({"ok": True, "glb": str(out), "sheet": str(folder / "sheet.png"), "closeup": str(folder / "closeup.png"),
+          "pawErrorMm": paw_error})
+
+
+PAW_CHECK_MM = 1.0
+
+
+def paw_check(predicted, baked):
+    """The largest distance (mm) between facts' predicted paw positions at every key and the re-imported GLB's;
+    refuses over PAW_CHECK_MM (the IK pins would not be what the GLB plays)."""
+    worst = 0.0
+    for bone, track in predicted.items():
+        got = np.asarray(baked.get(bone, []), float)
+        want = np.asarray(track, float)
+        if got.shape != want.shape:
+            raise StageError(f"The baked GLB reports {len(got)} keys for paw {bone}; facts predicted {len(want)}")
+        worst = max(worst, float(np.abs(got - want).max()) * 1000 if len(want) else 0.0)
+    if worst > PAW_CHECK_MM:
+        raise StageError(f"A baked paw is {worst:.2f} mm from where facts pinned it (gate {PAW_CHECK_MM} mm): the "
+                         f"GLB's bones do not turn as the contract's rig.json says; rerun `contract`")
+    return round(worst, 4)
 
 
 def build_lab(ledger):
@@ -304,9 +356,10 @@ def build_lab(ledger):
     review_mod.draw_overlays(ledger.work, poses, ledger.output("fit", "projection"), ledger.output("ingest", "masks"),
                              folder / "overlays")
     hashes = {name: ledger.require("fit")["outputs"][name]["sha256"] for name in ("poses", "projection")}
+    facts = load_json(ledger.output("facts", "facts")) if ledger.state("facts") == "ok" else None
     page = review_mod.lab_page(ledger.clip, report, brief["iouThreshold"],
                                review_mod.contact_timeline(poses, project_contract(ledger), paw_rest(ledger)),
-                               hashes)
+                               hashes, review_mod.motion_summary(facts))
     (folder / "lab.html").write_text(page)
     return folder / "lab.html", report
 

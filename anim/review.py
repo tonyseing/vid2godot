@@ -39,8 +39,19 @@ def contact_timeline(poses, project, rest):
     return {bone: masks[chain].tolist() for chain, bone in project["paws"].items()}
 
 
-def lab_page(clip, report, threshold, timeline, hashes):
+def motion_summary(facts):
+    """What the lab states about the baked motion (Task 19), from facts.json: the cadence and any retime factor,
+    the gait check (and an accepted mismatch's reason), the contacts and their check against the baked keys."""
+    if not facts:
+        return None
+    return {"cadence": facts.get("cadence"), "gait": facts.get("gaitCheck"), "contactCheck": facts.get("contactCheck"),
+            "contacts": (facts.get("entry") or {}).get("contacts")}
+
+
+def lab_page(clip, report, threshold, timeline, hashes, motion=None):
     data = {"clip": clip, "report": report, "threshold": threshold, "timeline": timeline, "hashes": hashes}
+    if motion is not None:
+        data["motion"] = motion
     # No "<" reaches the page, so a "</script>" or "<!--<script" in a clip name or flag cannot end the inline
     # script or start an HTML comment in it; JSON reads "\u003c" back as "<".
     return TEMPLATE.replace("__DATA__", json.dumps(data).replace("<", "\\u003c"))
