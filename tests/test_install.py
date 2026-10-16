@@ -102,3 +102,10 @@ class ClaudeLinkTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class SkillTextTests(unittest.TestCase):
+    def test_skill_md_stays_under_900_words(self):
+        """Task 19: the installed SKILL.md stays at most 900 words (detail lives in reference/)."""
+        words = len((Path(__file__).resolve().parents[1] / "SKILL.md").read_text().split())
+        self.assertLessEqual(words, 900)

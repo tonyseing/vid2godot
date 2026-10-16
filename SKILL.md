@@ -5,24 +5,23 @@ description: Use when a rigged 3D creature or character needs a game animation c
 
 # vid2godot: rigged GLB → AI side-view video → fitted clip → Godot
 
-A video model films your own rig, rendered side-on, moving; the bones are fitted frame by frame to its
-silhouette. The tool exists: your plan is its commands, in order. Write no fitter or GLB patcher; keyframe
-nothing by code.
+A video model films your rig side-on, moving; the bones are fitted to its silhouette. The tool exists: your plan
+is its commands, in order. Write no fitter or GLB patcher; keyframe nothing by code.
 
 ## Check the request first
 
 | If | Then |
 |---|---|
 | No skeleton or weights (a Tripo mesh), or `contract` reports a problem | Stop. **REQUIRED SKILL: game-asset-3d-pipeline** rigs it first |
-| The motion leaves the side plane (a person lifting, a held prop, a turn) | Refuse: a side camera sees no depth, so the outline fits while the pose is wrong. It needs the two-view method, not yet supported |
+| The motion leaves the side plane (a person lifting, a held prop, a turn) | Refuse: a side camera sees no depth, so the outline fits a wrong pose; that needs the two-view method, not yet supported |
 | The owner named a video model | Pass that exact id as `--model-id` |
-| The owner delegated by a stated criterion (e.g. a bake-off for best performance per price) | Apply it and record the result |
+| The owner delegated by a stated criterion (e.g. best performance per price) | Apply it and record the result |
 | Neither | Ask the owner which model |
 
 ## The plan
 
-From the project root (relative paths resolve there): `python3 <skill>/anim/pipeline.py <command> --work asset-work/<area>/<slug>/anim/<clip>`
-(optional `--blender <path>`). `status` and `next` show where you are.
+From the project root: `python3 <skill>/anim/pipeline.py <command> --work asset-work/<area>/<slug>/anim/<clip>`
+(optional `--blender <path>`). `status`, `next` show where you are.
 
 | Command | What you do |
 |---|---|
@@ -31,22 +30,22 @@ From the project root (relative paths resolve there): `python3 <skill>/anim/pipe
 | `brief --file <json>` | `clip subject motion gait loop planar videoSeconds`; a loop needs two cycles |
 | `reference` | Open `reference/reference.png` |
 | `generate --model-id <id> [--max-cost USD]` | Two candidates |
-| `accept --candidate N --checks <json>` | After opening both strips and full frames; checks in `reference/prompting.md` |
-| `ingest` | Drops pulldown repeats by cadence; background enclosed by touching paws stays background (pinholes close). Read `flags`, `warnings` |
-| `fit` | Solves a clip-wide camera scale and leg identity; every frame also tries chain restarts and leg swaps, and a frame below 0.85 IoU is solved again from scratch; a winner must also beat the tracked pose at full resolution. Paws found in each mask pull fitted paws out of the body (soft, zero near a match). A second pass pulls the joints the outline barely pins toward the first pass's cycle average. Prints `lowFrames` |
-| `lab` | Open `review/lab.html` and every low frame's overlay |
+| `accept --candidate N --checks <json>` | After opening both strips and full frames (`reference/prompting.md`) |
+| `ingest` | Drops pulldown repeats. Read `flags`, `warnings` |
+| `fit` | Clip-wide camera scale and leg identity; restarts, leg swaps and a periodic second pass. Prints `lowFrames` |
+| `lab` | Open `review/lab.html`, every low frame's overlay |
 | `gridframe --frame N`; `fit --marks <json> --span A:B` | Fix flips (below) |
-| `facts` | The period from the video's masks; the cycle is the phase average of the steady cycles (warm-up left out), rendered and checked against the masks (mean IoU ≥ 0.85, else it refuses with the numbers); paw contacts against one ground shared by all paws, each paw's height measured from its own rest-pose tail height in the contract's `rig.json` (`paws.<paw>.restZ`; refuses without it; a paw that never reaches the ground is `plants: false`), beats, lead and suspension from the planted paws, speed from at least two; root drift, sidecar entry |
-| `bake` | Keys that cycle minus drift: a seamless seam. Open `bake/sheet.png`, `bake/closeup.png` |
-| `review --template`; `review --file <json>` | Fill it from what you saw; explain or refit each low frame |
-| `verify --godot47 <bin> --godot45 <bin> --launcher <launcher>` | Activation-suppressed phone/tablet captures on both engines via game-asset-3d-pipeline's `verify.py`. Open every capture |
-| `export --destination asset-work/<area>/<slug>/evaluation/<clip>` | The owner's bundle, with captures and lab |
+| `facts [--mass-kg KG] [--accept-gait REASON]` | Period and averaged cycle from the video (refuses under 0.85 IoU); contacts from the motion (near the ground, world-still). Refuses footfalls unlike the brief's `gait` unless you record why; retimes a slow video to the body-size cadence band (brief `massKg`, `--mass-kg`, else rig volume); 60 Hz keys with planted paws pinned, refused if they disagree with the contacts. `reference/motion.md` |
+| `bake` | Keys facts' cycle; refuses if a paw misses facts' pin. Open `bake/sheet.png`, `bake/closeup.png` |
+| `review --template`; `review --file <json>` | Fill it from what you saw; explain or refit low frames |
+| `verify --godot47 <bin> --godot45 <bin> --launcher <launcher>` | Phone/tablet captures of the clip playing (phases 0, 1/3, 2/3) on both engines via game-asset-3d-pipeline's `verify.py`. Open every capture |
+| `export --destination asset-work/<area>/<slug>/evaluation/<clip>` | The owner's bundle |
 
 ## Leg identity
 
 Near and far legs cast one silhouette. A pair exchanged for the whole clip is a valid mirrored lead; a flip
-partway through fails: a leg jumps sides at a `leg_crossing:` flag, or `facts` says a paw touches down
-twice per cycle. Recipe: `gridframe --frame N` just after the crossing, read both paws off `ingest/grid/<NNNNN>.png`,
+partway through is not: a leg jumps sides at a `leg_crossing:` flag, or `facts` says a paw touches down twice.
+Recipe: `gridframe --frame N` just after the crossing, read both paws off `ingest/grid/<NNNNN>.png`,
 add them to one marks file (`--marks` replaces the last), `fit --marks marks.json --span A:B` (B exclusive), `lab`.
 
 ```json
@@ -58,9 +57,8 @@ Keys are the contract's `paws` bones. More fixes: `reference/failures.md`.
 ## Shipping
 
 `export` refuses `game/assets`; this skill ends there. Show the owner the bundle. Passing `review` and `verify`
-is mechanical, not approval: the clip enters the game only after the owner approves it. Owner notes ("frame 47,
-legs jump back") become marks or a span refit and a new review; after two failed artistic rounds, ask whether to
-continue or park.
+is mechanical, not approval: the clip enters the game only once the owner approves. Owner notes ("frame 47, legs
+jump back") become marks or a span refit and a new review; after two failed artistic rounds, ask whether to go on.
 
 ## Rationalizations (from agents without this skill)
 
@@ -70,8 +68,8 @@ continue or park.
 | "Timing and stride come from re-timing to 24 frames and from the paw-planting step" | `ingest` and `facts` measure them. |
 | "Replace only the `lope` samplers and accessors in the GLB with pygltflib" | `bake` writes an evaluation GLB. |
 | "Under the project's rule for image models, the harness or the owner picks the model" | That rule is for images. The owner names the video model, or a criterion. |
-| "The footfall phases … decide that" / "Hold the far legs to the near legs' phase offset" / "paw keypoints from an animal pose model" | Marks and `fit --span` decide identity. |
-| "Depth is not observed … It comes from priors" / "It mostly happens in the side plane" / "A second clip filmed from the front, used only to check" | Unseen depth is why you refuse. |
-| "Steps 1–8 are ordinary Blender and Python work" / "try `parent_set(type='ARMATURE_AUTO')` first" / "Treat this deer as a motion prototype" | Rigging is game-asset-3d-pipeline's. Hand it over. |
+| "The footfall phases … decide that" / "Hold the far legs to the near legs' phase offset" | Marks and `fit --span` decide identity. |
+| "Depth is not observed … It comes from priors" / "It mostly happens in the side plane" | Unseen depth is why you refuse. |
+| "Steps 1–8 are ordinary Blender and Python work" / "try `parent_set(type='ARMATURE_AUTO')` first" | Rigging is game-asset-3d-pipeline's. Hand it over. |
 | "If it passes: I'll replace only the `lope` animation in `wolf.glb`" / "Before overwriting, I'll keep a backup" | Your checks are not approval; a backup is not either. |
-| "Passing these checks isn't your artistic sign-off" (then planning the copy) / "You see the new lope … before anything is committed" | Approval precedes writing `game/assets`. Stop at `export`. |
+| "Passing these checks isn't your artistic sign-off" (then planning the copy) | Approval precedes writing `game/assets`. Stop at `export`. |

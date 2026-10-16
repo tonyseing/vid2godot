@@ -3,8 +3,9 @@
 vid2godot is the agent skill `game-asset-animation-pipeline`. It turns a video of your own rigged model into a
 game animation clip: it renders the rig exactly side-on, has a named AI video model film it moving from that
 frame, fits the bones frame by frame until the rig's silhouette matches the video, measures one clean cycle and
-its contacts, bakes an evaluation GLB, gates it on a hash-bound review and on Godot 4.7 and 4.5 captures, and
-exports a bundle for the owner to approve. It never writes `game/assets`. Agents follow [SKILL.md](SKILL.md).
+its contacts from the motion, checks its gait and body-size cadence, bakes a 60 Hz evaluation GLB with the planted
+paws pinned, gates it on a hash-bound review and on Godot 4.7 and 4.5 captures of the clip playing, and exports a
+bundle for the owner to approve ([reference/motion.md](reference/motion.md)). It never writes `game/assets`. Agents follow [SKILL.md](SKILL.md).
 
 ## Install
 
