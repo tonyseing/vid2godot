@@ -21,9 +21,16 @@ A paw is on the ground while it is **near the ground and world-still**:
 
 Gaps up to 0.05 of a cycle inside a stance are bridged. `gait` reads beats, lead and suspensions from these
 stances. Each stance is rounded to the key grid; `entry.contacts` reach half a key past its first and last key (the
-paw lands and lifts between keys; the midpoint is the estimate), so the phase origin's footfall is half a key before
-0 (0.979 at 24 keys). The pin holds the keys strictly inside, from half a key after the rounded touchdown to half a
-key before the rounded liftoff (see the keys).
+paw lands and lifts between keys; the midpoint is the estimate), so the phase origin's footfall phase is half a key
+before its first pinned key (0.979 at 24 keys). The pin holds the keys strictly inside, from half a key after the
+rounded touchdown to half a key before the rounded liftoff (see the keys).
+
+The loop's first key is not the phase origin's touchdown (Task 19 round 4): `motion.start_key` picks the key with the
+most room outside every paw's pin approach and release, so the seam is where no paw eases into or out of its pin
+(on the wolf lope the origin's touchdown key lay inside hind_L's approach and hind_R's; the start moved 5 keys).
+`contactCheck.cycleStart` records the key and its room; `cycle.startKey`, `cycle.startPhase` and `start` (the video
+frame of key 0) move with it, `entry.contacts` are the clip's phases, and `entry.footfall_phase` stays the phase
+origin's (each contact's start plus `startPhase`). The clip is cyclic, so only the seam's place changes.
 
 ## The gait check
 
@@ -78,17 +85,24 @@ warning.
   foot keeps its world orientation, the knee its bend; where the leg cannot reach, the foot turns about the pinned
   toe, the heel lifting) holds the paw on a world-still line: on the ground, sliding back one stride per cycle.
   Outside, the paw follows the free motion plus the correction where the pin lets go, faded out by a quintic over
-  max(0.05 of a cycle, 2.6 key intervals). The correction is set by `motion.PIN_RELEASE` (span, the derivatives
+  max(0.05 of a cycle, 3 key intervals). The correction is set by `motion.PIN_RELEASE` (span, the derivatives
   matched per axis at touchdown and at liftoff, and the inset; recorded as `contactCheck.pinRelease`). The default
   matches position, velocity and acceleration in x and position and velocity in z at both edges, so liftoff and
   touchdown have no velocity step. It came from a sweep on the wolf lope, measured with chase3d's
-  `tools/anim_compare.py` (Task 19 round 3): the shorter span (4 keys before) ends the paw's tangential lift sooner. `ik` reports each paw's pinned and eased keys
-  and its largest residual (a leg that cannot reach its pin leaves one).
+  `tools/anim_compare.py` (Task 19 rounds 3 and 4; 4 keys in fix round 1, 2.6 in round 3): of the settings that pass
+  bar criteria 1-6 and facts' gates, 3 keys pops least at the contact edges. None passes the per-paw edge criterion
+  (the front paws' lift-offs). `ik` reports each paw's pinned and eased keys and its largest residual (a leg that
+  cannot reach its pin leaves one).
 - **Check**: the keys are played as the clip plays them (linear between keys) and detected again with the same
   rule, without the 0.06 m allowance (a pinned paw is on the ground). Under 0.95 agreement for any paw, `facts`
   refuses (`contactCheck`); `plantedStillShare` reports how much of each stance is under 0.10 m/s.
-- **Edges**: `contactCheck.edgeJumps` is each paw's velocity change at its first and last pinned key (m/s per key)
-  against its swing's median per-key change; an edge over the median refuses (the pin pops).
+- **Edges**: `contactCheck.edgeJumps` is each paw's velocity change (x and z at the keys, m/s per key; in place
+  equals world for a constant body speed, as chase3d's harness measures it) against its swing's median per-key
+  change. `touchdownMps` and `liftoffMps` are the largest across the whole approach and release span, where the kink
+  is (round 4); `touchdownPinnedMps` and `liftoffPinnedMps` are at the first and last pinned key (round 3). An edge
+  over the median at the pinned keys refuses (the pin pops). Across the span the rule is recorded in
+  `contactCheck.edgeSpanGate` and warned; it refuses only with `facts.EDGE_GATE_SPAN` on, which is off pending a
+  ruling: it refuses every clip measured, the old hand-made wolf lope's own motion included.
 
 A one-shot (`"loop": false`) keys its fitted frames; with the rig, `facts` predicts each paw at every key as the
 bake plays it (dx less its mean), so `bake` checks a one-shot the same way.

@@ -21,7 +21,8 @@ The keys pin each planted paw world-still over its stance less `PIN_RELEASE.inse
 max(BLEND, PIN_RELEASE.span_keys / n_keys) of the cycle by a quintic. The correction matches the pin's derivatives up to
 `PIN_RELEASE`'s orders per axis and edge: by default position, velocity and acceleration in x and position and
 velocity in z at both edges, so the paw's position and velocity are continuous at liftoff and touchdown (Task 19
-round 3; `edge_jumps` measures the velocity change at the pinned keys).
+round 3; `edge_jumps` measures the velocity change across each approach and release span, round 4). `start_key`
+picks the loop's first key outside every approach and release (round 4).
 
 numpy only."""
 from typing import NamedTuple
@@ -42,7 +43,7 @@ class PinRelease(NamedTuple):
     the cycle). touchdown_orders, liftoff_orders: per axis (x, z), the derivatives of the pin the correction matches at
     that edge: 0 position, 1 also velocity, 2 also acceleration. inset_keys: where the pin starts and ends, in key
     intervals inside the snapped contact window at each end (0 at its edge, negative outside it)."""
-    span_keys: float = 2.6
+    span_keys: float = 3.0
     touchdown_orders: tuple = (2, 1)
     liftoff_orders: tuple = (2, 1)
     inset_keys: float = 0.5
@@ -55,13 +56,13 @@ class PinRelease(NamedTuple):
         return np.asarray(self.touchdown_orders if touchdown else self.liftoff_orders)
 
 
-# The default (Task 19 round 3), chosen by a sweep of the wolf lope measured with chase3d's tools/anim_compare.py
-# (task-19-round3-report.md in the chase3d plan folder). It matches the pin's position, velocity and acceleration in x
-# and its position and velocity in z at both edges, as fix round 1 did, over 2.6 key intervals instead of 4: the
-# shorter span ends the slow tangential lift sooner, so the declared contacts agree with the height-only detection
-# (bar criterion 5) and the edge jumps stay under the old clip's (criterion 8). No setting passed the whole bar and
-# facts' own edge gate on the real fixture together: the ones that passed the bar let z go unmatched at liftoff,
-# which the real fixture's gate refuses. This one misses the bar's literature score by its loop-seam row.
+# The default (Task 19 round 4), chosen by a sweep of the wolf lope measured with chase3d's tools/anim_compare.py
+# (task-19-round3-report.md in the chase3d plan folder, fix round 4). It matches the pin's position, velocity and
+# acceleration in x and its position and velocity in z at both edges, over 3 key intervals (round 3: 2.6). With the
+# loop's start outside the eases (start_key) the literature score's seam row passes at every span; of the settings
+# that pass bar criteria 1-6, facts' enforced gates and the real fixture, this one pops least at the contact edges.
+# None passes the per-paw edge criterion 8 (every front lift-off is over 2.3 m/s against the old clip's 1.4) or the
+# span-wide edge gate (EDGE_GATE_SPAN in facts).
 PIN_RELEASE = PinRelease()
 SUBSAMPLES = 8           # re-detection samples per key interval (the keys are interpolated linearly, as played)
 
@@ -491,30 +492,99 @@ def plan_keys(rig, smooth, names, project, windows, stride, rest, lift, n_keys, 
     return keys, {c: p for c, p in paws.items()}, report
 
 
-def edge_jumps(paws, release, n_keys, dt):
-    """Per paw with a pinned key, the velocity change at its contact edges against its swing (fix round 1, ruling
-    4): over key interval k (key k to k + 1) the paw moves at v_k, and at key k its velocity changes by
-    |v_k - v_(k-1)|. Touchdown is read at the first pinned key, liftoff at the last; the swing median over the keys
+def _pinned_mask(release_window, n_keys):
+    on, off = release_window
+    end = off if off >= on else off + 1.0
+    phases = np.arange(n_keys) / n_keys
+    pinned = np.zeros(n_keys, bool)
+    for shift_u in (-1.0, 0.0, 1.0):
+        u = phases + shift_u
+        pinned |= (u >= on - 1e-9) & (u <= end + 1e-9)
+    return pinned, on, end
+
+
+def edge_jumps(paws, release, n_keys, dt, span=None):
+    """Per paw with a pinned key, the velocity change at its contact edges against its swing (fix round 1, ruling 4;
+    round 4: measured across the whole approach and release span). Over key interval k (key k to k + 1) the paw
+    moves at v_k (x and z; the side view's y is 0), and at key k its velocity changes by |v_k - v_(k-1)|; a constant
+    body speed adds the same velocity to every key, so the in-place change is the world change the bar's harness
+    measures. Touchdown is the largest change from the key before the first eased key of the approach (the keys
+    within `span`, a cycle fraction, before the pin: by default PIN_RELEASE.span) to the first pinned key; liftoff,
+    from the last pinned key to the key after the last eased key of the release. The swing median over the keys
     that are not pinned. m/s, for `dt` seconds per key."""
+    span = PIN_RELEASE.span(n_keys) if span is None else span
     out = {}
     phases = np.arange(n_keys) / n_keys
-    for chain, (on, off) in release.items():
+    for chain, window in release.items():
         p = np.asarray(paws[chain], float)[:, :2]
-        end = off if off >= on else off + 1.0
-        pinned = np.zeros(n_keys, bool)
-        for shift_u in (-1.0, 0.0, 1.0):
-            u = phases + shift_u
-            pinned |= (u >= on - 1e-9) & (u <= end + 1e-9)
+        pinned, on, end = _pinned_mask(window, n_keys)
         if not pinned.any() or pinned.all():
             continue
         v = (p[1:n_keys + 1] - p[:n_keys]) / dt
         change = np.linalg.norm(v - np.roll(v, 1, axis=0), axis=1)
         first = next(k for k in range(n_keys) if pinned[k] and not pinned[k - 1])
         last = next(k for k in range(n_keys) if pinned[k] and not pinned[(k + 1) % n_keys])
-        out[chain] = {"touchdownMps": round(float(change[first]), 4), "liftoffMps": round(float(change[last]), 4),
+
+        def eased(edge, sign):
+            # keys with 0 < (u - edge) * sign / span < 1, as plan_keys eases them
+            d = ((phases - edge) * sign) % 1.0
+            return int(np.count_nonzero((d > 1e-9) & (d < span - 1e-9) & ~pinned)) if span > 0 else 0
+        before, after = eased(on, -1.0), eased(end, 1.0)
+        td_keys = [(first - before - 1 + i) % n_keys for i in range(before + 2)]
+        lo_keys = [(last + i) % n_keys for i in range(after + 2)]
+        td = max(td_keys, key=lambda k: change[k])
+        lo = max(lo_keys, key=lambda k: change[k])
+        out[chain] = {"touchdownMps": round(float(change[td]), 4), "liftoffMps": round(float(change[lo]), 4),
+                      "touchdownPinnedMps": round(float(change[first]), 4),
+                      "liftoffPinnedMps": round(float(change[last]), 4),
                       "swingMedianMps": round(float(np.median(change[~pinned])), 4),
-                      "touchdownKey": int(first), "liftoffKey": int(last)}
+                      "touchdownKey": int(td), "liftoffKey": int(lo), "touchdownKeys": td_keys,
+                      "liftoffKeys": lo_keys, "firstPinnedKey": int(first), "lastPinnedKey": int(last)}
     return out
+
+
+def ease_spans(windows, n_keys, release=None):
+    """Per paw, the phase intervals (a, b) over which its pin's correction eases (plan_keys): the approach
+    (r_on - span, r_on) and the release (r_end, r_end + span) of its release window (`release_windows`); b may
+    pass 1. A whole-cycle stance has none."""
+    setting = PIN_RELEASE if release is None else release
+    span = setting.span(n_keys)
+    out = {}
+    for chain, (on, off) in release_windows(windows, n_keys, setting.inset_keys).items():
+        if (on, off) == (0.0, 1.0):
+            out[chain] = []
+            continue
+        end = off if off >= on else off + 1.0
+        out[chain] = [(on - span, on), (end, end + span)]
+    return out
+
+
+def ease_clearance(u, spans):
+    """How far phase u lies outside every ease interval (cyclic, in cycle fractions): the distance to the nearest
+    one, or minus the depth inside the deepest one that holds it."""
+    best = np.inf
+    for intervals in spans.values():
+        for a, b in intervals:
+            for shift in (-1.0, 0.0, 1.0):
+                x = u + shift
+                d = -min(x - a, b - x) if a < x < b else min(abs(x - a), abs(x - b))
+                best = min(best, d)
+    return float(best)
+
+
+def start_key(windows, n_keys, release=None):
+    """The loop's first key (round 4 ruling): of the n_keys keys of a cycle that starts at the phase origin's
+    touchdown, the one with the most room outside every paw's contact ease (`ease_spans`), the nearest to the
+    origin on a tie. A cyclic clip is the same motion from any key; this puts the seam where no paw eases into or out
+    of its pin (mid-suspension or a mid-stance key). Returns (key, {key, outsideEases, clearanceKeys,
+    originClearanceKeys})."""
+    spans = ease_spans(windows, n_keys, release)
+    if not any(spans.values()):
+        return 0, {"key": 0, "outsideEases": True, "clearanceKeys": None, "originClearanceKeys": None}
+    room = [ease_clearance(k / n_keys, spans) for k in range(n_keys)]
+    best = max(range(n_keys), key=lambda k: (round(room[k] * n_keys, 9), -min(k, n_keys - k)))
+    return best, {"key": int(best), "outsideEases": bool(room[best] > 1e-9),
+                  "clearanceKeys": round(room[best] * n_keys, 4), "originClearanceKeys": round(room[0] * n_keys, 4)}
 
 
 def played(keys, subsamples=SUBSAMPLES):

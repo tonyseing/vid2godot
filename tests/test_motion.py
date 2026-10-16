@@ -239,13 +239,16 @@ class PlanKeysTests(unittest.TestCase):
         keys, paws, report = motion.plan_keys(rig, smooth, poses["names"], toy_rig.PROJECT, windows, 20 / 24,
                                               toy_rig.REST, 0.0, n)
         jumps = motion.edge_jumps(paws, motion.release_windows(windows, n), n, 0.02)
+        # Round 4: the round-3 reading at the first and last pinned key (the span-wide reading is
+        # test_a_hard_release_breaks_the_edge_gate_and_the_default_does_not's).
         for chain, jump in jumps.items():
-            self.assertLessEqual(max(jump["touchdownMps"], jump["liftoffMps"]), jump["swingMedianMps"], chain)
+            self.assertLessEqual(max(jump["touchdownPinnedMps"], jump["liftoffPinnedMps"]), jump["swingMedianMps"],
+                                 chain)
             self.assertGreaterEqual(report[chain]["edgeKeys"], motion.PIN_RELEASE.span_keys - 1e-9)
         old = self.old_blend(rig, smooth, poses["names"], windows, 20 / 24, n)
         jumped = motion.edge_jumps(old, windows, n, 0.02)                  # the old plan pinned the whole window
-        self.assertTrue(any(max(j["touchdownMps"], j["liftoffMps"]) > j["swingMedianMps"] for j in jumped.values()),
-                        jumped)
+        self.assertTrue(any(max(j["touchdownPinnedMps"], j["liftoffPinnedMps"]) > j["swingMedianMps"]
+                            for j in jumped.values()), jumped)
 
     @staticmethod
     def old_blend(rig, smooth, names, windows, stride, n):
@@ -267,17 +270,29 @@ class PlanKeysTests(unittest.TestCase):
         keys = np.vstack([keys, keys[:1]])
         return rig.paws(keys, names, toy_rig.PROJECT)
 
-    def test_edge_jumps_measure_the_velocity_change_at_the_pinned_keys(self):
-        """dv at key k is |v(k -> k+1) - v(k-1 -> k)|; touchdown is read at the first pinned key, liftoff at the last;
-        the swing median over the keys that are not pinned."""
+    def test_edge_jumps_measure_the_velocity_change_across_the_release_span(self):
+        """dv at key k is |v(k -> k+1) - v(k-1 -> k)| (x and z: the side plane; a constant body speed adds the same
+        velocity to both keys, so the in-place and world changes are equal). Round 4 ruling: each edge's jump is the
+        largest over its whole approach or release span, where the bar's harness finds the kink: from the key before
+        the first eased key to the first pinned key at touchdown, from the last pinned key to the key after the last
+        eased key at liftoff. The swing median over the keys that are not pinned."""
         n, dt = 8, 0.1
         x = np.array([0.0, -0.1, -0.2, -0.3, 0.0, 0.3, 0.4, 0.2, 0.0])     # pinned keys 0..3 slide back 0.1 per key
         paws = {"a": np.stack([x, np.zeros(9)], axis=1)}
-        jumps = motion.edge_jumps(paws, {"a": (0.0, 3 / 8)}, n, dt)["a"]
         v = np.diff(x) / dt                                               # -1 -1 -1 3 3 1 -2 -2
-        self.assertAlmostEqual(jumps["touchdownMps"], abs(v[0] - v[7]))  # 1.0
-        self.assertAlmostEqual(jumps["liftoffMps"], abs(v[3] - v[2]))     # 4.0
-        self.assertAlmostEqual(jumps["swingMedianMps"], float(np.median([abs(v[k] - v[k - 1]) for k in (4, 5, 6, 7)])))
+        dv = [abs(v[k] - v[k - 1]) for k in range(8)]                     # 1 0 0 4 0 2 3 0
+        jumps = motion.edge_jumps(paws, {"a": (0.0, 3 / 8)}, n, dt, span=2 / 8)["a"]
+        # a 2-key span eases key 7 before touchdown and key 4 after liftoff
+        self.assertAlmostEqual(jumps["touchdownMps"], max(dv[6], dv[7], dv[0]))   # 3.0, at key 6
+        self.assertAlmostEqual(jumps["liftoffMps"], max(dv[3], dv[4], dv[5]))     # 4.0, at key 3
+        self.assertEqual((jumps["touchdownKey"], jumps["liftoffKey"]), (6, 3))
+        self.assertEqual(jumps["touchdownKeys"], [6, 7, 0])
+        self.assertEqual(jumps["liftoffKeys"], [3, 4, 5])
+        self.assertAlmostEqual(jumps["swingMedianMps"], float(np.median([dv[k] for k in (4, 5, 6, 7)])))
+        z = motion.edge_jumps({"a": np.stack([np.zeros(9), x], axis=1)}, {"a": (0.0, 3 / 8)}, n, dt, span=2 / 8)["a"]
+        self.assertAlmostEqual(z["touchdownMps"], 3.0)                    # the vertical counts the same
+        default = motion.edge_jumps(paws, {"a": (0.0, 3 / 8)}, n, dt)["a"]
+        self.assertEqual(default, motion.edge_jumps(paws, {"a": (0.0, 3 / 8)}, n, dt, span=motion.PIN_RELEASE.span(n))["a"])
         self.assertEqual(motion.release_windows({"a": (0.25, 0.5)}, 8), {"a": (0.3125, 0.4375)})
         self.assertEqual(motion.release_windows({"a": (0.25, 0.3125)}, 16), {"a": (0.28125, 0.28125)})
 
@@ -325,26 +340,36 @@ class PinReleaseTests(unittest.TestCase):
         return (p[1:n + 1] - p[:n]) / dt                     # v_k over key k -> k + 1
 
     def test_the_default_is_the_swept_setting(self):
-        self.assertEqual(motion.PIN_RELEASE, motion.PinRelease(span_keys=2.6, touchdown_orders=(2, 1),
+        self.assertEqual(motion.PIN_RELEASE, motion.PinRelease(span_keys=3.0, touchdown_orders=(2, 1),
                                                                liftoff_orders=(2, 1), inset_keys=0.5,
                                                                min_span=motion.BLEND))
-        self.assertAlmostEqual(motion.PIN_RELEASE.span(24), 2.6 / 24)
-        self.assertAlmostEqual(motion.PIN_RELEASE.span(12), 2.6 / 12)
+        self.assertAlmostEqual(motion.PIN_RELEASE.span(24), 3.0 / 24)
+        self.assertAlmostEqual(motion.PIN_RELEASE.span(12), 3.0 / 12)
         self.assertAlmostEqual(motion.PIN_RELEASE.span(200), motion.BLEND)   # a slow gait: at least BLEND of a cycle
 
-    def test_the_default_has_no_edge_jump_above_the_old_clips_on_a_synthetic_stance(self):
-        """Every per-key velocity change of every paw (the bar's criterion 8 measure at the keys, world = in place
-        for a constant body speed) is under the old clip's worst, and at the pinned edges under the swing median."""
+    def test_a_hard_release_breaks_the_edge_gate_and_the_default_does_not(self):
+        """Round 4 ruling (the old test compared the toy with the wolf's 4.879 m/s, which no toy speed reaches, so it
+        could not fail). Facts' enforced gate, the edge's velocity change at the first and last pinned key at most the
+        swing median: the default passes it and a hard release (a one-key span matching position only) breaks it.
+        Across the whole approach and release span (the round-4 reading, where the bar's harness finds the kink)
+        neither is under the toy's swing median on any paw, because the toy's free paw paths themselves turn by
+        2.6-2.7 m/s in a key at touchdown and liftoff (the pin's correction fades to the free paw, so its kink
+        stays)."""
         n, dt = 24, 0.4 / 24                                  # a 0.4 s stride at 60 Hz, as the wolf lope
         windows, _, paws, _ = self.plan(n=n)
-        for chain, paw in paws.items():
-            v = self.velocity(paw, n, dt)
-            change = np.linalg.norm(v - np.roll(v, 1, axis=0), axis=1)
-            self.assertLessEqual(float(change.max()), OLD_CLIP_EDGE_JUMP_MPS, chain)
-        jumps = motion.edge_jumps(paws, motion.release_windows(windows, n), n, dt)
+        release = motion.release_windows(windows, n)
+        jumps = motion.edge_jumps(paws, release, n, dt)
         self.assertEqual(sorted(jumps), sorted(windows))
         for chain, j in jumps.items():
-            self.assertLessEqual(max(j["touchdownMps"], j["liftoffMps"]), j["swingMedianMps"], chain)
+            self.assertLessEqual(max(j["touchdownPinnedMps"], j["liftoffPinnedMps"]), j["swingMedianMps"], chain)
+        hard = motion.PinRelease(span_keys=1.0, touchdown_orders=(0, 0), liftoff_orders=(0, 0), min_span=0.0)
+        _, _, hard_paws, _ = self.plan(hard, n)
+        broken = motion.edge_jumps(hard_paws, release, n, dt, span=hard.span(n))
+        self.assertTrue(any(max(j["touchdownPinnedMps"], j["liftoffPinnedMps"]) > j["swingMedianMps"]
+                            for j in broken.values()), broken)
+        for chain in jumps:
+            for j in (jumps[chain], broken[chain]):
+                self.assertGreater(max(j["touchdownMps"], j["liftoffMps"]), j["swingMedianMps"], chain)
 
     def test_orders_choose_the_matched_derivatives_per_axis_and_edge(self):
         """The liftoff orders change only the keys after liftoff and the touchdown orders only those before
@@ -381,9 +406,34 @@ class PinReleaseTests(unittest.TestCase):
         _, _, _, default = self.plan()
         for chain in wide:
             self.assertAlmostEqual(wide[chain]["edgeKeys"], 6.0)
-            self.assertAlmostEqual(default[chain]["edgeKeys"], 2.6)
+            self.assertAlmostEqual(default[chain]["edgeKeys"], 3.0)
             self.assertGreater(wide[chain]["easedKeys"], default[chain]["easedKeys"], chain)
             self.assertLess(deep[chain]["pinnedKeys"], default[chain]["pinnedKeys"], chain)
+
+
+class StartKeyTests(unittest.TestCase):
+    """Round 4 ruling: the loop's first key lies outside every paw's contact ease (the pin's approach and release
+    spans), so the seam is not where a paw decelerates into its pin."""
+
+    def test_ease_spans_are_the_approach_and_release_of_each_pin(self):
+        spans = motion.ease_spans({"a": (0.25, 0.5)}, 8, motion.PinRelease(span_keys=2.0, min_span=0.0))
+        np.testing.assert_allclose(spans["a"], [(0.0625, 0.3125), (0.4375, 0.6875)])
+        self.assertEqual(motion.ease_spans({"a": (0.0, 1.0)}, 8), {"a": []})
+
+    def test_the_start_key_is_outside_every_ease_with_the_most_room(self):
+        n = 50
+        windows = {c: (round(on * n) / n, round(off * n) / n) for c, (on, off) in toy_rig.LOPE_WINDOWS.items()}
+        spans = motion.ease_spans(windows, n)
+        inside = lambda u: any(a < u + d < b for c in spans.values() for a, b in c for d in (-1.0, 0.0, 1.0))
+        self.assertTrue(inside(0.0), "the phase origin's touchdown key is inside its own approach")
+        key, info = motion.start_key(windows, n)
+        self.assertFalse(inside(key / n), key)
+        self.assertTrue(info["outsideEases"])
+        self.assertGreater(info["clearanceKeys"], 0.0)
+        self.assertLess(info["originClearanceKeys"], 0.0)
+        for k in range(n):
+            self.assertLessEqual(motion.ease_clearance(k / n, spans), info["clearanceKeys"] / n + 1e-12, k)
+        self.assertEqual(motion.start_key({"a": (0.0, 1.0)}, n)[0], 0)
 
 
 class HeglundTaylorTests(unittest.TestCase):

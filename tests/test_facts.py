@@ -1,5 +1,6 @@
 import math
 import unittest
+import unittest.mock
 
 import numpy as np
 
@@ -839,10 +840,16 @@ class RigFactsTests(unittest.TestCase):
         self.assertEqual(len(cycle["frames"]), n + 1)
         self.assertEqual(cycle["frames"][-1], cycle["frames"][0])
         self.assertEqual(cycle["drift"], {"dx": 0.0, "dz": 0.0})
+        # The footfall phases are the phase origin's (its footfall at 0, half a key before its first pinned key);
+        # the contacts are the clip's, which starts startPhase later (round 4).
         self.assertAlmostEqual(entry["footfall_phase"]["paw_hl"], 1 - 0.5 / n, places=4)
+        shift = cycle["startPhase"]
         for chain, (on, off) in toy_rig.LOPE_WINDOWS.items():
             bone = toy_rig.PROJECT["paws"][chain]
-            window = [x - 1.0 if x > 0.9 and on < 0.1 else x for x in entry["contacts"][bone]]
+            self.assertAlmostEqual(entry["footfall_phase"][bone], round((entry["contacts"][bone][0] + shift) % 1.0, 4),
+                                   places=4)
+            window = [round((x + shift) % 1.0, 6) for x in entry["contacts"][bone]]
+            window = [x - 1.0 if x > 0.9 and on < 0.1 else x for x in window]
             # The toy's paw paths turn sharply at touchdown and liftoff; the smooth cycle rounds those corners.
             self.assertAlmostEqual(window[0], on, delta=2.5 / n, msg=chain)
             self.assertAlmostEqual(window[1], off, delta=2.5 / n, msg=chain)
@@ -863,11 +870,14 @@ class RigFactsTests(unittest.TestCase):
         result = self.facts(toy_rig.toy_gait(float_paw=("front_L", 0.04)))
         n = result["entry"]["frames"]
         on, off = result["entry"]["contacts"]["paw_fl"]
+        shift = result["cycle"]["startPhase"]
+        on, off = (on + shift) % 1.0, (off + shift) % 1.0
         self.assertAlmostEqual(on, 0.3, delta=2.5 / n)
         self.assertAlmostEqual(off, 0.55, delta=2.5 / n)
         paws = np.array(result["cycle"]["paws"]["paw_fl"])
         # Changed with fix round 1: the pin holds the keys a key inside the declared contact's ends.
-        inside = [k for k in range(n + 1) if on + 1.0 / n - 1e-9 <= k / n <= off - 1.0 / n + 1e-9]
+        inside = [(k - result["cycle"]["startKey"]) % n for k in range(n + 1)
+                  if on + 1.0 / n - 1e-9 <= k / n <= off - 1.0 / n + 1e-9]
         np.testing.assert_allclose(paws[inside, 1], 0.0, atol=1e-6)
 
     def test_trunk_columns_are_smooth_and_keep_the_range(self):
@@ -909,7 +919,7 @@ class FixRoundOneFactsTests(unittest.TestCase):
         declared contacts at facts' own gate."""
         check = self.facts()["contactCheck"]
         n = check["keys"]
-        self.assertEqual(check["pinRelease"], {"span_keys": 2.6, "touchdown_orders": [2, 1],
+        self.assertEqual(check["pinRelease"], {"span_keys": 3.0, "touchdown_orders": [2, 1],
                                                "liftoff_orders": [2, 1], "inset_keys": 0.5,
                                                "min_span": motion.BLEND,
                                                "spanKeys": round(motion.PIN_RELEASE.span(n) * n, 3)})
@@ -920,7 +930,28 @@ class FixRoundOneFactsTests(unittest.TestCase):
         jumps = self.facts()["contactCheck"]["edgeJumps"]
         self.assertEqual(sorted(jumps), ["paw_fl", "paw_fr", "paw_hl", "paw_hr"])
         for bone, jump in jumps.items():
-            self.assertLessEqual(max(jump["touchdownMps"], jump["liftoffMps"]), jump["swingMedianMps"], bone)
+            # the enforced (round-3) reading at the first and last pinned key; the span-wide one is warned
+            self.assertLessEqual(max(jump["touchdownPinnedMps"], jump["liftoffPinnedMps"]), jump["swingMedianMps"],
+                                 bone)
+
+    def test_the_edge_gate_across_the_span_is_measured_warned_and_enforced_when_switched_on(self):
+        """Round 4 ruling: the edge gate read across each pin's approach and release span. The toy's free paw paths
+        turn sharply at touchdown and liftoff, so it is over there: recorded and warned, and with EDGE_GATE_SPAN on,
+        refused."""
+        from unittest import mock
+        result = self.facts()
+        check = result["contactCheck"]
+        self.assertFalse(check["edgeSpanGate"]["pass"])
+        self.assertFalse(check["edgeSpanGate"]["enforced"])
+        self.assertTrue(check["edgeSpanGate"]["over"])
+        self.assertTrue(any("approach and release spans" in w for w in result["warnings"]), result["warnings"])
+        for bone, j in check["edgeJumps"].items():
+            self.assertGreaterEqual(j["touchdownMps"], j["touchdownPinnedMps"], bone)
+            self.assertGreaterEqual(j["liftoffMps"], j["liftoffPinnedMps"], bone)
+        self.assertFalse(facts.EDGE_GATE_SPAN)
+        with mock.patch.object(facts, "EDGE_GATE_SPAN", True):
+            with self.assertRaisesRegex(facts.FactsError, r"approach or release span.*swing.*median"):
+                self.facts()
 
     def test_a_velocity_jump_at_a_contact_edge_is_refused(self):
         from unittest import mock
@@ -937,6 +968,49 @@ class FixRoundOneFactsTests(unittest.TestCase):
         with mock.patch.object(facts.motion, "plan_keys", side_effect=jumpy):
             with self.assertRaisesRegex(facts.FactsError, r"paw_fl.*liftoff.*m/s.*swing.*median"):
                 self.facts()
+
+    def test_the_loop_starts_outside_every_contact_ease(self):
+        """Round 4 ruling: the toy's phase-origin touchdown key lies inside hind_L's approach; facts starts the
+        loop at a key outside every paw's approach and release span instead. The loop is cyclic, so the keys are the
+        same motion, rolled: the seam's second difference (the bar's loop-seam row: the bone with the largest second
+        difference at key 0 against its median elsewhere) is <= 3, the start frame moves by the same share of the
+        period, and the footfall phases stay the phase origin's."""
+        result = self.facts()
+        cycle, entry, check = result["cycle"], result["entry"], result["contactCheck"]
+        n = entry["frames"]
+        start = check["cycleStart"]
+        self.assertLess(start["originClearanceKeys"], 0.0, "the old start was inside an ease")
+        self.assertTrue(start["outsideEases"])
+        self.assertGreater(start["clearanceKeys"], 0.0)
+        self.assertEqual(cycle["startKey"], start["key"])
+        self.assertAlmostEqual(cycle["startPhase"], start["key"] / n)
+        self.assertNotEqual(start["key"], 0)
+        self.assertAlmostEqual(cycle["start"], start["originStart"] + cycle["startPhase"] * result["period"], places=6)
+        self.assertEqual(result["start"], cycle["start"])
+        self.assertAlmostEqual(entry["footfall_phase"]["paw_hl"], 1 - 0.5 / n, places=4)
+        ratios = {}
+        for bone, track in cycle["paws"].items():
+            p = np.asarray(track, float)[:n]
+            sd = np.linalg.norm(np.roll(p, -1, axis=0) - 2 * p + np.roll(p, 1, axis=0), axis=1)
+            ratios[bone] = (sd[0], sd[0] / max(1e-12, float(np.median(sd[1:]))))
+        worst = max(ratios, key=lambda b: ratios[b][0])
+        self.assertLessEqual(ratios[worst][1], 3.0, ratios)
+        # The same motion as a start at the phase origin, rolled.
+        with unittest.mock.patch.object(facts.motion, "start_key", return_value=(0, {
+                "key": 0, "outsideEases": False, "clearanceKeys": start["originClearanceKeys"],
+                "originClearanceKeys": start["originClearanceKeys"]})):
+            origin = self.facts()
+        rolled = np.roll(np.asarray(origin["cycle"]["frames"], float)[:n], -start["key"], axis=0)
+        np.testing.assert_allclose(np.asarray(cycle["frames"], float)[:n], rolled, atol=2e-3)
+        for bone, (on, off) in origin["entry"]["contacts"].items():
+            self.assertAlmostEqual((on - cycle["startPhase"]) % 1.0, entry["contacts"][bone][0] % 1.0, places=3)
+        ratios0 = {}
+        for bone, track in origin["cycle"]["paws"].items():
+            p = np.asarray(track, float)[:n]
+            sd = np.linalg.norm(np.roll(p, -1, axis=0) - 2 * p + np.roll(p, 1, axis=0), axis=1)
+            ratios0[bone] = (sd[0], sd[0] / max(1e-12, float(np.median(sd[1:]))))
+        worst0 = max(ratios0, key=lambda b: ratios0[b][0])
+        self.assertGreater(ratios0[worst0][1], 3.0, f"the toy's origin start is not a hard case: {ratios0}")
 
     def test_a_retime_on_the_rig_path(self):
         """A slow toy video at 200 kg is retimed by 1.62: 60 Hz keys over the shorter cycle, pins and checks on them."""

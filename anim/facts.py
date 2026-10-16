@@ -19,8 +19,10 @@ the planted paws). A stance is seeded within CONTACT_TOLERANCE of the ground and
 within STANCE_TOLERANCE (a side silhouette lets the fit hold a planted paw a few cm up). With the contract's rig
 (`rig`), the motion is the forward kinematics of the smooth periodic cycle (anim/motion.py) at DENSE samples; the
 keys pin every planted paw over that detection on the 60 Hz key grid (two-bone IK), the declared contacts reach half a
-key past the pinned keys at each end (where between keys the paw lands and lifts; so the phase origin's footfall is
-1 - 0.5 / n_keys, half a key before key 0); and the
+key past the pinned keys at each end (where between keys the paw lands and lifts; so the phase origin's footfall phase
+is 1 - 0.5 / n_keys, half a key before its first pinned key). The loop's first key is the one with the most room
+outside every paw's pin approach and release (round 4: motion.start_key; the cycle is rolled there, the start frame
+moves with it, and the footfall phases stay the phase origin's while the contacts are the clip's); and the
 keys, played as the clip plays them, are detected again (the same rule, without the fit-error allowance): under
 CONTACT_AGREEMENT per paw facts refuses. The footfall
 pattern is checked against the brief's `gait` (`expected_gait`, `gait_reads`), and the cadence against the
@@ -59,6 +61,13 @@ STANCE_TOLERANCE = 0.06
 BRIDGE_PHASE = 0.05
 DENSE = 240                  # samples per cycle the rig's motion is read at
 CONTACT_AGREEMENT = 0.95     # declared contacts vs a re-detection from the baked keys, per paw
+# Round 4 ruling: the edge gate (an edge's velocity change at most the paw's swing median per-key change) measured
+# across each pin's whole approach and release span, where the bar's harness finds the kink (motion.edge_jumps).
+# Measured, recorded and warned on every clip; it refuses only while EDGE_GATE_SPAN is True. It is False pending the
+# controller's decision because it refuses every clip measured with every pin-release setting: the wolf lope, the
+# toy and the real fixture, and the old hand-made wolf lope itself (edges 2.1-2.4 m/s against swing medians
+# 1.6-1.8). The round-3 gate (the same rule at the first and last pinned key) is enforced either way.
+EDGE_GATE_SPAN = False
 STILL_SPEED = 0.10           # m/s: the report's "still" for a planted paw in the played clip
 MASS_SPREAD = 0.25           # a single massKg m is the range [m (1 - spread), m (1 + spread)]
 CADENCE_CONSISTENCY = 0.10   # every steady cycle's own period within this share of the clip's: one time scale
@@ -663,15 +672,21 @@ def loop_cycle(poses, project, every, paws, chains, masks, render, rest, rig=Non
              "cadence": cadence, "warnings": warnings}
     if speed is None:
         extra["speedReason"] = contacts["speedReason"]
+    start, shift = contacts["start"], 0.0
     if rig is None:
         keys, n_keys, declared = contacts["keys"], n, contacts["windows"]
-        cycle_out = {"frames": keys, "fps": n / duration, "periodFrames": period, "start": contacts["start"],
+        cycle_out = {"frames": keys, "fps": n / duration, "periodFrames": period, "start": start,
                      "drift": contacts["drift"]}
     else:
         n_keys = motion.key_count(duration)
         keys, declared, bake = rig_keys(contacts, n_keys, names, project, rig, rest, period / fps, factor)
         extra.update({"smooth": contacts["smoothReport"], "contactCheck": bake["check"], "ik": bake["ik"]})
-        cycle_out = {"frames": keys, "fps": n_keys / duration, "periodFrames": period, "start": contacts["start"],
+        warnings += bake["warnings"]
+        # Round 4: the clip starts startKey keys after the phase origin's touchdown.
+        shift = bake["startKey"] / n_keys
+        start = contacts["start"] + shift * period
+        cycle_out = {"frames": keys, "fps": n_keys / duration, "periodFrames": period, "start": start,
+                     "startKey": bake["startKey"], "startPhase": shift, "originStart": contacts["start"],
                      "drift": {"dx": 0.0, "dz": 0.0}, "videoDrift": drift, "keyRate": motion.KEY_RATE,
                      "retime": factor, "groundLift": round(-contacts["groundHeight"], 6), "paws": bake["paws"]}
     entry = {"duration_s": duration, "loop": True,
@@ -684,11 +699,12 @@ def loop_cycle(poses, project, every, paws, chains, masks, render, rest, rig=Non
             entry["duty_factor"][bone] = 0.0
             continue
         on, off = declared[c]
-        entry["contacts"][bone], entry["footfall_phase"][bone] = [round(on, 4), round(off, 4)], round(on, 4)
+        entry["contacts"][bone] = [round(on, 4), round(off, 4)]
+        entry["footfall_phase"][bone] = round((on + shift) % 1.0, 4)     # the phase origin's phase (round 4)
         entry["duty_factor"][bone] = round((off - on) % 1.0 or 1.0, 4)
     if factor != 1.0 and speed is not None:
         extra["videoSpeedMps"] = round(speed, 3)
-    return contacts["start"], period, entry, cycle_out, extra
+    return start, period, entry, cycle_out, extra
 
 
 def averaged_contacts(avg, n, kinds, paw_cols, chains, origin, fps, period, kept, project, rest):
@@ -783,6 +799,14 @@ def snapped(mask, n_keys):
     return a / n_keys, b / n_keys
 
 
+def rolled(window, key, n_keys):
+    """A key-grid window [on, off] as phases of the clip that starts `key` keys later (round 4)."""
+    if tuple(window) == (0.0, 1.0):
+        return window
+    on, off = (int(round(x * n_keys)) for x in window)
+    return ((on - key) % n_keys) / n_keys, ((off - key) % n_keys) / n_keys
+
+
 def in_window(phases, window):
     on, off = window
     if (on, off) == (0.0, 1.0):
@@ -798,11 +822,16 @@ def rig_keys(contacts, n_keys, names, project, rig, rest, period_s, factor):
     CONTACT_AGREEMENT for any paw. Returns (keys, declared windows, {"check", "ik", "paws"})."""
     planar, speed = contacts["planar"], contacts["speed"]
     pinned = {c: snapped(m, n_keys) for c, m in contacts["masks"].items() if m.any()}
+    # Round 4: the loop starts at the key with the most room outside every pin's approach and release.
+    key0, start = motion.start_key(pinned, n_keys)
+    smooth = contacts["smooth"]
+    if key0:
+        pinned = {c: rolled(w, key0, n_keys) for c, w in pinned.items()}
+        smooth = smooth.roll(key0 / n_keys)
     declared = {c: widened(w, n_keys) for c, w in pinned.items()}
     lift = -contacts["groundHeight"]
     stride = (speed or 0.0) * period_s
-    keys, paws, ik = motion.plan_keys(planar, contacts["smooth"], names, project, pinned, stride, rest, lift,
-                                      n_keys)
+    keys, paws, ik = motion.plan_keys(planar, smooth, names, project, pinned, stride, rest, lift, n_keys)
     played, phases = motion.played(keys)
     dt = period_s / len(played)
     heights, vx = {}, {}
@@ -813,7 +842,7 @@ def rig_keys(contacts, n_keys, names, project, rig, rest, period_s, factor):
     again = stance_masks(heights, vx, 0.0, speed, circular=True, gap=max(1, int(round(BRIDGE_PHASE * len(played)))),
                          extent=CONTACT_TOLERANCE)
     jumps = motion.edge_jumps(paws, motion.release_windows(pinned, n_keys, motion.PIN_RELEASE.inset_keys), n_keys,
-                              period_s / factor / n_keys)
+                              period_s / factor / n_keys, span=motion.PIN_RELEASE.span(n_keys))
     edge_jumps = {project["paws"][c]: j for c, j in jumps.items()}
     agreement, still = {}, {}
     for chain in heights:
@@ -829,21 +858,40 @@ def rig_keys(contacts, n_keys, names, project, rig, rest, period_s, factor):
                             "touchdown_orders": list(motion.PIN_RELEASE.touchdown_orders),
                             "liftoff_orders": list(motion.PIN_RELEASE.liftoff_orders),
                             "spanKeys": round(motion.PIN_RELEASE.span(n_keys) * n_keys, 3)},
-             "edgeJumpRule": "the velocity change at the first and last pinned key at most the swing's median "
-                             "per-key change"}
-    jumpy = {b: j for b, j in edge_jumps.items() if max(j["touchdownMps"], j["liftoffMps"]) > j["swingMedianMps"]}
+             "edgeJumpRule": "an edge's velocity change at most the paw's swing median per-key change (x and z at "
+                             "the 60 Hz keys; in place = world for a constant body speed): touchdownMps and "
+                             "liftoffMps across the whole approach and release span (round 4), touchdownPinnedMps and "
+                             "liftoffPinnedMps at the first and last pinned key (round 3)"}
+    span_over = {b: j for b, j in edge_jumps.items() if max(j["touchdownMps"], j["liftoffMps"]) > j["swingMedianMps"]}
+    pinned_over = {b: j for b, j in edge_jumps.items()
+                   if max(j["touchdownPinnedMps"], j["liftoffPinnedMps"]) > j["swingMedianMps"]}
+    check["edgeSpanGate"] = {"pass": not span_over, "enforced": EDGE_GATE_SPAN, "over": sorted(span_over)}
+    check["cycleStart"] = {**start, "phase": key0 / n_keys, "originStart": contacts["start"],
+                           "origin": contacts["origin"],
+                           "rule": "the key with the most room outside every paw's pin approach and release span "
+                                   "(motion.start_key); footfall phases stay the phase origin's"}
+    warnings = []
+    if span_over and not EDGE_GATE_SPAN:
+        warnings.append("Across the pins' approach and release spans the paw velocity changes more than the swing's "
+                        "median per-key change (round 4 edge gate, measured, not enforced): " + "; ".join(
+                            f"{b} touchdown {j['touchdownMps']:.2f}, liftoff {j['liftoffMps']:.2f} against "
+                            f"{j['swingMedianMps']:.2f} m/s per key" for b, j in span_over.items()))
+    jumpy = span_over if EDGE_GATE_SPAN else pinned_over
     if jumpy:
-        raise FactsError("A paw's velocity jumps at a contact edge more than anywhere typical in its swing: " + "; ".join(
-            f"{b} touchdown {j['touchdownMps']:.2f} m/s, liftoff {j['liftoffMps']:.2f} m/s against a swing median of "
-            f"{j['swingMedianMps']:.2f} m/s per key" for b, j in jumpy.items()) + f" (leg IK: {ik}). The pins do not "
-            f"ease in and out; check the leg chains and the IK residuals")
+        where = "across its pin's approach or release span" if EDGE_GATE_SPAN else "at its first or last pinned key"
+        key = ("touchdownMps", "liftoffMps") if EDGE_GATE_SPAN else ("touchdownPinnedMps", "liftoffPinnedMps")
+        raise FactsError(f"A paw's velocity jumps at a contact edge ({where}) more than anywhere typical in its swing: "
+                         + "; ".join(f"{b} touchdown {j[key[0]]:.2f} m/s, liftoff {j[key[1]]:.2f} m/s against a swing "
+                                     f"median of {j['swingMedianMps']:.2f} m/s per key" for b, j in jumpy.items())
+                         + f" (leg IK: {ik}). The pins do not ease in and out; check the leg chains and the IK "
+                           f"residuals")
     low = {b: a for b, a in agreement.items() if a < CONTACT_AGREEMENT}
     if low:
         raise FactsError(f"The declared contacts and a re-detection from the baked keys disagree: they agree on "
                          f"{', '.join(f'{b} {a:.2f}' for b, a in low.items())} of the played cycle, under the gate "
                          f"{CONTACT_AGREEMENT} (leg IK: {ik}). The keys do not plant those paws where facts "
                          f"declared them; check the leg chains, the fit's paws and the IK residuals")
-    return keys.tolist(), declared, {"check": check, "ik": ik,
+    return keys.tolist(), declared, {"check": check, "ik": ik, "startKey": key0, "warnings": warnings,
                                      "paws": {project["paws"][c]: np.round(p, 6).tolist() for c, p in paws.items()}}
 
 
