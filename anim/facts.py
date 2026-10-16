@@ -812,7 +812,8 @@ def rig_keys(contacts, n_keys, names, project, rig, rest, period_s, factor):
     # The same rule without the fit-error allowance (STANCE_TOLERANCE): a pinned paw in the keys is on the ground.
     again = stance_masks(heights, vx, 0.0, speed, circular=True, gap=max(1, int(round(BRIDGE_PHASE * len(played)))),
                          extent=CONTACT_TOLERANCE)
-    jumps = motion.edge_jumps(paws, motion.release_windows(pinned, n_keys), n_keys, period_s / factor / n_keys)
+    jumps = motion.edge_jumps(paws, motion.release_windows(pinned, n_keys, motion.PIN_RELEASE.inset_keys), n_keys,
+                              period_s / factor / n_keys)
     edge_jumps = {project["paws"][c]: j for c, j in jumps.items()}
     agreement, still = {}, {}
     for chain in heights:
@@ -824,6 +825,10 @@ def rig_keys(contacts, n_keys, names, project, rig, rest, period_s, factor):
             still[bone] = round(float(np.mean(world[want] < STILL_SPEED)), 4)
     check = {"agreement": agreement, "gate": CONTACT_AGREEMENT, "plantedStillShare": still,
              "stillSpeedMps": STILL_SPEED, "samples": len(played), "keys": n_keys, "edgeJumps": edge_jumps,
+             "pinRelease": {**motion.PIN_RELEASE._asdict(),
+                            "touchdown_orders": list(motion.PIN_RELEASE.touchdown_orders),
+                            "liftoff_orders": list(motion.PIN_RELEASE.liftoff_orders),
+                            "spanKeys": round(motion.PIN_RELEASE.span(n_keys) * n_keys, 3)},
              "edgeJumpRule": "the velocity change at the first and last pinned key at most the swing's median "
                              "per-key change"}
     jumpy = {b: j for b, j in edge_jumps.items() if max(j["touchdownMps"], j["liftoffMps"]) > j["swingMedianMps"]}

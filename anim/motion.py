@@ -16,24 +16,53 @@ does not change with scale). Leg columns keep every harmonic the samples hold (t
 through every averaged sample), since their stance and swing shapes are what the contacts are read from and the IK
 reshapes them in stance anyway.
 
-The keys pin each planted paw world-still over its stance less half a key at each end (`release_windows`); outside,
-the correction from the free paw to the pin (their difference in position and velocity, and in horizontal
-acceleration, where the pin lets go) fades to nothing over max(BLEND, EDGE_KEYS / n_keys) of the cycle by a quintic,
-so the paw's position and velocity are continuous at liftoff and touchdown (fix round 1, ruling 4; `edge_jumps`
-measures it).
+The keys pin each planted paw world-still over its stance less `PIN_RELEASE.inset_keys` (half a key) at each end
+(`release_windows`); outside, the correction from the free paw to the pin fades to nothing over
+max(BLEND, PIN_RELEASE.span_keys / n_keys) of the cycle by a quintic. The correction matches the pin's derivatives up to
+`PIN_RELEASE`'s orders per axis and edge: by default position, velocity and acceleration in x and position and
+velocity in z at both edges, so the paw's position and velocity are continuous at liftoff and touchdown (Task 19
+round 3; `edge_jumps` measures the velocity change at the pinned keys).
 
 numpy only."""
+from typing import NamedTuple
+
 import numpy as np
 
 KEY_RATE = 60.0          # the bake's key rate (Hz of the played clip)
 RANGE_KEEP = 0.95        # a smoothed trunk, neck, tail or root column keeps this share of its sampled range
 JERK_MAX = 3.0           # ... with its jerk at most this many times a sine's of the same range (the bar's criterion 4)
 BLEND = 0.05             # least cycle fraction over which a paw eases from free to pinned before touchdown, and back
-EDGE_KEYS = 4            # ... and at least this many key intervals (fix round 1, ruling 4)
-# Which axes (x, z) the release matches the pin's acceleration on: x, where the paw is world-still; not z, where
-# the ground's reaction changes the paw's vertical acceleration at contact (matching it holds a lifting paw low).
-EDGE_CURVATURE = (1.0, 0.0)
 EDGE_SAMPLES = 3600      # samples per cycle the free paw's position, velocity and acceleration are read at
+
+
+class PinRelease(NamedTuple):
+    """How a pinned paw takes up its world-still line at touchdown and lets go of it at liftoff (Task 19 round 3).
+
+    span_keys: the key intervals the correction from the free paw to the pin fades over (and at least `min_span` of
+    the cycle). touchdown_orders, liftoff_orders: per axis (x, z), the derivatives of the pin the correction matches at
+    that edge: 0 position, 1 also velocity, 2 also acceleration. inset_keys: where the pin starts and ends, in key
+    intervals inside the snapped contact window at each end (0 at its edge, negative outside it)."""
+    span_keys: float = 2.6
+    touchdown_orders: tuple = (2, 1)
+    liftoff_orders: tuple = (2, 1)
+    inset_keys: float = 0.5
+    min_span: float = BLEND
+
+    def span(self, n_keys):
+        return max(self.min_span, self.span_keys / n_keys)
+
+    def edge_orders(self, touchdown):
+        return np.asarray(self.touchdown_orders if touchdown else self.liftoff_orders)
+
+
+# The default (Task 19 round 3), chosen by a sweep of the wolf lope measured with chase3d's tools/anim_compare.py
+# (task-19-round3-report.md in the chase3d plan folder). It matches the pin's position, velocity and acceleration in x
+# and its position and velocity in z at both edges, as fix round 1 did, over 2.6 key intervals instead of 4: the
+# shorter span ends the slow tangential lift sooner, so the declared contacts agree with the height-only detection
+# (bar criterion 5) and the edge jumps stay under the old clip's (criterion 8). No setting passed the whole bar and
+# facts' own edge gate on the real fixture together: the ones that passed the bar let z go unmatched at liftoff,
+# which the real fixture's gate refuses. This one misses the bar's literature score by its loop-seam row.
+PIN_RELEASE = PinRelease()
 SUBSAMPLES = 8           # re-detection samples per key interval (the keys are interpolated linearly, as played)
 
 
@@ -361,20 +390,22 @@ def pin_lines(rig, smooth, names, project, windows, stride, rest, lift, dx_shift
     return lines
 
 
-def release_windows(windows, n_keys):
-    """Each contact window less half a key at each end: the phases over which the pin holds the paw (a window
-    shorter than one key is its midpoint)."""
+def release_windows(windows, n_keys, inset_keys=None):
+    """Each contact window less `inset_keys` key intervals at each end (PIN_RELEASE's, half a key, by default; a
+    negative inset widens it): the phases over which the pin holds the paw (a window that would close is its
+    midpoint)."""
+    inset = PIN_RELEASE.inset_keys if inset_keys is None else inset_keys
     out = {}
     for chain, (on, off) in windows.items():
         if (on, off) == (0.0, 1.0):
             out[chain] = (0.0, 1.0)
             continue
         end = off if off > on else off + 1.0
-        half = 0.5 / n_keys
+        half = inset / n_keys
         a, b = on + half, end - half
         if a > b:
             a = b = 0.5 * (on + end)
-        out[chain] = (a % 1.0, b % 1.0) if b >= 1.0 else (a, b)
+        out[chain] = (a % 1.0, b % 1.0) if (a < 0.0 or b >= 1.0) else (a, b)
     return out
 
 
@@ -386,22 +417,23 @@ def quintic(s):
             0.5 * s ** 2 - 1.5 * s ** 3 + 1.5 * s ** 4 - 0.5 * s ** 5)
 
 
-def plan_keys(rig, smooth, names, project, windows, stride, rest, lift, n_keys, blend=None):
+def plan_keys(rig, smooth, names, project, windows, stride, rest, lift, n_keys, blend=None, release=None):
     """The bake's keys: n_keys + 1 value vectors at phases k / n_keys (the last repeats the first), the smooth cycle
     with its root lifted by `lift` and every planted paw pinned to its world-still line (`pin_lines`) over its
-    contact window less half a key at each end (`release_windows`). Outside, the paw's target is the free paw plus
-    the correction where the pin lets go (pin minus free in position and velocity, and in acceleration on the
-    EDGE_CURVATURE axes) faded to nothing by a quintic over `blend` (max(BLEND, EDGE_KEYS / n_keys) of the cycle), so
-    the paw's motion has no step in position or velocity at liftoff and touchdown. Returns (keys, predicted paws per
-    key, IK report)."""
-    span = max(BLEND, EDGE_KEYS / n_keys) if blend is None else blend
+    contact window less `release.inset_keys` at each end (`release_windows`). Outside, the paw's target is the free
+    paw plus the correction where the pin lets go (pin minus free in position, and in velocity and acceleration on the
+    axes whose `release.edge_orders` at that edge reach them) faded to nothing by a quintic over `blend` (by default `release.span`:
+    max(BLEND, span_keys / n_keys) of the cycle). `release` is PIN_RELEASE unless given. Returns (keys, predicted
+    paws per key, IK report)."""
+    release_setting = PIN_RELEASE if release is None else release
+    span = release_setting.span(n_keys) if blend is None else blend
     phases = np.arange(n_keys) / n_keys
     keys = smooth.at(phases)
     keys[:, names.index("dz")] += lift
     shift = float(keys[:, names.index("dx")].mean())       # in place: the bake would remove it; the pins move with it
     keys[:, names.index("dx")] -= shift
     lines = pin_lines(rig, smooth, names, project, windows, stride, rest, lift, shift)
-    release = release_windows(windows, n_keys)
+    release = release_windows(windows, n_keys, release_setting.inset_keys)
     grid = np.arange(EDGE_SAMPLES) / EDGE_SAMPLES
     dense = smooth.at(grid)
     dense[:, names.index("dz")] += lift
@@ -432,10 +464,11 @@ def plan_keys(rig, smooth, names, project, windows, stride, rest, lift, n_keys, 
             velocity = (np.roll(p, -1, axis=0) - np.roll(p, 1, axis=0)) * EDGE_SAMPLES / 2
             accel = (np.roll(p, -1, axis=0) - 2 * p + np.roll(p, 1, axis=0)) * EDGE_SAMPLES ** 2
             for edge, sign in ((on, -1.0), (end, 1.0)):
+                order = release_setting.edge_orders(touchdown=sign < 0)
                 i = int(round((edge % 1.0) * EDGE_SAMPLES)) % EDGE_SAMPLES
                 value = pin(edge) - p[i]
-                slope = (np.array([-stride, 0.0]) - velocity[i]) * sign * span
-                curve = -accel[i] * span ** 2 * np.asarray(EDGE_CURVATURE, float)
+                slope = (np.array([-stride, 0.0]) - velocity[i]) * sign * span * (order >= 1)
+                curve = -accel[i] * span ** 2 * (order >= 2)
                 for shift_u in (-1.0, 0.0, 1.0):
                     s = (phases + shift_u - edge) * sign / span
                     near = (s > 0) & (s < 1) & ~pinned

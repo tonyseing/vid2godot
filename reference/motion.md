@@ -77,10 +77,13 @@ warning.
 - **Pins**: over each stance's keys less half a key at each end, two-bone IK (the two bones above the last two; the
   foot keeps its world orientation, the knee its bend; where the leg cannot reach, the foot turns about the pinned
   toe, the heel lifting) holds the paw on a world-still line: on the ground, sliding back one stride per cycle.
-  Outside, the paw follows the free motion plus the correction where the pin lets go (pin minus free in position and
-  velocity, and in horizontal acceleration), faded out by a quintic over max(0.05 of a cycle, 4 key intervals), so
-  liftoff and touchdown have no velocity step. `ik` reports each paw's pinned and eased keys and its largest
-  residual (a leg that cannot reach its pin leaves one).
+  Outside, the paw follows the free motion plus the correction where the pin lets go, faded out by a quintic over
+  max(0.05 of a cycle, 2.6 key intervals). The correction is set by `motion.PIN_RELEASE` (span, the derivatives
+  matched per axis at touchdown and at liftoff, and the inset; recorded as `contactCheck.pinRelease`). The default
+  matches position, velocity and acceleration in x and position and velocity in z at both edges, so liftoff and
+  touchdown have no velocity step. It came from a sweep on the wolf lope, measured with chase3d's
+  `tools/anim_compare.py` (Task 19 round 3): the shorter span (4 keys before) ends the paw's tangential lift sooner. `ik` reports each paw's pinned and eased keys
+  and its largest residual (a leg that cannot reach its pin leaves one).
 - **Check**: the keys are played as the clip plays them (linear between keys) and detected again with the same
   rule, without the 0.06 m allowance (a pinned paw is on the ground). Under 0.95 agreement for any paw, `facts`
   refuses (`contactCheck`); `plantedStillShare` reports how much of each stance is under 0.10 m/s.

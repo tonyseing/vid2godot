@@ -904,6 +904,18 @@ class FixRoundOneFactsTests(unittest.TestCase):
         return facts.clip_facts(poses, toy_rig.PROJECT, brief, toy_rig.REST, masks=masks, render=render,
                                 rig=toy_rig.toy_rig(), **kw)
 
+    def test_the_default_pin_release_is_recorded_and_its_contacts_agree(self):
+        """Task 19 round 3: facts records the pin release it keyed with, and the default's keys agree with the
+        declared contacts at facts' own gate."""
+        check = self.facts()["contactCheck"]
+        n = check["keys"]
+        self.assertEqual(check["pinRelease"], {"span_keys": 2.6, "touchdown_orders": [2, 1],
+                                               "liftoff_orders": [2, 1], "inset_keys": 0.5,
+                                               "min_span": motion.BLEND,
+                                               "spanKeys": round(motion.PIN_RELEASE.span(n) * n, 3)})
+        self.assertGreaterEqual(min(check["agreement"].values()), facts.CONTACT_AGREEMENT)
+        self.assertEqual(facts.CONTACT_AGREEMENT, 0.95)
+
     def test_the_edge_velocity_jumps_are_recorded_and_within_the_swing(self):
         jumps = self.facts()["contactCheck"]["edgeJumps"]
         self.assertEqual(sorted(jumps), ["paw_fl", "paw_fr", "paw_hl", "paw_hr"])
