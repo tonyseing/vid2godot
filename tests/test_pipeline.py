@@ -47,6 +47,25 @@ class PipelineTests(unittest.TestCase):
         self.assertIn("missing.json", err)
         self.assertNotIn("Traceback", err)
 
+    def test_facts_without_the_paws_rest_heights_is_refused(self):
+        """Task 17b fix round 4: facts measures each paw from its rest-pose tail height in the contract's rig.json;
+        a rig.json without them is a clean refusal, never a silent fallback to absolute heights."""
+        from anim.ledger import Ledger
+        model = self.tmp / "m.glb"
+        model.write_bytes(b"x")
+        work = self.tmp / "w"
+        ledger = Ledger.init(work, model, "lope")
+        (work / "contract").mkdir()
+        shutil.copyfile(FIXTURE_CONTRACT, work / "contract" / "project-contract.json")
+        rig = work / "contract" / "rig.json"
+        rig.write_text(json.dumps({"bones": [{"name": "root", "head": [0, 0, 0], "tail": [0, 0, 1]}]}))
+        ledger.record("contract", {}, {"rig": rig})
+        code, _, err = run("facts", "--work", str(work))
+        self.assertEqual(code, 1)
+        self.assertTrue(err.startswith("error: "))
+        self.assertRegex(err, "rest.*paw_")
+        self.assertNotIn("Traceback", err)
+
     @requires_blender
     def test_contract_on_fixture(self):
         glb, _ = fixture_glb()

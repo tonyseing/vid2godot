@@ -31,9 +31,10 @@ def draw_overlays(work, poses, projection_npz, masks_npz, out_dir):
     return paths
 
 
-def contact_timeline(poses, project):
-    """Each paw's frames on the ground, against the one ground shared by every paw (facts.ground_height)."""
-    masks = contact_masks({chain: np.array([f["paws"][chain][1] for f in poses["frames"]])
+def contact_timeline(poses, project, rest):
+    """Each paw's frames on the ground, against the one ground shared by every paw (facts.ground_height), each paw's
+    height measured from its rest-pose tail height `rest[chain]` (facts.rest_heights), as facts measures it."""
+    masks = contact_masks({chain: np.array([f["paws"][chain][1] for f in poses["frames"]]) - rest[chain]
                            for chain in project["paws"]})
     return {bone: masks[chain].tolist() for chain, bone in project["paws"].items()}
 

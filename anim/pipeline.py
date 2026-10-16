@@ -93,6 +93,12 @@ def project_contract(ledger):
     return contract_mod.load_project_contract(ledger.output("contract", "rig").parent / "project-contract.json")
 
 
+def paw_rest(ledger):
+    """Each paw chain's rest-pose tail height from the contract stage's rig.json (facts and the lab's contact strip
+    measure the paws from it); refuses when the rig.json has none."""
+    return facts_mod.rest_heights(load_json(ledger.output("contract", "rig")), project_contract(ledger))
+
+
 def load_json(path):
     return json.loads(Path(path).read_text())
 
@@ -232,6 +238,7 @@ def silhouette_renderer(model, poses, shape, folder, blender=None):
 @command("facts")
 def cmd_facts(a):
     ledger = Ledger(a.work)
+    rest = paw_rest(ledger)
     brief = load_json(ledger.output("brief", "brief"))
     poses = load_json(ledger.output("fit", "poses"))
     masks_path = ledger.output("ingest", "masks")
@@ -239,7 +246,7 @@ def cmd_facts(a):
     folder = ledger.work / "facts"
     folder.mkdir(exist_ok=True)
     render = silhouette_renderer(ledger.model, poses, masks.shape[1:], folder / "render", a.blender)
-    result = facts_mod.clip_facts(poses, project_contract(ledger), brief, masks=masks, render=render)
+    result = facts_mod.clip_facts(poses, project_contract(ledger), brief, rest, masks=masks, render=render)
     (folder / "facts.json").write_text(json.dumps(result, indent=2))
     (folder / "anim-entry.json").write_text(json.dumps({ledger.clip: result["entry"]}, indent=2))
     ledger.record("facts", {"poses": ledger.output("fit", "poses"), "masks": masks_path},
@@ -298,7 +305,8 @@ def build_lab(ledger):
                              folder / "overlays")
     hashes = {name: ledger.require("fit")["outputs"][name]["sha256"] for name in ("poses", "projection")}
     page = review_mod.lab_page(ledger.clip, report, brief["iouThreshold"],
-                               review_mod.contact_timeline(poses, project_contract(ledger)), hashes)
+                               review_mod.contact_timeline(poses, project_contract(ledger), paw_rest(ledger)),
+                               hashes)
     (folder / "lab.html").write_text(page)
     return folder / "lab.html", report
 

@@ -12,6 +12,9 @@ PROJECT = {"paws": {"hind_L": "paw_hl", "front_L": "paw_fl", "hind_R": "paw_hr",
            "legPairs": [["front_L", "front_R"], ["hind_L", "hind_R"]], "phaseOrigin": "hind_L"}
 PHASES = {"hind_L": 0.0, "front_L": 0.25, "hind_R": 0.5, "front_R": 0.75}
 LOPE = {"clip": "lope", "loop": True, "targetSpeedMps": 3.0}
+# Task 17b fix round 4: each paw's height is measured from its own rest-pose tail height (the contract's rig.json).
+# The synthetic rigs' paw tails all rest at 0.
+REST = {c: 0.0 for c in PROJECT["paws"]}
 
 
 def synthetic(frames=60, period=12, fps=24.0, speed=3.0, phases=PHASES, envelope=0.0):
@@ -46,11 +49,11 @@ def analytic_values(f, period=9.6, amplitude=0.015):
     return [-0.125 * f, 0.02 * f] + [amplitude * math.sin(2 * math.pi * (f / period - p)) for p in PHASES.values()]
 
 
-def run(poses, project=PROJECT, brief=LOPE, gain=1.0, masks_from=None, render=None, hips=None):
+def run(poses, project=PROJECT, brief=LOPE, gain=1.0, masks_from=None, render=None, hips=None, rest=REST):
     """facts on a toy video of the poses (tests/toy_gait.py): its masks, and its renderer for the cycle check."""
     kwargs = {"hips": hips} if hips else {}
     masks, toy_render = toy_video(poses, gain, masks_from=masks_from, **kwargs)
-    return facts.clip_facts(poses, project, brief, masks=masks, render=render or toy_render)
+    return facts.clip_facts(poses, project, brief, rest, masks=masks, render=render or toy_render)
 
 
 def expected_cycle(result, function):
@@ -235,7 +238,7 @@ class FactsTests(unittest.TestCase):
                    "paws": {c: [-3.0 * f / 24.0, 0.0 if f in planted[c] else 0.2] for c in planted}}
                   for f in range(11)]
         poses = {"fps": 24.0, "names": ["dx", "dz", "a", "b", "c", "d"], "frames": frames}
-        result = facts.clip_facts(poses, PROJECT, {"clip": "pounce", "loop": False, "targetSpeedMps": None})
+        result = facts.clip_facts(poses, PROJECT, {"clip": "pounce", "loop": False, "targetSpeedMps": None}, REST)
         entry = result["entry"]
         self.assertIs(entry["loop"], False)
         self.assertEqual(entry["frames"], 10)
@@ -320,7 +323,7 @@ class VideoCycleTests(unittest.TestCase):
 
     def test_loop_needs_the_video(self):
         with self.assertRaisesRegex(facts.FactsError, "masks"):
-            facts.clip_facts(synthetic(), PROJECT, LOPE)
+            facts.clip_facts(synthetic(), PROJECT, LOPE, REST)
 
     def test_period_comes_from_the_video_not_the_angles(self):
         poses = self.loose()
@@ -446,7 +449,7 @@ class GroundContactTests(unittest.TestCase):
                             "front_L": [-3.0 * f / 24.0, 0.1 + 0.01 * (f % 2)], "front_R": [0.0, 0.2]}}
                   for f in range(11)]
         poses = {"fps": 24.0, "names": ["dx", "dz", "a", "b", "c", "d"], "frames": frames}
-        result = facts.clip_facts(poses, PROJECT, {"clip": "pounce", "loop": False, "targetSpeedMps": None})
+        result = facts.clip_facts(poses, PROJECT, {"clip": "pounce", "loop": False, "targetSpeedMps": None}, REST)
         self.assertEqual({c: p["plants"] for c, p in result["paws"].items()},
                          {"hind_L": True, "front_L": False, "hind_R": True, "front_R": False})
         self.assertEqual(result["entry"]["contact_windows"]["paw_fl"], [])
@@ -481,3 +484,84 @@ class GroundContactTests(unittest.TestCase):
         self.assertEqual(wrap.tolist(), [True, True, False, False, False, True], "the gap at the seam is bridged")
         edge = facts.contact_masks({"p": np.array([0.03, 0.0, 0.1, 0.1, 0.1, 0.0])}, 0.0)["p"]
         self.assertEqual(edge.tolist(), [False, True, False, False, False, True], "a clip's ends are not joined")
+
+
+# The chase3d wolf's paw tails at rest (contract/rig.json): the fronts 6.4 mm up, the hinds 20.7 mm down.
+WOLF_REST = {"front_L": 0.0064, "front_R": 0.0064, "hind_L": -0.0207, "hind_R": -0.0207}
+
+
+def rested(poses, rest=WOLF_REST):
+    """The poses of a rig whose paw tails rest at `rest`: every paw's height carries its own rest offset."""
+    for entry in poses["frames"]:
+        for chain, z in rest.items():
+            entry["paws"][chain][1] += z
+    return poses
+
+
+def rig_of(rest, project=PROJECT):
+    """A contract rig.json stand-in with each paw bone's rest tail at height `rest[chain]`."""
+    return {"bones": [{"name": project["paws"][c], "head": [0.0, 0.0, z + 0.05], "tail": [0.1, 0.0, z]}
+                      for c, z in rest.items()] + [{"name": "root", "head": [0, 0, 0], "tail": [0, 0, 0.5]}]}
+
+
+class RestRelativeHeightTests(unittest.TestCase):
+    """Task 17b fix round 4: a rig's paw tails need not rest at one height (the wolf's fronts rest 2.7 cm over its
+    hinds), so each paw's height is measured from its own rest-pose tail height before the shared ground and the
+    tolerance apply; the rest offsets come from the contract's rig.json and are required."""
+
+    def test_rest_heights_from_the_rig(self):
+        rest = facts.rest_heights(rig_of(WOLF_REST), PROJECT)
+        self.assertEqual(rest, WOLF_REST)
+
+    def test_missing_rest_data_is_refused(self):
+        rig = rig_of({c: z for c, z in WOLF_REST.items() if c != "front_L"})
+        with self.assertRaisesRegex(facts.FactsError, r"rest.*front_L.*paw_fl"):
+            facts.rest_heights(rig, PROJECT)
+        with self.assertRaisesRegex(facts.FactsError, "rest"):
+            facts.rest_heights({}, PROJECT)
+        broken = rig_of(WOLF_REST)
+        del broken["bones"][0]["tail"]
+        with self.assertRaisesRegex(facts.FactsError, "rest"):
+            facts.rest_heights(broken, PROJECT)
+        with self.assertRaisesRegex(facts.FactsError, "rest"):
+            run(lope(), rest=None)
+        with self.assertRaisesRegex(facts.FactsError, r"rest.*hind_R"):
+            run(lope(), rest={c: 0.0 for c in ("hind_L", "front_L", "front_R")})
+
+    def test_paws_resting_at_different_heights_all_plant(self):
+        poses = rested(lope())
+        flat = run(poses, rest=REST)
+        self.assertEqual(sorted(flat["gait"]["neverPlants"]), ["front_L", "front_R"],
+                         "measured from one absolute ground, the fronts read 2.7 cm high and never plant")
+        result = run(poses, rest=WOLF_REST)
+        self.assertEqual(result["gait"]["neverPlants"], [])
+        for chain, paw in result["paws"].items():
+            self.assertIs(paw["plants"], True, chain)
+            self.assertEqual(paw["restZ"], WOLF_REST[chain])
+            self.assertAlmostEqual(paw["lowestAboveGround"], 0.0, delta=0.003, msg=chain)
+        gait = result["gait"]
+        self.assertEqual(gait["beats"], 3)
+        self.assertEqual([sorted(b) for b in gait["beatPaws"]], [["hind_L"], ["front_L", "hind_R"], ["front_R"]])
+        self.assertEqual(gait["lead"], {"front": "front_R", "hind": "hind_R"})
+        self.assertEqual(len(gait["suspensions"]), 1)
+        self.assertAlmostEqual(result["speedMps"], 3.0, delta=0.05)
+
+    def test_a_paw_raised_above_its_own_rest_ground_never_plants(self):
+        poses = rested(lope())
+        for entry in poses["frames"]:
+            entry["paws"]["front_L"][1] += 0.06
+        result = run(poses, rest=WOLF_REST)
+        self.assertIs(result["paws"]["front_L"]["plants"], False)
+        self.assertAlmostEqual(result["paws"]["front_L"]["lowestAboveGround"], 0.06, delta=0.005)
+        self.assertEqual(result["gait"]["neverPlants"], ["front_L"])
+
+    def test_one_shot_heights_are_rest_relative(self):
+        frames = [{"index": f, "values": [0.0, 0.0, 0.1 * f, 0.0, 0.0, 0.0], "flags": [],
+                   "paws": {c: [-3.0 * f / 24.0, WOLF_REST[c]] for c in PROJECT["paws"]}} for f in range(11)]
+        poses = {"fps": 24.0, "names": ["dx", "dz", "a", "b", "c", "d"], "frames": frames}
+        brief = {"clip": "pounce", "loop": False, "targetSpeedMps": None}
+        flat = facts.clip_facts(poses, PROJECT, brief, REST)
+        self.assertFalse(flat["paws"]["front_L"]["plants"])
+        result = facts.clip_facts(poses, PROJECT, brief, WOLF_REST)
+        self.assertTrue(all(p["plants"] for p in result["paws"].values()))
+        self.assertEqual(result["paws"]["hind_L"]["restZ"], -0.0207)

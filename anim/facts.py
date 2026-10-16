@@ -8,7 +8,10 @@ checked against the masks (mean IoU at least CYCLE_MIN_IOU) before it is accepte
 
 Paw contacts are measured against one ground shared by every paw (`ground_height`), never each paw's own lowest
 point: a paw that never comes within CONTACT_TOLERANCE of that ground has no contact (`plants: false`), and the beats,
-lead, suspension and ground speed come from the planted paws only. A one-sample lift inside a stance is bridged."""
+lead, suspension and ground speed come from the planted paws only. A one-sample lift inside a stance is bridged.
+Each paw's height is measured from its own rest-pose tail height (`rest_heights`, from the contract's rig.json) before
+the ground and the tolerance apply: a rig's paw tails need not rest at one height (the chase3d wolf's front tails
+rest 2.7 cm over its hind tails), and absolute heights would read the higher-resting paws as never planting."""
 import numpy as np
 
 from anim import cycle
@@ -73,6 +76,35 @@ def resample(series, times):
     return cycle.resample(series, times)
 
 
+def rest_heights(rig, project):
+    """Each paw chain's rest-pose tail height (world z) from the contract's rig.json (`bones[].tail`). Refuses when
+    a paw bone or its tail is missing: facts never falls back to absolute heights."""
+    bones = {b.get("name"): b for b in (rig or {}).get("bones") or [] if isinstance(b, dict)}
+    rest, missing = {}, []
+    for chain, bone in project["paws"].items():
+        tail = bones.get(bone, {}).get("tail")
+        if not isinstance(tail, (list, tuple)) or len(tail) != 3:
+            missing.append(f"{chain} ({bone})")
+            continue
+        rest[chain] = float(tail[2])
+    if missing:
+        raise FactsError(f"facts measures each paw from its rest-pose tail height, and the contract's rig.json has "
+                         f"no rest tail for {', '.join(missing)}; rerun `contract`")
+    return rest
+
+
+def rest_relative(paws, rest, project):
+    """The paws' (x, height) with each paw's height measured from its rest-pose tail height."""
+    if rest is None:
+        raise FactsError("facts measures each paw from its rest-pose tail height (the contract's rig.json), and no "
+                         "rest heights were given")
+    missing = [f"{c} ({project['paws'][c]})" for c in paws if c not in rest]
+    if missing:
+        raise FactsError(f"facts measures each paw from its rest-pose tail height, and there is none for "
+                         f"{', '.join(missing)}")
+    return {c: p - np.array([0.0, float(rest[c])] + [0.0] * (p.shape[1] - 2)) for c, p in paws.items()}
+
+
 def ground_height(heights):
     """The one ground every paw is measured against: GROUND_PERCENTILE of all paws' heights together."""
     return float(np.percentile(np.concatenate([np.asarray(z, float) for z in heights.values()]), GROUND_PERCENTILE))
@@ -101,9 +133,11 @@ def contact_masks(heights, ground=None, circular=False):
     return {c: bridge(contact_mask(z, ground), circular) for c, z in heights.items()}
 
 
-def paw_report(heights, masks, ground, project):
+def paw_report(heights, masks, ground, project, rest):
+    """Per paw: whether it plants, its lowest rest-relative height over the shared ground, its rest tail height."""
     return {c: {"bone": project["paws"][c], "plants": bool(masks[c].any()),
-                "lowestAboveGround": round(float(np.min(heights[c]) - ground), 4)} for c in heights}
+                "lowestAboveGround": round(float(np.min(heights[c]) - ground), 4),
+                "restZ": round(float(rest[c]), 4)} for c in heights}
 
 
 def contact_window(mask):
@@ -191,18 +225,19 @@ def gait_pattern(masks, touchdowns, project, n):
             "lead": lead, "suspensions": suspensions, "beatTolerance": round(tol, 4)}
 
 
-def clip_facts(poses, project, brief, masks=None, render=None):
-    """The clip's facts. A loop needs the video: `masks` (the ingest's working masks, (T, H, W) bool) and `render`
+def clip_facts(poses, project, brief, rest, masks=None, render=None):
+    """The clip's facts. `rest` is each paw chain's rest-pose tail height (`rest_heights`); the paws' heights are
+    measured from it. A loop needs the video: `masks` (the ingest's working masks, (T, H, W) bool) and `render`
     (value vectors -> the rig's silhouettes at the masks' size) for the averaged cycle's check."""
     fps = float(poses["fps"])
     frames = poses["frames"]
     every = np.array([f["values"] for f in frames], float)
     values = every[:, 2:]
     chains = list(project["paws"])
-    paws = {c: np.array([f["paws"][c] for f in frames], float) for c in chains}
+    paws = rest_relative({c: np.array([f["paws"][c] for f in frames], float) for c in chains}, rest, project)
     warnings = []
     if brief["loop"]:
-        found = loop_cycle(poses, project, every, paws, chains, masks, render)
+        found = loop_cycle(poses, project, every, paws, chains, masks, render, rest)
         start, period, entry, cycle_out, extra = found
         speed, speed_reason = entry["authored_speed_mps"], extra.pop("speedReason", None)
     else:
@@ -219,7 +254,7 @@ def clip_facts(poses, project, brief, masks=None, render=None):
         cycle_out = {"frames": every.tolist(), "fps": fps, "periodFrames": period, "start": start,
                      "drift": {"dx": 0.0, "dz": 0.0}}
         extra = {"ground": ground_block(ground, "every frame, all paws"),
-                 "paws": paw_report(heights, masks, ground, project)}
+                 "paws": paw_report(heights, masks, ground, project, rest)}
     target = brief.get("targetSpeedMps")
     if speed is not None and target and abs(speed - target) / target > 0.25:
         warnings.append(f"Measured ground speed {speed:.2f} m/s is more than 25% from the brief's {target} m/s")
@@ -260,7 +295,7 @@ def leg_period(values, names, project, fps, period):
             "gate": PERIOD_MAX_SCORE}
 
 
-def loop_cycle(poses, project, every, paws, chains, masks, render):
+def loop_cycle(poses, project, every, paws, chains, masks, render, rest):
     """The loop's cycle from the video: period, steady cycles, phase average, touchdown roll, the averaged cycle's
     check against the masks. Returns (start, period, entry, cycle block, extra facts)."""
     if masks is None or render is None:
@@ -351,7 +386,7 @@ def loop_cycle(poses, project, every, paws, chains, masks, render):
              "cycleScores": {f"{s:.4f}": round(v, 4) for s, v in steady["scores"].items()},
              "identityExchanged": exchanged, "averagedCycleIoU": check["meanIoU"], "cycleCheck": check,
              "ground": ground_block(ground, "averaged cycle, all paws"),
-             "paws": paw_report(heights, masks_of, ground, project), "gait": gait}
+             "paws": paw_report(heights, masks_of, ground, project, rest), "gait": gait}
     if speed is None:
         extra["speedReason"] = speed_reason
     return start, period, entry, cycle_out, extra

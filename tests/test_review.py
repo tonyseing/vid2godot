@@ -69,6 +69,16 @@ class ReviewTests(unittest.TestCase):
         self.assertIn("Copy notes", page)
         self.assertNotIn("__DATA__", page)
 
+    def test_contact_timeline_is_rest_relative(self):
+        """Task 17b fix round 4: the lab's contact strip reads each paw from its own rest-pose tail height, as facts
+        does (a front paw resting 2.7 cm over the hinds is still on the ground)."""
+        project = {"paws": {"hind_L": "paw_hl", "front_L": "paw_fl"}}
+        frames = [{"paws": {"hind_L": [0.0, -0.0207 + (0.0 if f < 3 else 0.1)],
+                            "front_L": [0.0, 0.0064 + (0.0 if f >= 3 else 0.1)]}} for f in range(6)]
+        rest = {"hind_L": -0.0207, "front_L": 0.0064}
+        timeline = review.contact_timeline({"frames": frames}, project, rest)
+        self.assertEqual(timeline, {"paw_hl": [True] * 3 + [False] * 3, "paw_fl": [False] * 3 + [True] * 3})
+
     def failing(self, template=None):
         filled = json.loads(json.dumps(template or self.template))
         filled.update({"reviewer": "agent", "verdict": "fail", "observations": "legs jump back at frame 2"})
@@ -156,7 +166,10 @@ class ReviewCommandTests(unittest.TestCase):
         ledger = Ledger.init(work, model, "lope")
         project = json.loads(FIXTURE_CONTRACT.read_text())
         put("contract/project-contract.json", project)
-        put("contract/rig.json", {})
+        # The paws' rest tails (Task 17b fix round 4: the lab's contact strip is rest-relative).
+        rig = {"bones": [{"name": bone, "head": [0.0, 0.0, 0.05], "tail": [0.1, 0.0, 0.0]}
+                         for bone in project["paws"].values()]}
+        put("contract/rig.json", rig)
         put("brief/brief.json", {"iouThreshold": 0.9})
         frames, height, width = 3, 30, 40
         for f in range(frames):
@@ -175,7 +188,7 @@ class ReviewCommandTests(unittest.TestCase):
                   "joints": {c: [[15, 12], [16, 16], [16, 19]] for c in chains}} for f in range(frames)]
         put("fit/poses.json", {"frames": poses})
         put("fit/report.json", REPORT)
-        outputs = {"contract": {"rig": put("contract/rig.json", {})}, "brief": {"brief": work / "brief/brief.json"},
+        outputs = {"contract": {"rig": put("contract/rig.json", rig)}, "brief": {"brief": work / "brief/brief.json"},
                    "reference": {"x": put("reference/x.json", {})}, "generate": {"x": put("generate/x.json", {})},
                    "accept": {"x": put("accept/x.json", {})},
                    "ingest": {"masks": work / "ingest/masks.npz", "meta": put("ingest/ingest.json", {})},
