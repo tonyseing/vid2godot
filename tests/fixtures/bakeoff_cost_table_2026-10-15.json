@@ -1,0 +1,252 @@
+{
+  "date": "2026-10-15",
+  "clip": "5 s 720p 16:9",
+  "source": "GET https://openrouter.ai/api/v1/videos/models",
+  "referenceModel": "bytedance/seedance-2.5",
+  "rows": [
+    {
+      "model": "bytedance/seedance-1-5-pro",
+      "reference": false,
+      "eligible": true,
+      "why": "eligible",
+      "estimateUsd": 0.2592,
+      "pricingBasis": "video_tokens: 1280x720 x 24 fps x 5 s / 1024 x $0.0000024"
+    },
+    {
+      "model": "x-ai/grok-imagine-video",
+      "reference": false,
+      "eligible": true,
+      "why": "eligible",
+      "estimateUsd": 0.352,
+      "pricingBasis": "per second: cents_per_video_output_second_720p = $0.07/s x 5 s + cents_per_image_input $0.002 (one first frame)"
+    },
+    {
+      "model": "bytedance/seedance-2.0-mini",
+      "reference": false,
+      "eligible": true,
+      "why": "eligible",
+      "estimateUsd": 0.378,
+      "pricingBasis": "video_tokens: 1280x720 x 24 fps x 5 s / 1024 x $0.0000035"
+    },
+    {
+      "model": "bytedance/seedance-2.0-fast",
+      "reference": false,
+      "eligible": true,
+      "why": "eligible",
+      "estimateUsd": 0.4536,
+      "pricingBasis": "video_tokens: 1280x720 x 24 fps x 5 s / 1024 x $0.0000042"
+    },
+    {
+      "model": "alibaba/happyhorse-1.0",
+      "reference": false,
+      "eligible": true,
+      "why": "eligible",
+      "estimateUsd": 0.494,
+      "pricingBasis": "per second: duration_seconds_720p = $0.0988/s x 5 s"
+    },
+    {
+      "model": "alibaba/happyhorse-1.1",
+      "reference": false,
+      "eligible": true,
+      "why": "eligible",
+      "estimateUsd": 0.494,
+      "pricingBasis": "per second: duration_seconds_720p = $0.0988/s x 5 s"
+    },
+    {
+      "model": "alibaba/wan-2.6",
+      "reference": false,
+      "eligible": true,
+      "why": "eligible",
+      "estimateUsd": 0.5,
+      "pricingBasis": "per second: image_to_video_duration_seconds_720p = $0.1/s x 5 s"
+    },
+    {
+      "model": "alibaba/wan-2.7",
+      "reference": false,
+      "eligible": true,
+      "why": "eligible",
+      "estimateUsd": 0.5,
+      "pricingBasis": "per second: duration_seconds = $0.1/s x 5 s"
+    },
+    {
+      "model": "kwaivgi/kling-video-o1",
+      "reference": false,
+      "eligible": true,
+      "why": "eligible",
+      "estimateUsd": 0.56,
+      "pricingBasis": "per second: duration_seconds = $0.112/s x 5 s"
+    },
+    {
+      "model": "runway/gen-4.5",
+      "reference": false,
+      "eligible": true,
+      "why": "eligible",
+      "estimateUsd": 0.6,
+      "pricingBasis": "per second: cents_per_second_output = $0.12/s x 5 s"
+    },
+    {
+      "model": "kwaivgi/kling-v3.0-std",
+      "reference": false,
+      "eligible": true,
+      "why": "eligible",
+      "estimateUsd": 0.63,
+      "pricingBasis": "per second: duration_seconds_with_audio = $0.126/s x 5 s"
+    },
+    {
+      "model": "bytedance/seedance-2.0",
+      "reference": false,
+      "eligible": true,
+      "why": "eligible",
+      "estimateUsd": 0.756,
+      "pricingBasis": "video_tokens: 1280x720 x 24 fps x 5 s / 1024 x $0.000007"
+    },
+    {
+      "model": "kwaivgi/kling-v3.0-pro",
+      "reference": false,
+      "eligible": true,
+      "why": "eligible",
+      "estimateUsd": 0.84,
+      "pricingBasis": "per second: duration_seconds_with_audio = $0.168/s x 5 s"
+    },
+    {
+      "model": "bytedance/seedance-2.5",
+      "reference": true,
+      "eligible": true,
+      "why": "eligible",
+      "estimateUsd": 1.1556,
+      "pricingBasis": "video_tokens: 1280x720 x 24 fps x 5 s / 1024 x $0.0000107"
+    },
+    {
+      "model": "black-forest-labs/flux-video-edit",
+      "reference": false,
+      "eligible": false,
+      "why": "excluded: edit, upscale or avatar model",
+      "estimateUsd": 0.15,
+      "pricingBasis": "per second: cents_per_second_output = $0.03/s x 5 s"
+    },
+    {
+      "model": "x-ai/grok-imagine-video-1.5-lite",
+      "reference": false,
+      "eligible": false,
+      "why": "excluded: lists 720p 16:9 but no matching supported_sizes entry, so vid2godot generate refuses it (size_for)",
+      "estimateUsd": 0.16,
+      "pricingBasis": "per second: cents_per_video_output_second_720p = $0.03/s x 5 s + cents_per_image_input $0.01 (one first frame)"
+    },
+    {
+      "model": "google/veo-3.1-lite",
+      "reference": false,
+      "eligible": false,
+      "why": "excluded: no 5 s duration (lists [8, 4, 6])",
+      "estimateUsd": 0.25,
+      "pricingBasis": "per second: duration_seconds_with_audio_720p = $0.05/s x 5 s"
+    },
+    {
+      "model": "heygen/avatar-iv",
+      "reference": false,
+      "eligible": false,
+      "why": "excluded: edit, upscale or avatar model",
+      "estimateUsd": 0.25,
+      "pricingBasis": "per second: duration_seconds = $0.05/s x 5 s"
+    },
+    {
+      "model": "minimax/hailuo-3-max",
+      "reference": false,
+      "eligible": false,
+      "why": "excluded: no 720p (lists ['768p', '480p'])",
+      "estimateUsd": 0.4,
+      "pricingBasis": "per second: duration_seconds = $0.08/s x 5 s"
+    },
+    {
+      "model": "minimax/hailuo-2.3",
+      "reference": false,
+      "eligible": false,
+      "why": "excluded: no 5 s duration (lists [6, 10])",
+      "estimateUsd": 0.4085,
+      "pricingBasis": "per second: duration_seconds = $0.0817/s x 5 s"
+    },
+    {
+      "model": "alibaba/wan-3.0",
+      "reference": false,
+      "eligible": false,
+      "why": "excluded: lists 720p 16:9 but no matching supported_sizes entry, so vid2godot generate refuses it (size_for)",
+      "estimateUsd": 0.5,
+      "pricingBasis": "per second: duration_seconds_720p = $0.1/s x 5 s"
+    },
+    {
+      "model": "google/veo-3.1-fast",
+      "reference": false,
+      "eligible": false,
+      "why": "excluded: no 5 s duration (lists [4, 6, 8])",
+      "estimateUsd": 0.5,
+      "pricingBasis": "per second: duration_seconds_with_audio_720p = $0.1/s x 5 s"
+    },
+    {
+      "model": "minimax/hailuo-3",
+      "reference": false,
+      "eligible": false,
+      "why": "excluded: no 720p (lists ['2K'])",
+      "estimateUsd": 0.65,
+      "pricingBasis": "per second: duration_seconds = $0.13/s x 5 s"
+    },
+    {
+      "model": "alibaba/wan-3.0-prime",
+      "reference": false,
+      "eligible": false,
+      "why": "excluded: lists 720p 16:9 but no matching supported_sizes entry, so vid2godot generate refuses it (size_for)",
+      "estimateUsd": 0.7,
+      "pricingBasis": "per second: duration_seconds_720p = $0.14/s x 5 s"
+    },
+    {
+      "model": "x-ai/grok-imagine-video-1.5",
+      "reference": false,
+      "eligible": false,
+      "why": "excluded: lists 720p 16:9 but no matching supported_sizes entry, so vid2godot generate refuses it (size_for)",
+      "estimateUsd": 0.71,
+      "pricingBasis": "per second: cents_per_video_output_second_720p = $0.14/s x 5 s + cents_per_image_input $0.01 (one first frame)"
+    },
+    {
+      "model": "black-forest-labs/flux-3-video",
+      "reference": false,
+      "eligible": false,
+      "why": "excluded: lists 720p 16:9 but no matching supported_sizes entry, so vid2godot generate refuses it (size_for)",
+      "estimateUsd": 0.85,
+      "pricingBasis": "per second: cents_per_second_output_720p = $0.17/s x 5 s"
+    },
+    {
+      "model": "runway/aleph-2",
+      "reference": false,
+      "eligible": false,
+      "why": "excluded: edit, upscale or avatar model",
+      "estimateUsd": 1.4,
+      "pricingBasis": "per second: cents_per_second_output = $0.28/s x 5 s"
+    },
+    {
+      "model": "google/veo-3.1",
+      "reference": false,
+      "eligible": false,
+      "why": "excluded: no 5 s duration (lists [4, 6, 8])",
+      "estimateUsd": 2.0,
+      "pricingBasis": "per second: duration_seconds_with_audio = $0.4/s x 5 s"
+    },
+    {
+      "model": "black-forest-labs/flux-video-upscale",
+      "reference": false,
+      "eligible": false,
+      "why": "excluded: edit, upscale or avatar model",
+      "estimateUsd": null,
+      "pricingBasis": "unknown: no video_tokens or per-second SKU for 720p (cents_per_megapixel_second_precise, cents_per_megapixel_second_creative)"
+    },
+    {
+      "model": "heygen/heygen-video-1",
+      "reference": false,
+      "eligible": false,
+      "why": "excluded: edit, upscale or avatar model",
+      "estimateUsd": null,
+      "pricingBasis": "unknown: no video_tokens or per-second SKU for 720p (duration_seconds_2k, duration_seconds_480p, duration_seconds_768p, reference_input_images, reference_duration_seconds_2k, reference_duration_seconds_480p, reference_duration_seconds_768p)"
+    }
+  ],
+  "candidatesToRun": 13,
+  "totalNewUsd": 6.8168,
+  "totalWithReferenceUsd": 7.9724,
+  "keyLimitRemainingUsd": 138.838751392
+}

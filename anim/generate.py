@@ -16,22 +16,132 @@ TEMPLATE = (Path(__file__).resolve().parent / "prompt_template.txt").read_text()
 NAMES = {"#c8c8c8": "light grey", "#7f7f7f": "mid grey", "#00b140": "chroma green"}
 CHECKS = ("singleAnimal", "noCuts", "sideViewHeld", "noZoom", "legCount", "sameAnimal", "plainBackground")
 RESOLUTION_HEIGHT = {"480p": 480, "720p": 720, "1080p": 1080}
+FPS = 24
+# Resolution words in SKU names; a SKU naming another resolution does not price ours.
+RESOLUTION_TOKENS = {"480p", "720p", "768p", "1080p", "2k", "4k"}
+# Per-second SKUs that do not price a first-frame clip: other modes, inputs, and fees handled separately.
+SKIPPED_SKU_WORDS = ("reference", "continuation", "text_to_video", "megapixel", "video_input", "minimum",
+                     "image_input")
 
 
 def size_for(info, resolution, aspect):
-    if resolution not in info.get("supported_resolutions", []) or aspect not in info.get("supported_aspect_ratios", []):
+    """The frame size to request. A listed `supported_sizes` must contain one; when the listing gives none
+    (null or absent), the size follows from the resolution's short side and the aspect."""
+    if resolution not in (info.get("supported_resolutions") or []) or \
+            aspect not in (info.get("supported_aspect_ratios") or []):
         raise StageError(f"{info['id']} does not support {resolution} at {aspect}")
+    if resolution not in RESOLUTION_HEIGHT:
+        raise StageError(f"{info['id']}: no known frame height for {resolution}")
+    short = RESOLUTION_HEIGHT[resolution]
     a, b = (int(x) for x in aspect.split(":"))
-    for size in info.get("supported_sizes", []):
+    sizes = info.get("supported_sizes")
+    if sizes is None:
+        long = 2 * round(short * max(a, b) / min(a, b) / 2)
+        return (long, short) if a >= b else (short, long)
+    for size in sizes:
         w, h = (int(x) for x in size.split("x"))
-        if min(w, h) == RESOLUTION_HEIGHT[resolution] and abs(w / h - a / b) < 0.02:
+        if min(w, h) == short and abs(w / h - a / b) < 0.02:
             return w, h
     raise StageError(f"{info['id']} lists no {resolution} {aspect} size")
 
 
-def estimate_cost(info, w, h, seconds, fps=24):
-    price = (info.get("pricing_skus") or {}).get("video_tokens")
-    return None if price is None else w * h * fps * seconds / 1024 * float(price)
+def sends_audio(info):
+    """Ask for sound unless the listing says the model cannot make it (`generate_audio: false`)."""
+    return info.get("generate_audio") is not False
+
+
+def _number(value):
+    if isinstance(value, bool):
+        return None
+    try:
+        number = float(value)
+    except (TypeError, ValueError):
+        return None
+    return number if number >= 0 else None
+
+
+def _dollars(key, value):
+    number = _number(value)
+    if number is None:
+        return None
+    return number / 100 if "cents" in key.lower().split("_") else number
+
+
+def _per_second(info, resolution, audio):
+    """(dollars per second, SKU key) for a first-frame clip at this resolution, or None.
+
+    A resolution-specific SKU beats a generic one. With audio, a with-audio rate is used where one is listed;
+    without audio, a without-audio rate. Otherwise the plain rate, and then the other audio rate (as a bound).
+    """
+    groups = {"with": [], "plain": [], "without": []}
+    for key, value in (info.get("pricing_skus") or {}).items():
+        k = key.lower()
+        if "second" not in k or any(word in k for word in SKIPPED_SKU_WORDS):
+            continue
+        named = set(k.split("_")) & RESOLUTION_TOKENS
+        if named and resolution.lower() not in named:
+            continue
+        rate = _dollars(key, value)
+        if rate is None:
+            continue
+        kind = "without" if "without_audio" in k else "with" if "with_audio" in k else "plain"
+        groups[kind].append((bool(named), rate, key))
+    order = ("with", "plain", "without") if audio else ("without", "plain", "with")
+    entries = next((groups[kind] for kind in order if groups[kind]), None)
+    if entries is None:
+        return None
+    specific = [e for e in entries if e[0]] or entries
+    best = max(specific, key=lambda e: e[1])
+    return best[1], best[2]
+
+
+def price(info, seconds, resolution, aspect, fps=FPS, audio=None, size=None):
+    """(estimated dollars for one clip, pricing basis), or (None, why the price is unknown).
+
+    `video_tokens`: w x h x fps x seconds / 1024 x price. Otherwise a per-second SKU (keys with `cents` are in
+    cents) x seconds, plus one image-input fee for the first frame, raised to any per-generation minimum.
+    `audio` defaults to what `generate` sends (`sends_audio`).
+    """
+    audio = sends_audio(info) if audio is None else audio
+    skus = info.get("pricing_skus") or {}
+    if "video_tokens" in skus:
+        rate = _number(skus["video_tokens"])
+        if rate is None:
+            return None, f"unknown: video_tokens price {skus['video_tokens']!r} is not a number"
+        if size is None:
+            try:
+                size = size_for(info, resolution, aspect)
+            except StageError:
+                return None, f"unknown: video_tokens but no {resolution} {aspect} size to count tokens"
+        w, h = size
+        return (w * h * fps * seconds / 1024 * rate,
+                f"video_tokens: {w}x{h} x {fps} fps x {seconds} s / 1024 x ${skus['video_tokens']}")
+    per_second = _per_second(info, resolution, audio)
+    if per_second is None:
+        return None, f"unknown: no video_tokens or per-second SKU for {resolution} ({', '.join(skus) or 'none'})"
+    rate, key = per_second
+    cost = rate * seconds
+    basis = f"per second: {key} = ${rate:g}/s x {seconds} s"
+    for fee_key, value in skus.items():
+        fee = _dollars(fee_key, value) if "image_input" in fee_key.lower() else None
+        if fee is not None:
+            cost += fee
+            basis += f" + {fee_key} ${fee:g} (one first frame)"
+    for floor_key, value in skus.items():
+        minimum = _dollars(floor_key, value) if "minimum" in floor_key.lower() else None
+        if minimum is not None and minimum > cost:
+            cost = minimum
+            basis += f", raised to {floor_key} ${cost:g}"
+    return cost, basis
+
+
+def _resolution_of(w, h):
+    return next((name for name, height in RESOLUTION_HEIGHT.items() if height == min(w, h)), f"{min(w, h)}p")
+
+
+def estimate_cost(info, w, h, seconds, fps=FPS, resolution=None, audio=None):
+    """Estimated dollars for one w x h clip, or None when the listing's pricing is unknown (see `price`)."""
+    return price(info, seconds, resolution or _resolution_of(w, h), f"{w}:{h}", fps, audio, size=(w, h))[0]
 
 
 def build_prompt(brief, background):
@@ -87,14 +197,17 @@ def run_generate(client, out_dir, model_id, brief, reference_png, background, ca
     if shutil.which("ffmpeg") is None:
         raise StageError("ffmpeg is not installed; it is needed for the candidate strips, so nothing was submitted")
     info = client.video_model(model_id)
-    if brief["videoSeconds"] not in info.get("supported_durations", []):
+    if brief["videoSeconds"] not in (info.get("supported_durations") or []):
         raise StageError(f"{model_id} does not support {brief['videoSeconds']} s clips")
-    if "first_frame" not in info.get("supported_frame_images", []):
+    if "first_frame" not in (info.get("supported_frame_images") or []):
         raise StageError(f"{model_id} cannot start from our reference image (no first_frame)")
     w, h = size_for(info, brief["resolution"], brief["aspectRatio"])
-    each = estimate_cost(info, w, h, brief["videoSeconds"])
+    audio = sends_audio(info)
+    each, basis = price(info, brief["videoSeconds"], brief["resolution"], brief["aspectRatio"], audio=audio,
+                        size=(w, h))
     if each is None and max_cost is None:
-        raise StageError(f"{model_id} lists no video_tokens price; pass --max-cost to accept an unknown cost")
+        raise StageError(f"{model_id} has no price the cost guard can read ({basis}); pass --max-cost to accept "
+                         f"an unknown cost")
     estimate = (each or 0) * candidates
     if max_cost is not None and estimate > max_cost:
         raise StageError(f"Estimated ${estimate:.2f} is above --max-cost ${max_cost:.2f}")
@@ -107,7 +220,8 @@ def run_generate(client, out_dir, model_id, brief, reference_png, background, ca
     warnings = []
     if each is None:
         warnings.append("first candidate's cost is unbounded (price unknown)")
-    record = {"modelRequested": model_id, "estimateUsd": estimate, "prompt": prompt, "size": [w, h],
+    record = {"modelRequested": model_id, "estimateUsd": estimate, "pricingBasis": basis, "prompt": prompt,
+              "size": [w, h], "generateAudio": audio,
               "candidates": [], "jobs": [], "warnings": warnings}
     spent, observed, unpriced = 0.0, 0.0, []
     for index in range(1, candidates + 1):
@@ -125,9 +239,11 @@ def run_generate(client, out_dir, model_id, brief, reference_png, background, ca
                     raise StageError(f"Another candidate (x1.5 margin) exceeds the key's remaining ${remaining:.2f}")
             payload = {"model": model_id, "prompt": prompt, "duration": brief["videoSeconds"],
                        "resolution": brief["resolution"], "aspect_ratio": brief["aspectRatio"],
-                       "generate_audio": True, "seed": seed + index,
+                       "seed": seed + index,
                        "frame_images": [{"type": "image_url", "image_url": {"url": data_url(reference_png)},
                                          "frame_type": "first_frame"}]}
+            if audio:
+                payload["generate_audio"] = True
             job = client.submit(payload)
             record["jobs"].append({"index": index, "jobId": job["id"], "pollingUrl": job["polling_url"]})
             done = client.wait(job, interval=interval, timeout=timeout, sleep=sleep)

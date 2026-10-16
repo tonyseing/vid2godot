@@ -220,3 +220,100 @@ class GenerateTests(unittest.TestCase):
         client = FakeClient(cost=None)
         record = generate.run_generate(client, self.tmp / "gen", "m", BRIEF, self.png, "#c8c8c8")
         self.assertEqual(record["warnings"], ["job j1 reported no cost", "job j2 reported no cost"])
+
+
+FIXTURES = Path(__file__).resolve().parent / "fixtures"
+LISTING = {m["id"]: m for m in json.loads((FIXTURES / "openrouter_video_models_2026-10-15.json").read_text())["data"]}
+COST_TABLE = json.loads((FIXTURES / "bakeoff_cost_table_2026-10-15.json").read_text())
+
+
+class NoSubmitClient(FakeClient):
+    def submit(self, payload):
+        raise AssertionError("submit must not be called")
+
+
+class PricingTests(unittest.TestCase):
+    def test_every_listed_model_matches_the_bakeoff_table(self):
+        self.assertEqual(len(COST_TABLE["rows"]), len(LISTING))
+        for row in COST_TABLE["rows"]:
+            with self.subTest(model=row["model"]):
+                dollars, basis = generate.price(LISTING[row["model"]], 5, "720p", "16:9")
+                if row["estimateUsd"] is None:
+                    self.assertIsNone(dollars)
+                else:
+                    self.assertAlmostEqual(dollars, row["estimateUsd"], places=6)
+                self.assertEqual(basis, row["pricingBasis"])
+
+    def test_estimate_cost_prices_per_second_skus(self):
+        kling = LISTING["kwaivgi/kling-v3.0-pro"]
+        self.assertAlmostEqual(generate.estimate_cost(kling, 1280, 720, 5), 0.84)
+        self.assertAlmostEqual(generate.estimate_cost(kling, 1280, 720, 5, audio=False), 0.56)
+        self.assertAlmostEqual(generate.estimate_cost(INFO, 1280, 720, 5), 1280 * 720 * 24 * 5 / 1024 * 0.0000107)
+
+    def test_unknown_pricing_is_none(self):
+        dollars, basis = generate.price(LISTING["black-forest-labs/flux-video-upscale"], 5, "720p", "16:9")
+        self.assertIsNone(dollars)
+        self.assertTrue(basis.startswith("unknown"))
+        self.assertIsNone(generate.estimate_cost({"id": "m"}, 1280, 720, 5))
+
+    def test_null_sizes_derived_from_resolution_and_aspect(self):
+        self.assertEqual(generate.size_for(LISTING["alibaba/wan-3.0"], "720p", "16:9"), (1280, 720))
+        self.assertEqual(generate.size_for(LISTING["alibaba/wan-3.0"], "720p", "9:16"), (720, 1280))
+        self.assertEqual(generate.size_for(LISTING["alibaba/wan-3.0"], "480p", "16:9"), (854, 480))
+        absent = {k: v for k, v in LISTING["alibaba/wan-3.0"].items() if k != "supported_sizes"}
+        self.assertEqual(generate.size_for(absent, "720p", "16:9"), (1280, 720))
+
+    def test_listed_sizes_without_a_match_refused(self):
+        info = {**INFO, "supported_sizes": ["854x480"]}
+        with self.assertRaises(StageError):
+            generate.size_for(info, "720p", "16:9")
+
+    def test_null_sizes_with_unlisted_resolution_refused(self):
+        with self.assertRaises(StageError):
+            generate.size_for(LISTING["minimax/hailuo-3-max"], "720p", "16:9")
+        with self.assertRaises(StageError):
+            generate.size_for(LISTING["black-forest-labs/flux-video-edit"], "720p", "16:9")
+
+    def test_sends_audio_unless_the_listing_says_it_cannot(self):
+        self.assertFalse(generate.sends_audio(LISTING["runway/gen-4.5"]))
+        self.assertTrue(generate.sends_audio(LISTING["kwaivgi/kling-v3.0-pro"]))
+        self.assertTrue(generate.sends_audio(LISTING["x-ai/grok-imagine-video"]))
+        self.assertTrue(generate.sends_audio(INFO))
+
+
+class PerSecondGenerateTests(unittest.TestCase):
+    setUp, tearDown = GenerateTests.setUp, GenerateTests.tearDown
+
+    def test_per_second_max_cost_refused_before_any_submit(self):
+        client = NoSubmitClient(info=LISTING["kwaivgi/kling-v3.0-pro"])
+        with self.assertRaises(StageError) as caught:
+            generate.run_generate(client, self.tmp / "gen", "kwaivgi/kling-v3.0-pro", BRIEF, self.png, "#c8c8c8",
+                                  max_cost=1.0)
+        self.assertIn("$1.68", str(caught.exception))
+
+    def test_per_second_estimate_checked_against_remaining(self):
+        client = NoSubmitClient(info=LISTING["kwaivgi/kling-v3.0-pro"], remaining=2.0)
+        with self.assertRaises(StageError) as caught:
+            generate.run_generate(client, self.tmp / "gen", "kwaivgi/kling-v3.0-pro", BRIEF, self.png, "#c8c8c8")
+        self.assertIn("exceeds the key's remaining $2.00", str(caught.exception))
+
+    def test_runway_omits_generate_audio_and_prices_plain(self):
+        client = FakeClient(info=LISTING["runway/gen-4.5"], cost=0.6)
+        record = generate.run_generate(client, self.tmp / "gen", "runway/gen-4.5", BRIEF, self.png, "#c8c8c8")
+        for payload in client.submitted:
+            self.assertNotIn("generate_audio", payload)
+        self.assertAlmostEqual(record["estimateUsd"], 1.2)
+        self.assertIn("cents_per_second_output", record["pricingBasis"])
+        self.assertEqual(record["warnings"], [])
+
+    def test_audio_capable_model_sends_generate_audio(self):
+        client = FakeClient(info=LISTING["kwaivgi/kling-v3.0-pro"], cost=0.84)
+        record = generate.run_generate(client, self.tmp / "gen", "kwaivgi/kling-v3.0-pro", BRIEF, self.png, "#c8c8c8")
+        self.assertIs(client.submitted[0]["generate_audio"], True)
+        self.assertAlmostEqual(record["estimateUsd"], 1.68)
+
+    def test_null_sizes_model_generates_at_derived_size(self):
+        client = FakeClient(info=LISTING["alibaba/wan-3.0"], cost=0.5)
+        record = generate.run_generate(client, self.tmp / "gen", "alibaba/wan-3.0", BRIEF, self.png, "#c8c8c8")
+        self.assertEqual(record["size"], [1280, 720])
+        self.assertAlmostEqual(record["estimateUsd"], 1.0)
