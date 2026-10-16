@@ -6,6 +6,8 @@ import subprocess
 import sys
 from pathlib import Path
 
+import numpy as np
+
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 from anim import brief as brief_mod  # noqa: E402
 from anim import contract as contract_mod  # noqa: E402
@@ -214,19 +216,38 @@ def cmd_fit(a):
           "next": "Run `lab`, open the overlay of every low frame, mark or refit, then run `facts`."})
 
 
+def silhouette_renderer(model, poses, shape, folder, blender=None):
+    """facts' renderer for the averaged cycle: value vectors (poses.json `names` order) -> the rig's silhouettes
+    with the fit's camera, rasterised as the fit's scorer does, at `shape` (the working masks' height, width)."""
+    def render(values):
+        out = Path(folder) / "poses-uv.npz"
+        run_blender("pose_silhouettes", {"model": str(model), "camera": poses["camera"], "bones": poses["bones"],
+                                         "names": poses["names"], "values": [list(map(float, v)) for v in values],
+                                         "out": str(out)}, folder, blender)
+        data = np.load(out)
+        return [raster_mod.rasterize(uv, data["faces"], shape[1], shape[0]) for uv in data["uv"]]
+    return render
+
+
 @command("facts")
 def cmd_facts(a):
     ledger = Ledger(a.work)
     brief = load_json(ledger.output("brief", "brief"))
-    result = facts_mod.clip_facts(load_json(ledger.output("fit", "poses")), project_contract(ledger), brief)
+    poses = load_json(ledger.output("fit", "poses"))
+    masks_path = ledger.output("ingest", "masks")
+    masks = np.load(masks_path)["masks"]
     folder = ledger.work / "facts"
     folder.mkdir(exist_ok=True)
+    render = silhouette_renderer(ledger.model, poses, masks.shape[1:], folder / "render", a.blender)
+    result = facts_mod.clip_facts(poses, project_contract(ledger), brief, masks=masks, render=render)
     (folder / "facts.json").write_text(json.dumps(result, indent=2))
     (folder / "anim-entry.json").write_text(json.dumps({ledger.clip: result["entry"]}, indent=2))
-    ledger.record("facts", {"poses": ledger.output("fit", "poses")},
+    ledger.record("facts", {"poses": ledger.output("fit", "poses"), "masks": masks_path},
                   {"facts": folder / "facts.json", "entry": folder / "anim-entry.json"},
-                  {"speedMps": result["speedMps"], "period": result["period"], "warnings": result["warnings"]})
-    emit({"ok": True, **{k: result[k] for k in ("start", "period", "speedMps", "strideM", "warnings")}})
+                  {"speedMps": result["speedMps"], "period": result["period"], "warnings": result["warnings"],
+                   "averagedCycleIoU": result.get("averagedCycleIoU")})
+    emit({"ok": True, **{k: result[k] for k in ("start", "period", "speedMps", "strideM", "warnings")},
+          **{k: result[k] for k in ("cyclesAveraged", "averagedCycleIoU") if k in result}})
 
 
 @command("bake")

@@ -33,10 +33,10 @@ From the project root (relative paths resolve there): `python3 <skill>/anim/pipe
 | `generate --model-id <id> [--max-cost USD]` | Two candidates |
 | `accept --candidate N --checks <json>` | After opening both strips and full frames; checks in `reference/prompting.md` |
 | `ingest` | Drops pulldown repeats by cadence; background enclosed by touching paws stays background (pinholes close). Read `flags`, `warnings` |
-| `fit` | Solves a clip-wide camera scale and leg identity; every frame also tries chain restarts and leg swaps, and a frame below 0.85 IoU is solved again from scratch; a winner must also beat the tracked pose at full resolution. Paws found in each mask pull fitted paws out of the body (soft, zero near a match). Prints `lowFrames` |
+| `fit` | Solves a clip-wide camera scale and leg identity; every frame also tries chain restarts and leg swaps, and a frame below 0.85 IoU is solved again from scratch; a winner must also beat the tracked pose at full resolution. Paws found in each mask pull fitted paws out of the body (soft, zero near a match). A second pass pulls the joints the outline barely pins toward the first pass's cycle average. Prints `lowFrames` |
 | `lab` | Open `review/lab.html` and every low frame's overlay |
 | `gridframe --frame N`; `fit --marks <json> --span A:B` | Fix flips (below) |
-| `facts` | Sub-frame cycle; the steadiest full cycle (not the warm-up from the reference pose; the phase-origin shift never moves it back into the warm-up), resampled; root drift, sidecar entry |
+| `facts` | The period from the video's masks; the cycle is the phase average of the steady cycles (warm-up left out), rendered and checked against the masks (mean IoU ≥ 0.85, else it refuses with the numbers); root drift, sidecar entry |
 | `bake` | Keys that cycle minus drift: a seamless seam. Open `bake/sheet.png`, `bake/closeup.png` |
 | `review --template`; `review --file <json>` | Fill it from what you saw; explain or refit each low frame |
 | `verify --godot47 <bin> --godot45 <bin> --launcher <launcher>` | Activation-suppressed phone/tablet captures on both engines via game-asset-3d-pipeline's `verify.py`. Open every capture |

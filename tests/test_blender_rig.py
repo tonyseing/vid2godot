@@ -31,3 +31,32 @@ class RigInspectionTests(unittest.TestCase):
         self.assertGreater(collapse["lower_fl"], 0)
         problems, _ = check_rig(rig, project)
         self.assertTrue(any("Joint collapse at lower_fl" in problem for problem in problems))
+
+
+@requires_blender
+class PoseSilhouetteTests(unittest.TestCase):
+    """facts' renderer for the averaged cycle (anim/blender/pose_silhouettes.py through
+    pipeline.silhouette_renderer): given value vectors, the rig's silhouettes as the fit scores them."""
+
+    def test_rest_pose_matches_the_reference_mask_and_a_bent_leg_differs(self):
+        import numpy as np
+        from anim.pipeline import silhouette_renderer
+        from anim.raster import iou
+        from anim.reference import model_mask
+        glb, _ = fixture_glb()
+        project = load_project_contract(FIXTURE_CONTRACT)
+        bones = [b for chain in project["chains"].values() for b in chain]
+        names = ["dx", "dz"] + bones
+        with tempfile.TemporaryDirectory() as tmp:
+            ref = run_blender("render_reference", {"model": str(glb), "outDir": str(Path(tmp) / "ref"),
+                                                   "backgrounds": ["#c8c8c8"]}, Path(tmp) / "ref", BLENDER)
+            mask = model_mask(ref["mask"])
+            poses = {"bones": bones, "names": names, "camera": ref["camera"]}
+            render = silhouette_renderer(glb, poses, mask.shape, Path(tmp) / "render", BLENDER)
+            bent = [0.0] * len(names)
+            bent[names.index("upper_fl")] = 0.6
+            rest, moved = render([[0.0] * len(names), bent])
+        self.assertEqual(rest.shape, mask.shape)
+        self.assertGreaterEqual(iou(rest, mask), 0.97)
+        self.assertLess(iou(moved, rest), 0.99)
+        self.assertGreater(iou(moved, rest), 0.8)

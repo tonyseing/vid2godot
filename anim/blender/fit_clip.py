@@ -29,6 +29,11 @@ Left and right legs give the same side silhouette, so after the forward pass eac
 per frame by dynamic programming (marks plus smooth velocity; a span refit also takes up to two fixed frames on
 each side, pinned as fitted, so the span keeps its neighbours' identity), and the clip is then refined with a
 two-sided prior.
+
+A new full fit then runs a periodic pass (`periodic_pass`, PERIODIC_PASS; args "periodic": false turns it off): the
+video's period comes from the masks (anim/cycle.py), and each frame is solved again with a weak term toward the first
+pass's phase average, weighted per joint by how much the joint varies from cycle to cycle (the outline pins the main
+leg joints, which get ~0; a paw, the neck, the chest or a tail tip get the full W_PERIODIC).
 """
 import json
 import math
@@ -41,7 +46,7 @@ import bpy  # noqa: E402
 import numpy as np  # noqa: E402
 from mathutils import Matrix  # noqa: E402
 import rigutil  # noqa: E402
-from anim import fitsearch, paws  # noqa: E402
+from anim import cycle, fitsearch, paws  # noqa: E402
 from anim.camera import SideCamera  # noqa: E402
 
 LEVELS = (0.25, 0.5, 1.0)                       # pyramid levels, as fractions of the working resolution
@@ -66,6 +71,9 @@ RESTARTS = 4                                    # random restarts per chain on e
 RESTART_SIGMA = math.radians(25.0)              # their spread about the tracked pose
 RESTART_IOU = 0.85                              # a tracked frame below this IoU is also solved from scratch
 RESTART_SCALES = (-0.02, 0.0, 0.02)             # that global search's camera-scale starts, about the tracked one
+PERIODIC_PASS = True                            # the second pass with a weak periodic prior (a new full fit only)
+W_PERIODIC = 5.0                                # per rad^2 from the first pass's phase average, times the joint's weight
+PERIODIC_ROUNDS = 3                             # each round's average comes from the round before
 
 args = rigutil.load_args()
 base_camera = SideCamera.from_json(args["camera"])
@@ -414,6 +422,9 @@ def paw_term(x, f, cam):
 
 
 # ------------------------------------------------------------------------------------------------ the objective
+PERIODIC = {}       # frame -> (target values, per-value weights) while the periodic pass runs
+
+
 def score(x, f, prior, k, w_marks=W_MARKS):
     uv, cam = posed_uv(x)
     loss, _ = levels[k].loss(uv, f)
@@ -426,6 +437,9 @@ def score(x, f, prior, k, w_marks=W_MARKS):
         loss += weight * W_SMOOTH * float(np.sum((x[2:N] - target[2:N]) ** 2))
         loss += weight * W_OFFSET * float(np.sum(((x[:2] - target[:2]) * base_camera.px_per_m) ** 2))
         loss += weight * W_SCALE * float(((x[SCALE] - target[SCALE]) / 0.01) ** 2)
+    if f in PERIODIC:
+        target, weights = PERIODIC[f]
+        loss += W_PERIODIC * float(np.sum(weights * (x[:N] - target) ** 2))
     return float(loss)
 
 
@@ -786,6 +800,46 @@ for p in range(REFINE_PASSES):
     print(f"VID2GODOT_FIT refine pass {p + 1}: relabelled {changed}", flush=True)
 print(f"VID2GODOT_FIT solved {len(frames)} frames in {time.time() - t_start:.1f}s", flush=True)
 
+
+def periodic_pass(xs, frames):
+    """The second pass: the video repeats (anim/cycle.py finds its period in the masks), but joints the silhouette
+    barely constrains (a paw, the neck, the chest, a tail tip) come out of the first pass different from cycle to
+    cycle. Each frame is solved again with an extra term pulling its joints toward the first pass's phase average,
+    weighted per joint by that joint's cycle-to-cycle inconsistency (~0 for the main leg joints, which the outline
+    pins; 1 for the loose ones), from its first-pass pose and from the phase average itself; the lower objective
+    (silhouette, paws, the two-sided prior and the periodic term) wins. Returns whether it ran."""
+    values = np.array([xs[f][:N] for f in range(frame_count)])
+    prior = cycle.periodic_prior(values, masks, float(args["fps"]), [(ia, ib) for _, _, ia, ib in pairs],
+                                 int(math.ceil(0.1 * frame_count)))
+    if prior is None:
+        print("VID2GODOT_FIT periodic pass skipped: the video shows no steady cycle", flush=True)
+        return False
+    print(f"VID2GODOT_FIT periodic pass: period {prior['period']:.3f} frames over {len(prior['kept'])} cycles; "
+          "weights " + ", ".join(f"{names[i]} {w:.2f}" for i, w in enumerate(prior["weights"]) if w > 0), flush=True)
+    t_pass = time.time()
+    for f in frames:
+        PERIODIC[f] = (prior["targets"][f], prior["weights"])
+    for f in frames:
+        neighbours = [xs[g] for g in (f - 1, f + 1) if g in xs]
+        smooth = (np.mean(neighbours, axis=0), 1.0) if neighbours else None
+        start = xs[f].copy()
+        start[2:N] = prior["targets"][f][2:]
+        kept, _ = descend(xs[f], f, smooth, schedule=LEVELS[2:])
+        moved, _ = descend(clamp(start), f, smooth, schedule=LEVELS[1:])
+        xs[f] = min((kept, moved), key=lambda y: score(y, f, smooth, 1.0))
+    PERIODIC.clear()
+    changed = relabel(xs, frames)
+    print(f"VID2GODOT_FIT periodic pass in {time.time() - t_pass:.1f}s: relabelled {changed}", flush=True)
+    return True
+
+
+periodic = bool(PERIODIC_PASS and scale_free and frames == list(range(frame_count)) and args.get("periodic", True))
+periodic_ran = 0
+for _ in range(PERIODIC_ROUNDS if periodic else 0):
+    if not periodic_pass(xs, frames):
+        break
+    periodic_ran += 1
+
 camera = camera_for(cam_scale)
 
 
@@ -822,9 +876,9 @@ for f in frames:
 
 poses = {"bones": bones, "names": names, "axes": [list(a) for a in axes], "fps": args["fps"],
          "camera": camera.to_json(), "cameraScale": cam_scale, "registrationCamera": base_camera.to_json(),
-         "deformModel": DEFORM_MODEL, "frames": entries}
+         "deformModel": DEFORM_MODEL, "periodicPass": periodic_ran, "frames": entries}
 Path(args["out"]).write_text(json.dumps(poses))
 np.savez_compressed(args["projection"], uv=projection, faces=rigutil.triangles(skinned))
 rigutil.write_result(args, {"frames": span[1] - span[0], "meanLoss": float(np.mean([e["loss"] for e in entries])),
-                            "cameraScale": cam_scale, "deformModel": DEFORM_MODEL,
+                            "cameraScale": cam_scale, "deformModel": DEFORM_MODEL, "periodicPass": periodic_ran,
                             "seconds": time.time() - t_start})

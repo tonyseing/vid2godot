@@ -31,9 +31,9 @@
 | "Measured ground speed ... is more than 25% from the brief's" | The video moves at another pace than the target | Note it in the review; generate again if the gait reads wrong |
 | `fit --span` refuses | No full fit exists yet | Run `fit` first; spans refine it |
 | IoU falls frame by frame through the clip; forelegs fold into the chest | Tracking held a local minimum; a leg inside the body costs no IoU | `fit` restarts each chain, tries each leg pair exchanged, re-solves any frame under 0.85 IoU from scratch, and pulls fitted paws to the paws found in the mask; mark the frames that stay low and refit their span |
-| The loop shows the animal still settling from the reference pose | The first cycles are a warm-up | `facts` takes the steadiest full cycle; if the clip never settles, generate a longer video |
-| `facts`: "No steady cycle that starts at the … touchdown fits" | The steady part is shorter than a cycle plus the shift to the touchdown | Generate a longer video |
-| `facts`: "no full cycle found" on a fit with high IoU | The fitted angles are not periodic (joints wander where the silhouette cannot see them) | Mark paws on a few frames per cycle and refit; check the forepaws are outside the body |
+| The loop shows the animal still settling from the reference pose | The first cycles are a warm-up | `facts` averages only the steady cycles (their masks repeat a period on); if the clip never settles, generate a longer video |
+| `facts`: "no full cycle found in the video" | The masks do not repeat clearly within 0.25-2.5 s (a one-shot, a still clip, or a gait that changes) | For a loop, generate again; a one-shot needs `"loop": false` in the brief |
+| `facts`: "The averaged cycle ... does not match the video" | The fit chose different poses for repeating silhouettes (joints the outline barely constrains trade angle), so their average misses the masks | `fit` already runs a periodic pass; mark paws on a few frames per cycle and refit, then `facts` again |
 
 ## Review, verify, export
 

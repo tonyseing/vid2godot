@@ -84,7 +84,8 @@ class MetricTests(unittest.TestCase):
     def metrics(self, **change):
         base = {"meanIoU": 0.86, "spans": {"0-25": 0.95, "76-100": 0.81}, "frames": {"80": 0.76},
                 "forepawMissShare": 0.1, "legSwaps": {"front_L/front_R": 0, "hind_L/hind_R": 1},
-                "period": {"found": True, "periodFrames": 15.2, "score": 0.12}}
+                "period": {"found": False, "periodFrames": None, "score": 0.7},
+                "facts": {"ok": True, "start": 45.1, "period": 15.04, "averagedCycleIoU": 0.87}}
         base.update(change)
         return base
 
@@ -95,18 +96,19 @@ class MetricTests(unittest.TestCase):
         metrics = self.metrics(meanIoU=0.8, spans={"0-25": 0.95, "76-100": 0.7}, frames={"80": 0.6})
         self.assertEqual(len(rf.failures(fixture, metrics)), 3)
 
-    def test_failures_require_a_cycle_visible_forepaws_and_no_more_swaps(self):
-        """Temporal coherence: facts' own period search must find a full cycle in the fitted angles; forepaws must
-        be where the video shows paws; and no leg pair may swap more often than in the baseline."""
+    def test_failures_require_facts_visible_forepaws_and_no_more_swaps(self):
+        """Temporal coherence: the facts stage itself must accept the fit (Task 17b fix round 2: its period comes
+        from the video and its averaged cycle must match the masks; the all-angle period score is only reported);
+        forepaws must be where the video shows paws; and no leg pair may swap more often than in the baseline."""
         fixture = {"targets": rf.TARGETS,
                    "baseline": {"spans": {}, "legSwaps": {"front_L/front_R": 0, "hind_L/hind_R": 1}}}
-        self.assertEqual(rf.failures(fixture, self.metrics()), [])
+        self.assertEqual(rf.failures(fixture, self.metrics()), [], "the angle period score alone does not fail")
         problems = rf.failures(fixture, self.metrics(
-            period={"found": False, "periodFrames": None, "score": 0.66}, forepawMissShare=0.48,
-            legSwaps={"front_L/front_R": 2, "hind_L/hind_R": 1}))
+            facts={"ok": False, "error": "the averaged cycle matches the video at mean IoU 0.75"},
+            forepawMissShare=0.48, legSwaps={"front_L/front_R": 2, "hind_L/hind_R": 1}))
         self.assertEqual(len(problems), 3, problems)
-        self.assertIn("no full cycle", problems[0])
-        self.assertIn("0.66", problems[0])
+        self.assertIn("facts refuses the fit", problems[0])
+        self.assertIn("0.75", problems[0])
         self.assertIn("forepaw", problems[1])
         self.assertIn("front_L/front_R", problems[2])
 

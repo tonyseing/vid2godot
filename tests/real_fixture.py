@@ -10,6 +10,8 @@ and fit and measure it with
 
     python3 -m tests.real_fixture run --fixture <fixture folder> --out <run folder> [--script <fit_clip.py>]
 
+(`measure --fixture <folder> --run <run folder>` measures an existing run again.)
+
 `tests.test_real_fixture` runs the same fit when VID2GODOT_REAL_FIXTURE names the folder (and VID2GODOT_BLENDER is
 set), and holds it to the targets.
 
@@ -124,13 +126,31 @@ def period_metrics(poses):
             "score": round(found["score"], 4), "gate": facts.PERIOD_MAX_SCORE}
 
 
-def facts_outcome(poses, project, brief):
-    """The facts stage itself on the fit: "ok" with its start and period, or its refusal."""
+def leg_period_metrics(poses, fixture, masks):
+    """The secondary report facts makes on the fitted angles, whether or not facts accepts the fit: the video's
+    period (anim/cycle.py) and the well-observed leg joints' lag score at it."""
+    from anim import cycle
+    found = cycle.mask_period(masks, float(poses["fps"]))
+    if found["period"] is None:
+        return {"maskPeriod": None, "reason": found["reason"]}
+    values = np.array([e["values"] for e in sorted(poses["frames"], key=lambda e: e["index"])], float)
+    legs = facts.leg_period(values, poses["names"], fixture["project"], float(poses["fps"]), found["period"])
+    return {"maskPeriod": round(found["period"], 4), "maskScore": round(found["score"], 4),
+            "maskMargin": round(found["margin"], 3), **legs}
+
+
+def facts_outcome(poses, project, brief, masks=None, render=None):
+    """The facts stage itself on the fit (its period from the video masks, its averaged cycle rendered with
+    `render` and checked against them): "ok" with its start, period and the cycle evidence, or its refusal."""
     try:
-        result = facts.clip_facts(poses, project, brief)
+        result = facts.clip_facts(poses, project, brief, masks=masks, render=render)
     except facts.FactsError as error:
         return {"ok": False, "error": str(error)}
-    return {"ok": True, "start": round(result["start"], 3), "period": round(result["period"], 3)}
+    out = {"ok": True, "start": round(result["start"], 3), "period": round(result["period"], 3)}
+    for key in ("cyclesAveraged", "cycleStarts", "averagedCycleIoU", "maskPeriod", "legPeriod", "cycleCheck"):
+        if key in result:
+            out[key] = result[key]
+    return out
 
 
 def legacy_silhouette(img, bg, threshold=40.0):
@@ -218,7 +238,8 @@ def build(work, out, baseline_script=None, baseline_run=None, fitter=None, blend
             if not np.array_equal(np.load(run_dir / "masks.npz")["masks"], masks):
                 raise SystemExit(f"{run_dir} was fitted to other masks; pass --baseline-script to refit")
             poses = json.loads((run_dir / "poses.json").read_text())
-            metrics = measure(fixture, poses, run_dir / "projection.npz", run_dir / "masks.npz")
+            metrics = measure(fixture, poses, run_dir / "projection.npz", run_dir / "masks.npz", model, blender,
+                              run_dir)
             old = run_dir / "metrics.json"
             if old.is_file():
                 metrics["minutes"] = json.loads(old.read_text()).get("minutes")
@@ -246,16 +267,24 @@ def full_masks(fixture_masks, out):
     return out
 
 
-def measure(fixture, poses, projection, masks_npz):
+def measure(fixture, poses, projection, masks_npz, model=None, blender=None, work=None):
+    """The run's metrics. With `model`, facts runs on the fit with the rig's renderer (Blender) into `work`."""
     report = score_fit(poses, projection, masks_npz, fixture["brief"]["iouThreshold"], {})
     ious = {item["index"]: item["iou"] for item in report["frames"]}
     masks = np.load(masks_npz)["masks"]
+    render = None
+    if model is not None:
+        from anim.pipeline import silhouette_renderer
+        render = silhouette_renderer(model, poses, masks.shape[1:], Path(work or tempfile.mkdtemp()) / "facts",
+                                     blender)
     frames, spans = fixture["evalFrames"], [tuple(s) for s in fixture["spans"]]
     miss, far = forepaw_miss_share(poses, masks, frames=frames)
     swaps = leg_swaps(poses, fixture["project"]["legPairs"], fixture["project"]["chains"])
     return {**iou_metrics(ious, frames, spans), "meanIoUAll": report["meanIoU"], "forepawMissShare": miss,
             "forepawMisses": far, "legSwaps": {pair: len(f) for pair, f in swaps.items()}, "legSwapFrames": swaps,
-            "period": period_metrics(poses), "facts": facts_outcome(poses, fixture["project"], fixture["brief"]),
+            "period": period_metrics(poses), "facts": facts_outcome(poses, fixture["project"], fixture["brief"],
+                                                                    masks, render),
+            "legPeriod": leg_period_metrics(poses, fixture, masks), "periodicPass": poses.get("periodicPass"),
             "cameraScale": poses.get("cameraScale")}
 
 
@@ -272,9 +301,26 @@ def run(folder, out, blender=None, script=None):
     start = time.time()
     result = run_blender(Path(script) if script else "fit_clip", args, out, blender)
     poses = json.loads((out / "poses.json").read_text())
-    metrics = {**measure(fixture, poses, out / "projection.npz", masks),
+    metrics = {**measure(fixture, poses, out / "projection.npz", masks, model, blender, out),
                "minutes": round((time.time() - start) / 60, 1), "fitSeconds": round(result.get("seconds", 0), 1)}
     (out / "metrics.json").write_text(json.dumps(metrics, indent=1) + "\n")
+    return metrics
+
+
+def remeasure(folder, run_dir, blender=None):
+    """Measure an existing fit of the fixture (a `run` folder) with this repository's metrics and facts; writes
+    metrics.json there (keeping its minutes) and returns the metrics."""
+    fixture, model = load(folder)
+    run_dir = Path(run_dir)
+    if not np.array_equal(np.load(run_dir / "masks.npz")["masks"], np.load(Path(folder) / "masks.npz")["masks"]):
+        raise SystemExit(f"{run_dir} was fitted to other masks")
+    poses = json.loads((run_dir / "poses.json").read_text())
+    metrics = measure(fixture, poses, run_dir / "projection.npz", run_dir / "masks.npz", model, blender, run_dir)
+    old = run_dir / "metrics.json"
+    if old.is_file():
+        previous = json.loads(old.read_text())
+        metrics.update({k: previous[k] for k in ("minutes", "fitSeconds") if k in previous})
+    (run_dir / "metrics.json").write_text(json.dumps(metrics, indent=1) + "\n")
     return metrics
 
 
@@ -292,9 +338,8 @@ def failures(fixture, metrics):
     for span, value in (fixture.get("baseline") or {}).get("spans", {}).items():
         if metrics["spans"][span] < value:
             out.append(f"span {span} IoU {metrics['spans'][span]} is worse than the baseline {value}")
-    if targets.get("cycle") and not metrics["period"]["found"]:
-        out.append(f"no full cycle in the fitted angles (facts' period score {metrics['period']['score']} is not "
-                   f"under {facts.PERIOD_MAX_SCORE})")
+    if targets.get("cycle") and not metrics["facts"]["ok"]:
+        out.append(f"facts refuses the fit: {metrics['facts']['error']}")
     if "forepawMissShare" in targets and metrics["forepawMissShare"] > targets["forepawMissShare"]:
         out.append(f"forepaw miss share {metrics['forepawMissShare']} > {targets['forepawMissShare']}")
     for pair, count in metrics["legSwaps"].items():
@@ -319,6 +364,10 @@ def main(argv=None):
     r.add_argument("--out", required=True)
     r.add_argument("--script")
     r.add_argument("--blender")
+    m = sub.add_parser("measure", help="measure an existing run folder again")
+    m.add_argument("--fixture", required=True)
+    m.add_argument("--run", required=True)
+    m.add_argument("--blender")
     a = parser.parse_args(argv)
     if a.command == "build":
         fixture = build(a.work, a.out, a.baseline_script, a.baseline_run, a.fitter, a.blender)
@@ -326,7 +375,10 @@ def main(argv=None):
                           "legacyFalseFillFrames": fixture["falseFill"]["legacy"]["frames"],
                           "baseline": fixture.get("baseline")}))
     else:
-        metrics = run(a.fixture, a.out, a.blender, a.script)
+        if a.command == "measure":
+            metrics = remeasure(a.fixture, a.run, a.blender)
+        else:
+            metrics = run(a.fixture, a.out, a.blender, a.script)
         print(json.dumps({k: v for k, v in metrics.items() if k not in ("frames", "forepawMisses")}))
 
 
