@@ -35,7 +35,8 @@ ARGS = {"init": [("--model", {"required": True, "type": Path}), ("--clip", {"req
         "ingest": [("--work-scale", {"type": float, "default": 0.5})],
         "gridframe": [("--frame", {"required": True, "type": int})],
         "fit": [("--marks", {"type": Path}), ("--span", {})],
-        "facts": [("--mass-kg", {"type": float}), ("--accept-gait", {})], "bake": [], "lab": [],
+        "facts": [("--mass-kg", {"type": float}), ("--accept-gait", {}), ("--accept-retime", {})], "bake": [],
+        "lab": [],
         "review": [("--template", {"action": "store_true"}), ("--file", {"type": Path})],
         "verify": [("--godot47", {"required": True, "type": Path}), ("--godot45", {"required": True, "type": Path}),
                    ("--launcher", {"required": True, "type": Path}), ("--threed-verify", {"type": Path})],
@@ -238,12 +239,15 @@ def silhouette_renderer(model, poses, shape, folder, blender=None):
 
 def rig_mass(ledger, folder, blender=None):
     """A rough body mass from the rig: its skinned mesh's rest volume at the density of water (bodies are ~1.0-1.1
-    g/cm3; an open or furred mesh reads heavy). The brief's massKg or `facts --mass-kg` replace it."""
+    g/cm3; an open or furred mesh reads heavy). The brief's massKg or `facts --mass-kg` replace it. Fix round 1: the
+    meshes' non-manifold edge count rides along (`openEdges`); facts never retimes on an open mesh's volume."""
     found = run_blender("mesh_volume", {"model": str(ledger.model)}, folder, blender)
     volume = found.get("volumeM3")
     if not isinstance(volume, (int, float)) or volume <= 0:
         return None
-    return {"kg": round(1000.0 * volume, 2), "source": "rig mesh volume x 1000 kg/m3 (rough)"}
+    open_edges = sum(int(m.get("nonManifoldEdges") or 0) for m in found.get("meshes") or [] if isinstance(m, dict))
+    return {"kg": round(1000.0 * volume, 2), "source": "rig mesh volume x 1000 kg/m3 (rough)",
+            "openEdges": open_edges}
 
 
 def facts_mass(a, ledger, brief, folder):
@@ -272,14 +276,14 @@ def cmd_facts(a):
     mass = facts_mass(a, ledger, brief, folder / "mass")
     render = silhouette_renderer(ledger.model, poses, masks.shape[1:], folder / "render", a.blender)
     result = facts_mod.clip_facts(poses, project_contract(ledger), brief, rest, masks=masks, render=render, rig=rig,
-                                  mass=mass, accept_gait=a.accept_gait)
+                                  mass=mass, accept_gait=a.accept_gait, accept_retime=a.accept_retime)
     (folder / "facts.json").write_text(json.dumps(result, indent=2))
     (folder / "anim-entry.json").write_text(json.dumps({ledger.clip: result["entry"]}, indent=2))
     ledger.record("facts", {"poses": ledger.output("fit", "poses"), "masks": masks_path},
                   {"facts": folder / "facts.json", "entry": folder / "anim-entry.json"},
                   {"speedMps": result["speedMps"], "period": result["period"], "warnings": result["warnings"],
                    "averagedCycleIoU": result.get("averagedCycleIoU"), "mass": mass, "acceptGait": a.accept_gait,
-                   "retime": (result.get("cadence") or {}).get("retime")})
+                   "acceptRetime": a.accept_retime, "retime": (result.get("cadence") or {}).get("retime")})
     emit({"ok": True, **{k: result[k] for k in ("start", "period", "speedMps", "strideM", "warnings")},
           **{k: result[k] for k in ("cyclesAveraged", "averagedCycleIoU", "cadence", "gaitCheck", "contactCheck")
              if k in result}})
@@ -358,7 +362,7 @@ def build_lab(ledger):
     hashes = {name: ledger.require("fit")["outputs"][name]["sha256"] for name in ("poses", "projection")}
     facts = load_json(ledger.output("facts", "facts")) if ledger.state("facts") == "ok" else None
     page = review_mod.lab_page(ledger.clip, report, brief["iouThreshold"],
-                               review_mod.contact_timeline(poses, project_contract(ledger), paw_rest(ledger)),
+                               review_mod.contact_timeline(poses, project_contract(ledger), paw_rest(ledger), facts),
                                hashes, review_mod.motion_summary(facts))
     (folder / "lab.html").write_text(page)
     return folder / "lab.html", report
@@ -418,6 +422,10 @@ def cmd_verify(a):
     script = verify_mod.verifier(a.threed_verify)
     glb = ledger.output("bake", "glb")
     facts = load_json(ledger.output("facts", "facts"))
+    # The patched capture script records these paw bones' positions at every phase (verify.phase_evidence).
+    paw_bones = sorted((facts.get("cycle") or {}).get("paws") or (facts.get("entry") or {}).get("contacts") or {})
+    if not paw_bones:
+        raise StageError("facts.json names no paw bones for verify to follow through the clip; run `facts` again")
     outputs, problems = {}, []
     for prefix, engine in (("4.7", a.godot47), ("4.5", a.godot45)):
         folder = ledger.work / "verify" / prefix
@@ -426,7 +434,7 @@ def cmd_verify(a):
         # patched to seek the clip there first (verify.phase_verifier).
         for phase in verify_mod.PHASES:
             out = folder / f"phase{verify_mod.phase_tag(phase):03d}"
-            patched = verify_mod.phase_verifier(script, ledger.clip, phase, out / "verifier")
+            patched = verify_mod.phase_verifier(script, ledger.clip, phase, out / "verifier", paw_bones)
             report = verify_mod.run_verify(patched, glb, out, engine, a.launcher)
             # The clip's length tolerance is 1.5 frames at the baked clip's own (key) rate, not the ingest rate.
             problems += [f"[{prefix}] phase {phase:.2f}: {p}" for p in verify_mod.check_report(
@@ -434,6 +442,9 @@ def cmd_verify(a):
                 launcher_used=True, phase=phase)]
             reports.append((phase, out / "godot-report.json", report))
         combined = verify_mod.combine(reports, script)
+        # That the clip plays is measured: the phases' images and paw positions must differ.
+        combined["phaseEvidence"], moved = verify_mod.phase_evidence([(phase, r) for phase, _, r in reports])
+        problems += [f"[{prefix}] {p}" for p in moved]
         (folder / "godot-report.json").write_text(json.dumps(combined, indent=2))
         outputs[f"report{prefix.replace('.', '')}"] = folder / "godot-report.json"
     if problems:

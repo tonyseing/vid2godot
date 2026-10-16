@@ -220,6 +220,51 @@ class BakeTests(unittest.TestCase):
         ledger.record("facts", {}, {"facts": work / "facts" / "facts.json"})
         return work, run("bake", "--work", str(work))
 
+    def test_a_one_shot_bakes_through_the_command(self):
+        """Fix round 1, ruling 3: a one-shot (brief loop: false) bakes again. facts' one-shot branch predicts every
+        paw at every key from the rig (dx less its mean, as the bake keys it), and `bake` checks the GLB against it."""
+        from anim import facts as facts_mod
+        glb, _ = fixture_glb()
+        n = 12
+        bones, names, cycle = fixture_cycle(n, dx=lambda k: 0.01 * k, dz=lambda k: 0.002 * k, loop=False)
+        tmp = Path(tempfile.mkdtemp())
+        self.addCleanup(shutil.rmtree, tmp)
+        work = tmp / "w"
+        brief = tmp / "brief.json"
+        brief.write_text(json.dumps({"clip": "walk_fit", "subject": "box quadruped", "motion": "a short pounce",
+                                     "gait": "pounce", "loop": False, "planar": True, "videoSeconds": 4}))
+        run("init", "--work", str(work), "--model", str(glb), "--clip", "walk_fit")
+        self.assertEqual(run("contract", "--work", str(work), "--project-contract", str(FIXTURE_CONTRACT))[0], 0)
+        code, _, err = run("brief", "--work", str(work), "--file", str(brief))
+        self.assertEqual(code, 0, err)
+        self.assertEqual(run("reference", "--work", str(work))[0], 0)
+        ledger = Ledger(work)
+        stub = tmp / "stub.json"
+        stub.write_text("{}")
+        for stage in ("generate", "accept", "ingest"):
+            ledger.record(stage, {}, {"stub": stub})
+        project = load_project_contract(FIXTURE_CONTRACT)
+        rig_json = json.loads((work / "contract" / "rig.json").read_text())
+        rig = motion.PlanarRig(rig_json)
+        values = np.array(cycle["frames"])
+        paws = rig.paws(values, names, project)
+        poses = {"fps": 24.0, "names": names, "bones": bones,
+                 "frames": [{"index": i, "values": values[i].tolist(), "flags": [],
+                             "paws": {c: paws[c][i].tolist() for c in project["paws"]}} for i in range(n + 1)]}
+        (work / "fit").mkdir()
+        (work / "fit" / "poses.json").write_text(json.dumps(poses))
+        ledger.record("fit", {}, {"poses": work / "fit" / "poses.json"})
+        rest = facts_mod.rest_heights(rig_json, project)
+        result = facts_mod.clip_facts(poses, project, json.loads((work / "brief" / "brief.json").read_text()), rest,
+                                      rig=rig_json)
+        self.assertEqual(sorted(result["cycle"]["paws"]), sorted(project["paws"].values()))
+        (work / "facts").mkdir()
+        (work / "facts" / "facts.json").write_text(json.dumps(result))
+        ledger.record("facts", {}, {"facts": work / "facts" / "facts.json"})
+        code, data, err = run("bake", "--work", str(work))
+        self.assertEqual(code, 0, err)
+        self.assertLess(data["pawErrorMm"], 0.5)
+
     def test_a_bake_whose_paws_miss_the_facts_prediction_is_refused(self):
         _, (code, _, err) = self.bake_command(offset=0.005)
         self.assertEqual(code, 1)

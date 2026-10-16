@@ -251,7 +251,8 @@ class VerifyExportPipelineTests(unittest.TestCase):
             made[name] = path
             return path
 
-        facts = json.dumps({"fps": 24.0, "cycle": {"fps": 30.0}, "entry": {"duration_s": 0.5}})
+        facts = json.dumps({"fps": 24.0, "cycle": {"fps": 30.0, "paws": {"paw_hl": [], "paw_fl": []}},
+                            "entry": {"duration_s": 0.5}})
         ledger.record("contract", {}, {"rig": make("rig.json")})
         ledger.record("brief", {}, {"brief": make("brief.json")})
         ledger.record("reference", {}, {"image": make("reference.png")})
@@ -283,8 +284,9 @@ class VerifyExportPipelineTests(unittest.TestCase):
                      "overlays/00000.png", "overlays/00001.png"):
             self.assertIn(name, manifest)
             self.assertEqual(manifest[name], sha256_file(destination / name))
-        self.assertEqual((destination / "captures" / "4.5" / "phase000-phone-side.png").read_bytes(),
-                         b"4.5.1.stable.officialphase000-phone-side.png")
+        first = (destination / "captures" / "4.5" / "phase000-phone-side.png").read_bytes()
+        self.assertTrue(first.startswith(b"\x89PNG"))
+        self.assertNotEqual(first, (destination / "captures" / "4.5" / "phase333-phone-side.png").read_bytes())
 
     def test_verify_refuses_a_headless_report(self):
         headless = self.fake_skill(self.tmp / "headless", PHASED.replace(
@@ -309,10 +311,15 @@ func _capture() -> void:
 			captures.append({"path": filename, "profile": profile["name"], "view": view["name"]})
 '''
 
-PHASED = '''
+# Changed with fix round 1: the fake renders real PNGs in which the "clip" moves with the phase (a bar whose x
+# follows the phase tag, unless STILL), and records the patched script's paw positions per capture (moving with the
+# phase unless PAWS_STILL), since verify now measures that the phases differ. STATUS is the later phases' status.
+PHASED = """
 import hashlib, json, re, sys
 from pathlib import Path
+from PIL import Image, ImageDraw
 HERE = Path(__file__).resolve().parent
+STILL, PAWS_STILL, STATUS = False, False, "passed"
 args = dict(zip(sys.argv[1::2], sys.argv[2::2]))
 out = Path(args["--out"]); out.mkdir(parents=True, exist_ok=True)
 sha = hashlib.sha256(Path(args["--model"]).read_bytes()).hexdigest()
@@ -321,19 +328,25 @@ script = (HERE / "capture_asset.gd").read_text()
 phase = float(re.search(r"const CLIP_PHASE := ([0-9.]+)", script).group(1))
 clip = re.search(r'const CLIP_NAME := "([^"]+)"', script).group(1)
 tag = int(re.search(r"const PHASE_TAG := ([0-9]+)", script).group(1))
+bones = json.loads(re.search(r"const PAW_BONES := (\\[.*\\])", script).group(1))
 assert "clip_player.seek(clip_seconds, true)" in script
+assert "get_bone_global_pose" in script
 captures = []
 folder = out / "run-1" / "project" / "captures"; folder.mkdir(parents=True, exist_ok=True)
 for name in ("phone-side", "tablet-side"):
     path = folder / ("phase%03d-%s.png" % (tag, name))
-    path.write_bytes(version.encode() + path.name.encode())
+    image = Image.new("RGB", (60, 30), (48, 51, 56))
+    x = 5 if STILL else 5 + tag // 25
+    ImageDraw.Draw(image).rectangle([x, 8, x + 12, 22], fill=(200, 200, 210))
+    image.save(path)
+    paws = {b: [0.1 * i + (0.0 if PAWS_STILL else 0.3 * phase), 0.0, 0.0] for i, b in enumerate(bones)}
     captures.append({"profile": name.split("-")[0], "view": "side", "path": str(path), "phase": phase, "clip": clip,
-                     "clipSeconds": 0.5 * phase})
-report = {"status": "passed", "modelSha256": sha, "engine": {"version": version},
+                     "clipSeconds": 0.5 * phase, "paws": paws})
+report = {"status": STATUS if phase > 0.5 else "passed", "modelSha256": sha, "engine": {"version": version},
           "mode": "activation-suppressed capture", "captures": captures,
           "facts": {"animations": [{"name": "lope", "lengthSeconds": 0.5, "tracks": 30, "loopMode": 0}]}}
 (out / "godot-report.json").write_text(json.dumps(report))
-'''
+"""
 
 
 class PhaseCaptureTests(unittest.TestCase):
@@ -350,7 +363,7 @@ class PhaseCaptureTests(unittest.TestCase):
         (self.skill / "inspect_asset.gd").write_text("extends SceneTree\n")
 
     def test_the_patch_seeks_the_clip_and_tags_each_capture(self):
-        script = verify.phase_verifier(self.skill / "verify.py", "lope", 1 / 3, self.tmp / "patched")
+        script = verify.phase_verifier(self.skill / "verify.py", "lope", 1 / 3, self.tmp / "patched", ["paw_fl", "paw_hl"])
         self.assertEqual(script, self.tmp / "patched" / "verify.py")
         self.assertEqual((self.tmp / "patched" / "inspect_asset.gd").read_text(), "extends SceneTree\n")
         patched = (self.tmp / "patched" / "capture_asset.gd").read_text()
@@ -360,17 +373,21 @@ class PhaseCaptureTests(unittest.TestCase):
         self.assertLess(patched.index("scene.add_child(model)"), patched.index("clip_player.seek"))
         self.assertIn('"captures/phase%03d-%s-%s.png" % [PHASE_TAG,', patched)
         self.assertIn('captures.append({"phase": CLIP_PHASE, "clip": CLIP_NAME, "clipSeconds": clip_seconds,', patched)
+        self.assertIn('const PAW_BONES := ["paw_fl", "paw_hl"]', patched)
+        self.assertIn('"paws": paw_positions,', patched)
+        self.assertIn("skeleton.get_bone_global_pose(bone_index)", patched)
+        self.assertLess(patched.index("clip_player.pause()"), patched.index("get_bone_global_pose"))
         self.assertEqual((self.skill / "capture_asset.gd").read_text(), CAPTURE_GD, "the skill's copy is untouched")
 
     def test_a_changed_capture_script_is_refused(self):
         (self.skill / "capture_asset.gd").write_text(CAPTURE_GD.replace("scene.add_child(model)", "add(model)"))
         with self.assertRaisesRegex(verify.VerifyError, "capture script"):
-            verify.phase_verifier(self.skill / "verify.py", "lope", 0.0, self.tmp / "patched")
+            verify.phase_verifier(self.skill / "verify.py", "lope", 0.0, self.tmp / "patched", ["paw_fl"])
 
     def test_check_report_requires_the_phase_on_every_capture(self):
         model = self.tmp / "m.glb"
         model.write_bytes(b"glb")
-        script = verify.phase_verifier(self.skill / "verify.py", "lope", 2 / 3, self.tmp / "patched")
+        script = verify.phase_verifier(self.skill / "verify.py", "lope", 2 / 3, self.tmp / "patched", ["paw_fl"])
         report = verify.run_verify(script, model, self.tmp / "out", Path(self.tmp / "godot-4.7"), self.tmp / "l.mjs")
         sha = sha256_file(model)
         self.assertEqual(verify.check_report(report, sha, "lope", 0.5, 60.0, "4.7", launcher_used=True,
@@ -400,3 +417,58 @@ class PhaseCaptureTests(unittest.TestCase):
         names = json.loads((destination / "MANIFEST.json").read_text())
         for tag in ("000", "333", "667"):
             self.assertIn(f"captures/4.5/phase{tag}-phone-side.png", names)
+
+
+class PhaseEvidenceTests(unittest.TestCase):
+    """Fix round 1, ruling 5: that the clip plays is measured. For each profile and view the captures at different
+    phases must differ (image hash, and a pixel-difference share over PIXEL_FLOOR), and the paw bones' positions the
+    patched script records must differ between phases; otherwise verify fails with the numbers. The combined report
+    takes the worst run's status."""
+
+    def setUp(self):
+        self.tmp = Path(tempfile.mkdtemp())
+        self.addCleanup(shutil.rmtree, self.tmp)
+        self.work = VerifyExportPipelineTests.ledger_to_review(self.tmp)
+        self.engines = ["--godot47", str(self.tmp / "godot-4.7"), "--godot45", str(self.tmp / "godot-4.5")]
+
+    def verify(self, still=False, paws_still=False, status="passed"):
+        source = PHASED.replace('STILL, PAWS_STILL, STATUS = False, False, "passed"',
+                                f"STILL, PAWS_STILL, STATUS = {still!r}, {paws_still!r}, {status!r}")
+        script = VerifyExportPipelineTests.fake_skill(self.tmp / f"skill-{still}-{paws_still}-{status}", source)
+        return run_cli("verify", "--work", str(self.work), *self.engines, "--launcher", str(self.tmp / "l.mjs"),
+                       "--threed-verify", str(script))
+
+    def test_phases_that_render_the_same_image_are_refused_with_the_numbers(self):
+        code, _, err = self.verify(still=True)
+        self.assertEqual(code, 1)
+        self.assertRegex(err, r"\[4\.7\] phone/side: phases 0\.00 and 0\.33 render the same image \(same hash; "
+                              r"0\.0000 of the pixels differ, floor 0\.001\)")
+
+    def test_phases_whose_paws_do_not_move_are_refused(self):
+        code, _, err = self.verify(paws_still=True)
+        self.assertEqual(code, 1)
+        self.assertRegex(err, r"\[4\.5\] phases 0\.00 and 0\.33: no paw bone moved \(largest 0\.0000 m, floor "
+                              r"0\.005 m; paw_fl, paw_hl\)")
+
+    def test_moving_phases_pass_and_record_the_evidence(self):
+        code, _, err = self.verify()
+        self.assertEqual(code, 0, err)
+        report = json.loads((self.work / "verify" / "4.7" / "godot-report.json").read_text())
+        evidence = report["phaseEvidence"]
+        self.assertEqual(evidence["pixelFloor"], verify.PIXEL_FLOOR)
+        pair = evidence["views"]["phone/side"][0]
+        self.assertEqual((pair["phases"], pair["sameHash"]), ([0.0, 0.333333], False))
+        self.assertGreater(pair["pixelsDiffer"], verify.PIXEL_FLOOR)
+        self.assertGreater(evidence["paws"][0]["maxMoveM"], verify.PAW_MOVE_MIN)
+        self.assertEqual(report["status"], "passed")
+
+    def test_the_combined_report_takes_the_worst_status(self):
+        script = VerifyExportPipelineTests.fake_skill(self.tmp / "skill-combine", PHASED)
+        reports = [(0.0, self.tmp / "a" / "godot-report.json", {"status": "passed", "captures": []}),
+                   (0.5, self.tmp / "b" / "godot-report.json", {"status": "failed", "captures": []})]
+        self.assertEqual(verify.combine(reports, script)["status"], "failed")
+        self.assertEqual(verify.combine(reports[:1], script)["status"], "passed")
+        code, _, err = self.verify(status="failed")
+        self.assertEqual(code, 1)
+        report = json.loads((self.work / "verify" / "4.7" / "godot-report.json").read_text())
+        self.assertEqual(report["status"], "failed")

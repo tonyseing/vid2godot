@@ -78,8 +78,55 @@ class SmoothCycleTests(unittest.TestCase):
         np.testing.assert_allclose(smooth.roll(0.3).at(u), smooth.at(u + 0.3), atol=1e-12)
 
     def test_the_series_is_periodic(self):
+        """Fix round 1: at() wraps its phases, so comparing at(0) with at(1) proved nothing. The series itself, read
+        without the wrap, closes at the seam in value, slope and curvature."""
         smooth = motion.SmoothCycle(self.samples, self.names, toy_rig.PROJECT)
-        np.testing.assert_allclose(smooth.at([0.0]), smooth.at([1.0]), atol=1e-12)
+        for coeffs, name in zip(smooth.coeffs, smooth.names):
+            args = (smooth.orders[name], smooth.taper[name], smooth.gain[name])
+            for derivative in (0, 1, 2):
+                before = motion.evaluate(coeffs, np.array([1.0 - 1e-7]), *args, derivative=derivative,
+                                         keep=smooth.dominant[name])
+                at_zero = motion.evaluate(coeffs, np.array([0.0]), *args, derivative=derivative,
+                                          keep=smooth.dominant[name])
+                scale = 1.0 + float(np.abs(at_zero).max())
+                self.assertLess(float(np.abs(before - at_zero).max()) / scale, 1e-4, f"{name} d{derivative}")
+        self.assertNotEqual(float(smooth.at([0.25])[0, 2]), float(smooth.at([0.0])[0, 2]), "the column moves")
+
+    def test_a_column_mostly_in_an_overtone_is_not_divided_by_its_fundamental(self):
+        """Fix round 1, ruling 7: a root that bobs twice per stride is all second harmonic. Only harmonics above the
+        dominant one are tapered and its jerk is measured against a sine at the dominant harmonic, so the series is
+        neither tapered to nothing nor scaled by a near-zero fundamental."""
+        n = 15
+        u = np.arange(n) / n
+        bob = 0.01 * np.sin(4 * np.pi * u + 0.3) + 1e-9 * np.sin(2 * np.pi * u)
+        samples = np.stack([np.zeros(n), bob, 0.1 * np.sin(2 * np.pi * u)], axis=1)
+        smooth = motion.SmoothCycle(samples, ["dx", "dz", "pelvis"], toy_rig.PROJECT)
+        self.assertEqual(smooth.dominant["dz"], 2)
+        self.assertEqual(smooth.taper["dz"], 1.0)
+        self.assertTrue(math.isfinite(smooth.gain["dz"]) and 0.9 < smooth.gain["dz"] < 1.2, smooth.gain["dz"])
+        values = smooth.at(np.arange(600) / 600)[:, 1]
+        self.assertAlmostEqual(float(np.ptp(values)), float(np.ptp(bob)), delta=0.05 * float(np.ptp(bob)))
+        np.testing.assert_allclose(smooth.at(u)[:, 1], bob, atol=0.002)
+        taper, gain = motion.smoothest(motion.coefficients(bob), 2)
+        self.assertEqual((taper, gain), (1.0, 1.0))
+        overtone = 0.01 * np.sin(4 * np.pi * u) + 0.004 * np.sin(8 * np.pi * u + 1.0)
+        coeffs = motion.coefficients(overtone)
+        taper, gain = motion.smoothest(coeffs, 4)
+        self.assertLess(taper, 1.0, "the 4th harmonic, above the dominant 2nd, is tapered")
+        self.assertLessEqual(motion.jerk_ratio(coeffs, 4, taper, gain, keep=2) / 8.0, motion.JERK_MAX + 1e-6)
+        self.assertTrue(math.isfinite(gain) and gain < 2.0)
+
+    def test_trunk_columns_keep_their_sampled_range(self):
+        """Fix round 1: the bar measures each trunk joint's range against the video fit's; a series of the lowest
+        order that keeps RANGE_KEEP of it was then sampled at the 60 Hz keys and fell under (neck_01 0.945). The
+        smoothed series is scaled about its mean up to the sampled range itself when it falls short of it."""
+        smooth = motion.SmoothCycle(self.samples, self.names, toy_rig.PROJECT)
+        self.assertGreaterEqual(smooth.kept_range()["pelvis"], 1.0 - 1e-4)
+        short = np.stack([np.zeros(15), np.zeros(15), np.sign(np.sin(2 * np.pi * np.arange(15) / 15 + 0.1))], axis=1)
+        square = motion.SmoothCycle(short, ["dx", "dz", "pelvis"], toy_rig.PROJECT)
+        self.assertGreaterEqual(square.kept_range()["pelvis"], 1.0 - 1e-4, "a square wave's low order is scaled up")
+        keys = smooth.at(np.arange(24) / 24)[:, 2]
+        self.assertGreaterEqual(float(np.ptp(keys)) / float(np.ptp(self.trunk)), 0.98)
 
 
 class LegIkTests(unittest.TestCase):
@@ -154,7 +201,8 @@ class PlanKeysTests(unittest.TestCase):
         self.assertAlmostEqual(float(keys[:40, 0].mean()), 0.0, places=12)
         np.testing.assert_allclose(keys[:40, 1], values[0, 1] - 0.01, atol=1e-9, err_msg="the root is lifted")
         for chain, (on, off) in toy_rig.LOPE_WINDOWS.items():
-            inside = [k for k in range(41) if on <= k / 40 <= off]
+            # Changed with fix round 1: the pin holds the keys inside the window less half a key at each end.
+            inside = [k for k in range(41) if on + 0.5 / 40 - 1e-9 <= k / 40 <= off - 0.5 / 40 + 1e-9]
             p = paws[chain][inside]
             np.testing.assert_allclose(p[:, 1], 0.0, atol=1e-9, err_msg=chain)
             np.testing.assert_allclose(np.diff(p[:, 0]), -stride / 40, atol=1e-9, err_msg=chain)
@@ -176,6 +224,62 @@ class PlanKeysTests(unittest.TestCase):
                                           20 / 24, toy_rig.REST, 0.0, 40)
             planned.append(keys)
         np.testing.assert_allclose(planned[1], planned[0], atol=1e-9)
+
+    def test_the_pin_releases_without_a_velocity_jump(self):
+        """Fix round 1, ruling 4: the pin holds the paw over the window less half a key at each end; outside, the
+        correction to the free paw (its position, velocity and acceleration against the pin's) fades over at least
+        EDGE_KEYS key intervals, so at liftoff and touchdown the paw's velocity changes by no more than the swing's
+        median per-key change. The old blend (a 0.05-cycle position ease, about one key) jumped there."""
+        poses = toy_rig.toy_gait(frames=20, trunk=0.02)
+        values = np.array([f["values"] for f in poses["frames"]])
+        smooth = motion.SmoothCycle(values, poses["names"], toy_rig.PROJECT)
+        rig = motion.PlanarRig(toy_rig.toy_rig())
+        n = 24
+        windows = {c: (round(on * n) / n, round(off * n) / n) for c, (on, off) in toy_rig.LOPE_WINDOWS.items()}
+        keys, paws, report = motion.plan_keys(rig, smooth, poses["names"], toy_rig.PROJECT, windows, 20 / 24,
+                                              toy_rig.REST, 0.0, n)
+        jumps = motion.edge_jumps(paws, motion.release_windows(windows, n), n, 0.02)
+        for chain, jump in jumps.items():
+            self.assertLessEqual(max(jump["touchdownMps"], jump["liftoffMps"]), jump["swingMedianMps"], chain)
+            self.assertGreaterEqual(report[chain]["edgeKeys"], motion.EDGE_KEYS)
+        old = self.old_blend(rig, smooth, poses["names"], windows, 20 / 24, n)
+        jumped = motion.edge_jumps(old, windows, n, 0.02)                  # the old plan pinned the whole window
+        self.assertTrue(any(max(j["touchdownMps"], j["liftoffMps"]) > j["swingMedianMps"] for j in jumped.values()),
+                        jumped)
+
+    @staticmethod
+    def old_blend(rig, smooth, names, windows, stride, n):
+        """The keys' paws as the old plan made them: the target eased from the free paw to the pin line by a
+        smoothstep weight over 0.05 of a cycle outside the window."""
+        phases = np.arange(n) / n
+        keys = smooth.at(phases)
+        shift = float(keys[:, names.index("dx")].mean())
+        keys[:, names.index("dx")] -= shift
+        lines = motion.pin_lines(rig, smooth, names, toy_rig.PROJECT, windows, stride, toy_rig.REST, 0.0, shift)
+        for chain, window in windows.items():
+            weight, near = motion.stance_weight(phases, window, 0.05)
+            line, live = lines[chain], weight > 0
+            free = rig.paws(keys, names, toy_rig.PROJECT)[chain]
+            pin = np.stack([line["x"] - stride * (near - line["mid"]), np.full(n, line["z"])], axis=1)
+            target = weight[:, None] * pin + (1 - weight[:, None]) * free
+            keys[live], _ = motion.solve_leg(rig, keys[live], names, toy_rig.PROJECT["chains"][chain],
+                                             toy_rig.PROJECT["paws"][chain], target[live])
+        keys = np.vstack([keys, keys[:1]])
+        return rig.paws(keys, names, toy_rig.PROJECT)
+
+    def test_edge_jumps_measure_the_velocity_change_at_the_pinned_keys(self):
+        """dv at key k is |v(k -> k+1) - v(k-1 -> k)|; touchdown is read at the first pinned key, liftoff at the last;
+        the swing median over the keys that are not pinned."""
+        n, dt = 8, 0.1
+        x = np.array([0.0, -0.1, -0.2, -0.3, 0.0, 0.3, 0.4, 0.2, 0.0])     # pinned keys 0..3 slide back 0.1 per key
+        paws = {"a": np.stack([x, np.zeros(9)], axis=1)}
+        jumps = motion.edge_jumps(paws, {"a": (0.0, 3 / 8)}, n, dt)["a"]
+        v = np.diff(x) / dt                                               # -1 -1 -1 3 3 1 -2 -2
+        self.assertAlmostEqual(jumps["touchdownMps"], abs(v[0] - v[7]))  # 1.0
+        self.assertAlmostEqual(jumps["liftoffMps"], abs(v[3] - v[2]))     # 4.0
+        self.assertAlmostEqual(jumps["swingMedianMps"], float(np.median([abs(v[k] - v[k - 1]) for k in (4, 5, 6, 7)])))
+        self.assertEqual(motion.release_windows({"a": (0.25, 0.5)}, 8), {"a": (0.3125, 0.4375)})
+        self.assertEqual(motion.release_windows({"a": (0.25, 0.3125)}, 16), {"a": (0.28125, 0.28125)})
 
     def test_stance_weight_eases_outside_the_window(self):
         w, near = motion.stance_weight(np.array([0.95, 0.99, 0.0, 0.1, 0.2, 0.22, 0.3]), (0.0, 0.2), 0.05)

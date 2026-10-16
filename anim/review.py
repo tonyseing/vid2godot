@@ -6,7 +6,7 @@ import numpy as np
 from PIL import Image
 
 from anim import raster
-from anim.facts import contact_masks
+from anim.facts import in_window, motion_contacts
 from anim.ledger import StageError, sha256_file
 
 ARTISTIC_ROUNDS = 2
@@ -31,21 +31,45 @@ def draw_overlays(work, poses, projection_npz, masks_npz, out_dir):
     return paths
 
 
-def contact_timeline(poses, project, rest):
-    """Each paw's frames on the ground, against the one ground shared by every paw (facts.ground_height), each paw's
-    height measured from its rest-pose tail height `rest[chain]` (facts.rest_heights), as facts measures it."""
-    masks = contact_masks({chain: np.array([f["paws"][chain][1] for f in poses["frames"]]) - rest[chain]
-                           for chain in project["paws"]})
+def contact_timeline(poses, project, rest, facts=None):
+    """Each paw's frames on the ground, as facts reads them (fix round 1, ruling 8: the lab and facts agree). With
+    facts.json: its declared contacts (near the ground AND world-still) at each frame's phase of the cycle (a loop:
+    frame f at ((f - start) / period) mod 1) or a one-shot's contact windows. Before facts: facts' rule on the frames,
+    each paw's height measured from its rest-pose tail height `rest[chain]` (facts.rest_heights) against the one
+    shared ground, and its world stillness against the ground speed."""
+    frames = poses["frames"]
+    indices = [int(f.get("index", i)) for i, f in enumerate(frames)]
+    entry = (facts or {}).get("entry") or {}
+    if entry.get("loop") and isinstance(entry.get("contacts"), dict):
+        phases = ((np.array(indices, float) - float(facts["start"])) / float(facts["period"])) % 1.0
+        return {bone: (in_window(phases, entry["contacts"][bone]).tolist() if bone in entry["contacts"]
+                       else [False] * len(frames)) for bone in project["paws"].values()}
+    if entry and entry.get("loop") is False and isinstance(entry.get("contact_windows"), dict):
+        last = max(1, len(frames) - 1)
+        at = np.arange(len(frames)) / last
+        out = {}
+        for bone in project["paws"].values():
+            on = np.zeros(len(frames), bool)
+            for start, end in entry["contact_windows"].get(bone) or []:
+                on |= (at >= start - 1e-9) & ((at < end - 1e-9) | ((end >= 1.0) & (at >= 1.0 - 1e-9)))
+            out[bone] = on.tolist()
+        return out
+    fps = float(poses.get("fps") or 24.0)
+    heights = {chain: np.array([f["paws"][chain][1] for f in frames]) - rest[chain] for chain in project["paws"]}
+    vx = {chain: np.gradient(np.array([f["paws"][chain][0] for f in frames], float)) * fps
+          for chain in project["paws"]}
+    masks = motion_contacts(heights, vx)[3]
     return {bone: masks[chain].tolist() for chain, bone in project["paws"].items()}
 
 
 def motion_summary(facts):
     """What the lab states about the baked motion (Task 19), from facts.json: the cadence and any retime factor,
-    the gait check (and an accepted mismatch's reason), the contacts and their check against the baked keys."""
+    the gait check (and an accepted mismatch's reason), the contacts and their check against the baked keys (with the
+    edge velocity jumps), and every warning (fix round 1: an unchecked gait, an open-mesh mass, a world pitch range)."""
     if not facts:
         return None
     return {"cadence": facts.get("cadence"), "gait": facts.get("gaitCheck"), "contactCheck": facts.get("contactCheck"),
-            "contacts": (facts.get("entry") or {}).get("contacts")}
+            "contacts": (facts.get("entry") or {}).get("contacts"), "warnings": facts.get("warnings") or []}
 
 
 def lab_page(clip, report, threshold, timeline, hashes, motion=None):

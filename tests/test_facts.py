@@ -49,8 +49,15 @@ def analytic_values(f, period=9.6, amplitude=0.015):
     return [-0.125 * f, 0.02 * f] + [amplitude * math.sin(2 * math.pi * (f / period - p)) for p in PHASES.values()]
 
 
+TOY_GAIT = "test: the toy brief names no gait"
+
+
 def run(poses, project=PROJECT, brief=LOPE, gain=1.0, masks_from=None, render=None, hips=None, rest=REST, **extra):
-    """facts on a toy video of the poses (tests/toy_gait.py): its masks, and its renderer for the cycle check."""
+    """facts on a toy video of the poses (tests/toy_gait.py): its masks, and its renderer for the cycle check.
+    Changed with fix round 1: a loop brief that names no gait is refused unless accepted, so the toy briefs without
+    one pass TOY_GAIT."""
+    if brief.get("loop") and not brief.get("gait"):
+        extra.setdefault("accept_gait", TOY_GAIT)
     kwargs = {"hips": hips} if hips else {}
     masks, toy_render = toy_video(poses, gain, masks_from=masks_from, **kwargs)
     return facts.clip_facts(poses, project, brief, rest, masks=masks, render=render or toy_render, **extra)
@@ -101,7 +108,8 @@ class FactsTests(unittest.TestCase):
         self.assertAlmostEqual(entry["footfall_phase"]["paw_fl"], 0.25, delta=1 / 12)
         self.assertAlmostEqual(entry["duty_factor"]["paw_hr"], 0.5, delta=1 / 12)
         self.assertEqual(list(entry)[:5], ["duration_s", "loop", "authored_speed_mps", "stride_m", "contacts"])
-        self.assertEqual(result["warnings"], [])
+        # Changed with fix round 1: the toy brief names no gait, which is accepted and warned about.
+        self.assertEqual([w for w in result["warnings"] if not w.startswith("Gait not checked")], [])
         cycle = result["cycle"]
         self.assertEqual(len(cycle["frames"]), 13)
         self.assertEqual(cycle["frames"][-1], cycle["frames"][0])
@@ -619,8 +627,16 @@ class GaitGateTests(unittest.TestCase):
         self.assertEqual(facts.expected_gait("canid lope: a 3-beat canter with a lead"), "canter")
         self.assertEqual(facts.expected_gait("4-beat lateral walk"), "walk")
         self.assertEqual(facts.expected_gait("a working trot"), "trot")
-        self.assertEqual(facts.expected_gait("pacing camel"), None)
         self.assertEqual(facts.expected_gait("a pace"), "pace")
+        # Fix round 1, ruling 6: the inflections read too.
+        self.assertEqual(facts.expected_gait("pacing camel"), "pace")
+        self.assertEqual(facts.expected_gait("a wolf loping to the right"), "canter")
+        self.assertEqual(facts.expected_gait("cantering"), "canter")
+        self.assertEqual(facts.expected_gait("trotting steadily"), "trot")
+        self.assertEqual(facts.expected_gait("walking slowly"), "walk")
+        self.assertEqual(facts.expected_gait("Galloping hard"), "gallop")
+        self.assertEqual(facts.expected_gait("a rotary galloping cheetah"), "rotary gallop")
+        self.assertIsNone(facts.expected_gait("a walkway pacer"), "whole words only")
         self.assertEqual(facts.expected_gait("transverse gallop, gathered suspension"), "transverse gallop")
         self.assertEqual(facts.expected_gait("rotary gallop"), "rotary gallop")
         self.assertEqual(facts.expected_gait("galloping hard"), "gallop")
@@ -655,17 +671,71 @@ class GaitGateTests(unittest.TestCase):
         with self.assertRaisesRegex(facts.FactsError, "canter"):
             run(gallop(), brief={**LOPE, "gait": "canter"})
 
-    def test_no_gait_word_is_not_checked_and_one_shots_are_skipped(self):
-        self.assertIs(run(lope())["gaitCheck"]["checked"], False)
+    def test_no_gait_word_is_refused_unless_accepted_and_one_shots_are_skipped(self):
+        """Fix round 1, ruling 6: a loop whose brief names no gait the vocabulary knows is refused, unless accepted
+        with a reason; the acceptance is a warning in facts.json (which the ledger and the lab carry)."""
+        for brief in (LOPE, {**LOPE, "gait": "a bounding hop"}):
+            with self.assertRaisesRegex(facts.FactsError, r"names no gait.*walk, trot.*--accept-gait"):
+                run(lope(), brief=brief, accept_gait=None)
+        result = run(lope(), brief={**LOPE, "gait": "a bounding hop"}, accept_gait="the owner names it later")
+        self.assertIs(result["gaitCheck"]["checked"], False)
+        self.assertEqual(result["gaitCheck"]["accepted"], "the owner names it later")
+        self.assertTrue(any("a bounding hop" in w and "the owner names it later" in w for w in result["warnings"]),
+                        result["warnings"])
         poses = rested(synthetic(frames=11), {c: 0.0 for c in PROJECT["paws"]})
         result = facts.clip_facts(poses, PROJECT, {"clip": "pounce", "loop": False, "gait": "trot"}, REST)
         self.assertNotIn("gaitCheck", result)
 
 
+def footfalls(beats, suspensions=(), lead=None):
+    """A measured footfall pattern as facts.gait_pattern reports it, every paw planted."""
+    return {"beatPaws": [list(b) for b in beats], "suspensions": [list(x) for x in suspensions],
+            "lead": lead or {"front": None, "hind": None}, "beats": len(beats),
+            "plantedPaws": ["hind_L", "hind_R", "front_L", "front_R"]}
+
+
+class GaitReadsTests(unittest.TestCase):
+    """Fix round 1, ruling 6: each gait of the vocabulary is read from its footfall pattern, accepted against the
+    brief's own gait and refused against a wrong one."""
+    WALK = footfalls([["hind_L"], ["front_L"], ["hind_R"], ["front_R"]])
+    TROT = footfalls([["hind_L", "front_R"], ["hind_R", "front_L"]], [[0.45, 0.5], [0.95, 1.0]])
+    PACE = footfalls([["hind_L", "front_L"], ["hind_R", "front_R"]])
+    ROTARY = footfalls([["hind_L"], ["hind_R"], ["front_R"], ["front_L"]], [[0.8, 1.0]],
+                       {"front": "front_L", "hind": "hind_R"})
+
+    def check(self, pattern, reads, right, wrong):
+        self.assertIn(reads, facts.gait_reads(pattern))
+        accepted, warnings = facts.gait_check(pattern, {"gait": right})
+        self.assertIs(accepted["matches"], True)
+        self.assertEqual(warnings, [])
+        self.assertIsNone(accepted["accepted"])
+        with self.assertRaisesRegex(facts.FactsError, "--accept-gait"):
+            facts.gait_check(pattern, {"gait": wrong})
+
+    def test_a_lateral_sequence_walk(self):
+        self.check(self.WALK, "walk", "4-beat lateral walking", "a working trot")
+        self.assertNotIn("gallop", facts.gait_reads(self.WALK))
+
+    def test_a_trot_is_two_diagonal_pairs(self):
+        self.check(self.TROT, "trot", "trotting", "pacing")
+        self.assertNotIn("pace", facts.gait_reads(self.TROT))
+
+    def test_a_pace_is_two_lateral_pairs(self):
+        self.check(self.PACE, "pace", "a pacing camel", "trot")
+        self.assertNotIn("trot", facts.gait_reads(self.PACE))
+
+    def test_a_rotary_gallop_leads_on_opposite_sides(self):
+        self.check(self.ROTARY, "rotary gallop", "rotary gallop", "transverse gallop")
+        self.assertIs(facts.gait_check(self.ROTARY, {"gait": "galloping"})[0]["matches"], True)
+        with self.assertRaisesRegex(facts.FactsError, "walk"):
+            facts.gait_check(self.ROTARY, {"gait": "walking"})
+
+
 class CadenceTests(unittest.TestCase):
     """Task 19 step 3: the stride frequency against the Heglund-Taylor band for the body mass (the brief's massKg, or
-    a mass given to facts); a slow video with one consistent period is retimed to the band centre, never silently."""
-    BRIEF = {**LOPE, "gait": "canid lope: a 3-beat canter", "massKg": 40, "targetSpeedMps": None}
+    a mass given to facts); a slow video with one consistent period is retimed to the band centre, never silently.
+    Changed with fix round 1: the toy lope (1.2 Hz) is a 200 kg subject, so its retime (1.62) is inside the bound."""
+    BRIEF = {**LOPE, "gait": "canid lope: a 3-beat canter", "massKg": 200, "targetSpeedMps": None}
 
     def test_the_band_for_a_mass(self):
         self.assertEqual([round(x, 2) for x in facts.cadence_band([30, 50])], [2.41, 2.61])
@@ -676,7 +746,7 @@ class CadenceTests(unittest.TestCase):
         result = run(lope(), brief=self.BRIEF)
         cadence = result["cadence"]
         self.assertAlmostEqual(cadence["videoHz"], 24.0 / result["period"], places=4)
-        self.assertEqual(cadence["massKg"], [30.0, 50.0])
+        self.assertEqual(cadence["massKg"], [150.0, 250.0])
         self.assertEqual(cadence["massSource"], "brief massKg")
         centre = sum(cadence["bandHz"]) / 2
         self.assertAlmostEqual(cadence["retime"], centre / cadence["videoHz"], places=3)
@@ -690,9 +760,9 @@ class CadenceTests(unittest.TestCase):
         self.assertTrue(any("retimed" in w for w in result["warnings"]))
 
     def test_a_mass_given_to_facts_wins_and_without_one_nothing_is_checked(self):
-        result = run(lope(), brief=self.BRIEF, mass={"kg": 4, "source": "facts --mass-kg"})
+        result = run(lope(), brief=self.BRIEF, mass={"kg": 100, "source": "facts --mass-kg"})
         self.assertEqual(result["cadence"]["massSource"], "facts --mass-kg")
-        self.assertEqual(result["cadence"]["massKg"], [3.0, 5.0])
+        self.assertEqual(result["cadence"]["massKg"], [75.0, 125.0])
         result = run(lope(), brief={**self.BRIEF, "massKg": None})
         self.assertIs(result["cadence"]["checked"], False)
         self.assertEqual(result["cadence"]["retime"], 1.0)
@@ -711,6 +781,34 @@ class CadenceTests(unittest.TestCase):
         self.assertEqual(result["cadence"]["retime"], 1.0)
         self.assertTrue(any("not retimed" in w for w in result["warnings"]))
 
+    def test_a_retime_outside_the_bound_is_refused_unless_accepted(self):
+        """Fix round 1, ruling 2: a retime factor outside 0.5-2.0 is refused unless `facts --accept-retime <reason>`
+        records why (the toy lope at 40 kg would play 2.09 times faster)."""
+        brief = {**self.BRIEF, "massKg": 40}
+        with self.assertRaisesRegex(facts.FactsError, r"retime.*2\.09.*0\.5-2\.0.*--accept-retime"):
+            run(lope(), brief=brief)
+        result = run(lope(), brief=brief, accept_retime="the owner wants a 40 kg wolf from this video")
+        cadence = result["cadence"]
+        self.assertAlmostEqual(cadence["retime"], 2.09, delta=0.01)
+        self.assertEqual(cadence["retimeAccepted"], "the owner wants a 40 kg wolf from this video")
+        self.assertTrue(any("accepted" in w and "2.09" in w for w in result["warnings"]), result["warnings"])
+
+    def test_an_open_rig_mesh_mass_is_checked_but_never_retimes(self):
+        """Fix round 1, ruling 2: the rig's mesh volume is a body mass only for a closed mesh. With open edges the
+        cadence is checked and warned about, the warning naming the source and the open-edge count, and nothing is
+        retimed; a closed mesh's volume retimes as a brief mass would."""
+        source = "rig mesh volume x 1000 kg/m3 (rough)"
+        result = run(lope(), brief={**self.BRIEF, "massKg": None},
+                     mass={"kg": 200, "source": source, "openEdges": 1590})
+        cadence = result["cadence"]
+        self.assertIs(cadence["checked"], True)
+        self.assertEqual(cadence["retime"], 1.0)
+        self.assertIn("1590", cadence["retimeBlocked"])
+        self.assertTrue(any(source in w and "1590 open edges" in w and "not retimed" in w
+                            for w in result["warnings"]), result["warnings"])
+        closed = run(lope(), brief={**self.BRIEF, "massKg": None}, mass={"kg": 200, "source": source, "openEdges": 0})
+        self.assertGreater(closed["cadence"]["retime"], 1.5)
+
     def test_trots_and_walks_have_no_band(self):
         result = run(lope(), brief={**self.BRIEF, "gait": "trot"}, accept_gait="test")
         self.assertIsNone(result["cadence"]["bandHz"])
@@ -725,7 +823,10 @@ class RigFactsTests(unittest.TestCase):
         from tests import toy_rig
         poses = poses or toy_rig.toy_gait()
         masks, render = toy_video(poses, gain=1.0)
-        return facts.clip_facts(poses, toy_rig.PROJECT, brief or {**LOPE, "targetSpeedMps": 1.0}, toy_rig.REST,
+        brief = brief or {**LOPE, "targetSpeedMps": 1.0}
+        if not brief.get("gait"):
+            kw.setdefault("accept_gait", TOY_GAIT)
+        return facts.clip_facts(poses, toy_rig.PROJECT, brief, toy_rig.REST,
                                 masks=masks, render=render, rig=toy_rig.toy_rig(), **kw)
 
     def test_contacts_come_from_the_motion_and_the_keys_pin_them(self):
@@ -765,7 +866,8 @@ class RigFactsTests(unittest.TestCase):
         self.assertAlmostEqual(on, 0.3, delta=2.5 / n)
         self.assertAlmostEqual(off, 0.55, delta=2.5 / n)
         paws = np.array(result["cycle"]["paws"]["paw_fl"])
-        inside = [k for k in range(n + 1) if on < k / n < off]
+        # Changed with fix round 1: the pin holds the keys a key inside the declared contact's ends.
+        inside = [k for k in range(n + 1) if on + 1.0 / n - 1e-9 <= k / n <= off - 1.0 / n + 1e-9]
         np.testing.assert_allclose(paws[inside, 1], 0.0, atol=1e-6)
 
     def test_trunk_columns_are_smooth_and_keep_the_range(self):
@@ -786,3 +888,94 @@ class RigFactsTests(unittest.TestCase):
         with mock.patch.object(facts.motion, "plan_keys", side_effect=lifted):
             with self.assertRaisesRegex(facts.FactsError, r"declared contacts.*baked keys.*agree.*0\.95"):
                 self.facts()
+
+
+class FixRoundOneFactsTests(unittest.TestCase):
+    """Task 19 fix round 1: the edge-velocity gate and record, a retime on the rig path, the world pitch range of
+    the trunk and tail, and a one-shot's predicted paws."""
+
+    def facts(self, poses=None, brief=None, **kw):
+        from tests import toy_rig
+        poses = poses or toy_rig.toy_gait()
+        masks, render = toy_video(poses, gain=1.0)
+        brief = brief or {**LOPE, "targetSpeedMps": 1.0, "gait": "3-beat canter"}
+        # The toy's smooth cycle reads three short suspensions, not a canter: the mismatch is accepted.
+        kw.setdefault("accept_gait", TOY_GAIT)
+        return facts.clip_facts(poses, toy_rig.PROJECT, brief, toy_rig.REST, masks=masks, render=render,
+                                rig=toy_rig.toy_rig(), **kw)
+
+    def test_the_edge_velocity_jumps_are_recorded_and_within_the_swing(self):
+        jumps = self.facts()["contactCheck"]["edgeJumps"]
+        self.assertEqual(sorted(jumps), ["paw_fl", "paw_fr", "paw_hl", "paw_hr"])
+        for bone, jump in jumps.items():
+            self.assertLessEqual(max(jump["touchdownMps"], jump["liftoffMps"]), jump["swingMedianMps"], bone)
+
+    def test_a_velocity_jump_at_a_contact_edge_is_refused(self):
+        from unittest import mock
+        real = facts.motion.plan_keys
+
+        def jumpy(rig, smooth, names, project, windows, *args, **kw):
+            keys, paws, report = real(rig, smooth, names, project, windows, *args, **kw)
+            n = len(keys) - 1
+            on, off = motion.release_windows(windows, n)["front_L"]
+            k = (int(math.floor(off * n + 1e-9)) + 1) % n          # the key after the last pinned one
+            paws["front_L"] = paws["front_L"].copy()
+            paws["front_L"][k] += [0.05, 0.0]
+            return keys, paws, report
+        with mock.patch.object(facts.motion, "plan_keys", side_effect=jumpy):
+            with self.assertRaisesRegex(facts.FactsError, r"paw_fl.*liftoff.*m/s.*swing.*median"):
+                self.facts()
+
+    def test_a_retime_on_the_rig_path(self):
+        """A slow toy video at 200 kg is retimed by 1.62: 60 Hz keys over the shorter cycle, pins and checks on them."""
+        result = self.facts(brief={**LOPE, "targetSpeedMps": None, "gait": "3-beat canter", "massKg": 200})
+        cadence, entry, cycle = result["cadence"], result["entry"], result["cycle"]
+        self.assertAlmostEqual(cadence["retime"], 1.62, delta=0.02)
+        self.assertEqual(cycle["retime"], cadence["retime"])
+        self.assertAlmostEqual(entry["duration_s"], result["period"] / 24.0 / cadence["retime"], places=6)
+        self.assertEqual(entry["frames"], motion.key_count(entry["duration_s"]))
+        self.assertEqual(len(cycle["paws"]["paw_hl"]), entry["frames"] + 1)
+        self.assertAlmostEqual(entry["authored_speed_mps"], 1.0 * cadence["retime"], delta=0.05)
+        self.assertGreaterEqual(min(result["contactCheck"]["agreement"].values()), facts.CONTACT_AGREEMENT)
+
+    def test_the_trunk_and_tail_world_pitch_range_is_reported_and_warned(self):
+        """Ruling 7: the world pitch range of each trunk and tail bone is reported against the video's; under
+        RANGE_KEEP it is a warning (in facts.json, the ledger and the lab), not a refusal."""
+        from unittest import mock
+        result = self.facts()
+        kept = result["smooth"]["worldPitchKept"]
+        self.assertEqual(sorted(kept), ["chest", "pelvis", "tail"])
+        self.assertTrue(all(v >= motion.RANGE_KEEP for v in kept.values()), kept)
+        self.assertFalse(any("world pitch" in w for w in result["warnings"]))
+        with mock.patch.object(facts.motion, "world_pitch_kept", return_value={"pelvis": 1.0, "tail": 0.69}):
+            result = self.facts()
+        self.assertTrue(any("world pitch" in w and "tail 0.69" in w for w in result["warnings"]), result["warnings"])
+
+    def test_world_pitch_kept_compares_the_smooth_cycle_with_the_samples(self):
+        from tests import toy_rig
+        poses = toy_rig.toy_gait(frames=20, trunk=0.05)
+        values = np.array([f["values"] for f in poses["frames"]])
+        rig = motion.PlanarRig(toy_rig.toy_rig())
+        smooth = motion.SmoothCycle(values, poses["names"], toy_rig.PROJECT)
+        kept = motion.world_pitch_kept(rig, values, smooth, poses["names"], ["pelvis", "tail"])
+        self.assertGreaterEqual(kept["tail"], 0.95)
+        smooth.gain["tail"] = 0.5
+        self.assertLess(motion.world_pitch_kept(rig, values, smooth, poses["names"], ["tail"])["tail"], 0.9)
+
+    def test_a_one_shot_predicts_its_paws_for_the_bake(self):
+        """Ruling 3: a one-shot's keys are its fitted frames; with the rig, facts predicts each paw at every key as
+        the bake plays it (dx less its mean over keys 0..n-1), so `bake` can check a one-shot too."""
+        from tests import toy_rig
+        poses = toy_rig.toy_gait(frames=13)
+        result = facts.clip_facts(poses, toy_rig.PROJECT, {"clip": "pounce", "loop": False, "targetSpeedMps": None},
+                                  toy_rig.REST, rig=toy_rig.toy_rig())
+        values = np.array([f["values"] for f in poses["frames"]])
+        values[:, 0] -= values[:-1, 0].mean()
+        rig = motion.PlanarRig(toy_rig.toy_rig())
+        want = rig.paws(values, poses["names"], toy_rig.PROJECT)
+        for chain, bone in toy_rig.PROJECT["paws"].items():
+            np.testing.assert_allclose(result["cycle"]["paws"][bone], want[chain], atol=1e-6)
+        self.assertEqual(len(result["cycle"]["frames"]), 13)
+        self.assertNotIn("paws", facts.clip_facts(poses, toy_rig.PROJECT, {"clip": "pounce", "loop": False,
+                                                                            "targetSpeedMps": None},
+                                                  toy_rig.REST)["cycle"])

@@ -153,6 +153,31 @@ class FactsCommandTests(unittest.TestCase):
         self.assertEqual(stage["facts"]["acceptGait"], "transverse is right")
         self.assertEqual(stage["facts"]["mass"], {"kg": 40.0, "source": "facts --mass-kg"})
 
+    def test_accept_retime_reaches_facts_and_the_ledger(self):
+        """Fix round 1, ruling 2: `facts --accept-retime <reason>` is passed to clip_facts and recorded."""
+        from anim.ledger import Ledger
+        code, err, clip, _ = self.facts("--mass-kg", "40", "--accept-retime", "the owner wants it at 40 kg")
+        self.assertEqual(code, 0, err)
+        self.assertEqual(clip.call_args.kwargs["accept_retime"], "the owner wants it at 40 kg")
+        self.assertEqual(Ledger(self.work).require("facts")["facts"]["acceptRetime"], "the owner wants it at 40 kg")
+
+    def test_rig_mass_carries_the_open_edge_count(self):
+        """Fix round 1, ruling 2: the mesh-volume mass carries its non-manifold edge count, so facts never retimes
+        on an open mesh's volume."""
+        from unittest import mock
+        from anim import pipeline
+        from anim.ledger import Ledger
+        found = {"volumeM3": 0.085, "meshes": [{"name": "body", "volumeM3": 0.08, "nonManifoldEdges": 1500},
+                                                {"name": "eyes", "volumeM3": 0.005, "nonManifoldEdges": 90}]}
+        with mock.patch.object(pipeline, "run_blender", return_value=found):
+            mass = pipeline.rig_mass(Ledger(self.work), self.tmp / "mass")
+        self.assertEqual(mass["kg"], 85.0)
+        self.assertEqual(mass["openEdges"], 1590)
+        self.assertIn("rig mesh volume", mass["source"])
+        with mock.patch.object(pipeline, "run_blender", return_value={"volumeM3": 0.04, "meshes": [
+                {"name": "body", "volumeM3": 0.04, "nonManifoldEdges": 0}]}):
+            self.assertEqual(pipeline.rig_mass(Ledger(self.work), self.tmp / "mass")["openEdges"], 0)
+
     def test_the_brief_mass_then_the_rig_volume(self):
         self.brief({"clip": "lope", "loop": True, "gait": "lope", "massKg": [30, 50]})
         code, err, clip, volume = self.facts()

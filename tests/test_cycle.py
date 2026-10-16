@@ -169,5 +169,24 @@ class PeriodicPriorTests(unittest.TestCase):
         self.assertIsNone(cycle.periodic_prior(swing, masks, 24.0, [], first=6))
 
 
+class CyclePeriodTests(unittest.TestCase):
+    """Fix round 1: each steady cycle's own period, read directly (the cadence's one-time-scale check)."""
+
+    def test_each_cycle_reads_its_own_period(self):
+        steady = masks_of(np.arange(121), 15.2)
+        periods = cycle.cycle_periods(steady, [10.0, 25.2, 40.4, 55.6], 15.2)
+        self.assertEqual(len(periods), 4)
+        for p in periods:
+            self.assertAlmostEqual(p, 15.2, delta=0.35)
+
+    def test_a_cycle_that_runs_slower_reads_longer(self):
+        # Frames 0..60 at period 12, then the motion slows to period 16 (phase continuous at frame 60).
+        times = [t if t <= 60 else 60 + (t - 60) * 12 / 16 for t in range(121)]
+        periods = cycle.cycle_periods(masks_of(times, 12.0), [12.0, 24.0, 72.0, 88.0], 14.0, spread=0.3)
+        self.assertLess(abs(periods[0] - 12.0), 0.6)
+        self.assertLess(abs(periods[-1] - 16.0), 0.8)
+        self.assertGreater(periods[-1] - periods[0], 3.0)
+
+
 if __name__ == "__main__":
     unittest.main()

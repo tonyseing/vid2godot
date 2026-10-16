@@ -62,10 +62,13 @@ CONTACT_AGREEMENT = 0.95     # declared contacts vs a re-detection from the bake
 STILL_SPEED = 0.10           # m/s: the report's "still" for a planted paw in the played clip
 MASS_SPREAD = 0.25           # a single massKg m is the range [m (1 - spread), m (1 + spread)]
 CADENCE_CONSISTENCY = 0.10   # every steady cycle's own period within this share of the clip's: one time scale
+RETIME_BOUND = (0.5, 2.0)    # a retime factor outside this needs `facts --accept-retime <reason>` (fix round 1)
 GALLOPS = ("canter", "gallop", "transverse gallop", "rotary gallop")
-# The brief's `gait` vocabulary: the earliest of these words (at a word start) names the expected gait.
-GAIT_WORDS = (("transverse gallop", "transverse gallop"), ("rotary gallop", "rotary gallop"), ("gallop", "gallop"),
-              ("canter", "canter"), ("lope", "canter"), ("trot", "trot"), ("pace", "pace"), ("walk", "walk"))
+# The brief's `gait` vocabulary: the earliest of these whole words (or their inflections) names the expected gait.
+GAIT_WORDS = ((r"transverse gallop(?:s|ing|ed)?", "transverse gallop"), (r"rotary gallop(?:s|ing|ed)?", "rotary gallop"),
+              (r"gallop(?:s|ing|ed)?", "gallop"), (r"canter(?:s|ing|ed)?", "canter"), (r"lop(?:e|es|ing|ed)", "canter"),
+              (r"trot(?:s|ting|ted)?", "trot"), (r"pac(?:e|es|ing|ed)", "pace"), (r"walk(?:s|ing|ed)?", "walk"))
+VOCABULARY = "walk, trot, pace, canter/lope, gallop, transverse gallop or rotary gallop (or their -ing forms)"
 
 
 class FactsError(StageError):
@@ -249,13 +252,14 @@ def circular_speed(x, dt):
 
 # ------------------------------------------------------------------------------------------- the gait gate
 def expected_gait(text):
-    """The gait the brief's `gait` text names: the earliest word of GAIT_WORDS in it (at a word start), or None."""
+    """The gait the brief's `gait` text names: the earliest whole word of GAIT_WORDS in it (its inflections too:
+    loping, pacing, trotting, cantering, walking, galloping), or None."""
     text = (text or "").lower()
     found = []
-    for word, gait in GAIT_WORDS:
-        match = re.search(r"\b" + word, text)
+    for pattern, gait in GAIT_WORDS:
+        match = re.search(r"\b(?:" + pattern + r")\b", text)
         if match:
-            found.append((match.start(), -len(word), gait))
+            found.append((match.start(), match.start() - match.end(), gait))
     return min(found)[2] if found else None
 
 
@@ -310,20 +314,34 @@ def describe_gait(gait):
 
 
 def gait_check(gait, brief, accept_gait=None):
-    """The measured pattern against the brief's gait. A mismatch refuses unless `accept_gait` gives the reason."""
-    expected = expected_gait(brief.get("gait"))
+    """The measured pattern against the brief's gait. A mismatch, or a brief gait that names nothing in the
+    vocabulary (fix round 1), refuses unless `accept_gait` gives the reason. Returns (check, warnings)."""
+    text = brief.get("gait")
+    expected = expected_gait(text)
     reads = gait_reads(gait)
     out = {"expected": expected, "checked": expected is not None,
            "measured": {"text": describe_gait(gait), "reads": reads},
            "matches": None if expected is None else expected in reads, "accepted": None}
-    if expected is not None and expected not in reads:
+    warnings = []
+    named = f"the brief's gait {text!r}" if text else "the brief"
+    if expected is None:
+        if not accept_gait:
+            raise FactsError(f"{named[0].upper()}{named[1:]} names no gait facts can check ({VOCABULARY}); the motion's "
+                             f"footfalls are {describe_gait(gait)}, reading as {', '.join(reads) or 'none of them'}. "
+                             f"Name the gait in the brief, or record why the clip stands unchecked with "
+                             f"`facts --accept-gait <reason>`")
+        out["accepted"] = accept_gait
+        warnings.append(f"Gait not checked: {named} names none of {VOCABULARY}; accepted: {accept_gait}")
+    elif expected not in reads:
         if not accept_gait:
             raise FactsError(f"The brief's gait is a {expected}, but the motion's footfalls are {describe_gait(gait)}: "
                              f"they read as {', '.join(reads) or 'none of walk, trot, pace, canter/lope, gallop'}. "
                              f"Regenerate the video, or record why this motion stands with "
                              f"`facts --accept-gait <reason>`")
         out["accepted"] = accept_gait
-    return out
+        warnings.append(f"Gait mismatch accepted: the brief's {expected}, measured {describe_gait(gait)}; "
+                        f"accepted: {accept_gait}")
+    return out, warnings
 
 
 # ------------------------------------------------------------------------------------------------ the cadence
@@ -340,18 +358,23 @@ def cadence_band(kg):
     return [motion.heglund_taylor_hz(high), motion.heglund_taylor_hz(low)]
 
 
-def cadence_check(period, fps, gait_name, mass, periods):
+def cadence_check(period, fps, gait_name, mass, periods, accept_retime=None):
     """The stride frequency against the body-size band (galloping gaits: canter, gallop): the block for facts.json
     and the warnings. A video under the band whose steady cycles share one period (each within
-    CADENCE_CONSISTENCY of the clip's) is retimed to the band centre; the factor scales the clip's speed."""
+    CADENCE_CONSISTENCY of the clip's) is retimed to the band centre; the factor scales the clip's speed.
+    Fix round 1: a mass from an open mesh's volume (`openEdges` > 0) is checked against but never retimes; a factor
+    outside RETIME_BOUND refuses unless `accept_retime` records why."""
     hz = fps / period
     out = {"videoHz": round(hz, 4), "massKg": None, "massSource": None, "bandHz": None, "centreHz": None,
            "checked": False, "consistent": None, "cyclePeriods": [round(p, 3) for p in periods], "retime": 1.0,
            "hz": round(hz, 4), "law": "Heglund & Taylor 1988: stride frequency at the preferred galloping speed "
                                       "4.44 M^-0.156 Hz"}
     warnings = []
+    open_edges = (mass or {}).get("openEdges") or 0
     if mass is not None:
         out["massKg"], out["massSource"] = mass_range(mass["kg"]), mass["source"]
+        if open_edges:
+            out["massOpenEdges"] = int(open_edges)
     if gait_name not in GALLOPS:
         out["reason"] = f"no Heglund-Taylor band for a {gait_name or 'gait the brief does not name'}"
         return out, warnings
@@ -365,18 +388,35 @@ def cadence_check(period, fps, gait_name, mass, periods):
     out.update({"bandHz": [round(b, 4) for b in band], "centreHz": round(centre, 4), "checked": True,
                 "consistent": consistent})
     kg = "-".join(f"{m:g}" for m in out["massKg"])
-    if hz < band[0] and consistent:
+    where = f"{band[0]:.2f}-{band[1]:.2f} Hz band for {kg} kg"
+    untrusted = (f"the mass is the {mass['source']} of an open mesh ({int(open_edges)} open edges); give the brief's "
+                 f"massKg or `facts --mass-kg`") if open_edges else None
+    if untrusted:
+        warnings.append(f"Body mass {kg} kg is the {mass['source']} of an open mesh ({int(open_edges)} open edges): "
+                        f"the cadence is checked against it and not retimed")
+    if hz < band[0] and consistent and untrusted:
+        out["retimeBlocked"] = untrusted
+        warnings.append(f"The video's cadence {hz:.2f} Hz is under the {where} and not retimed: {untrusted}")
+    elif hz < band[0] and consistent:
         factor = centre / hz
+        low, high = RETIME_BOUND
+        accepted = ""
+        if not low <= factor <= high:
+            if not accept_retime:
+                raise FactsError(f"The cadence retime {factor:.2f} (the video's {hz:.2f} Hz to {centre:.2f} Hz, the "
+                                 f"{where}) is outside {low}-{high}: the video is far slower than the body size says "
+                                 f"or the mass is wrong. Check the mass (the brief's massKg or `facts --mass-kg`), or "
+                                 f"record why this retime stands with `facts --accept-retime <reason>`")
+            out["retimeAccepted"] = accept_retime
+            accepted = f"; outside {low}-{high}, accepted: {accept_retime}"
         out["retime"], out["hz"] = round(factor, 6), round(centre, 4)
-        warnings.append(f"The video's cadence {hz:.2f} Hz is under the {band[0]:.2f}-{band[1]:.2f} Hz band for "
-                        f"{kg} kg: retimed by {factor:.3f} to {centre:.2f} Hz (the speed by the same factor)")
+        warnings.append(f"The video's cadence {hz:.2f} Hz is under the {where}: retimed by {factor:.3f} to "
+                        f"{centre:.2f} Hz (the speed by the same factor){accepted}")
     elif hz < band[0]:
-        warnings.append(f"The video's cadence {hz:.2f} Hz is under the {band[0]:.2f}-{band[1]:.2f} Hz band for "
-                        f"{kg} kg and not retimed: the steady cycles' own periods ({out['cyclePeriods']}) are not "
-                        f"one time scale")
+        warnings.append(f"The video's cadence {hz:.2f} Hz is under the {where} and not retimed: the steady cycles' "
+                        f"own periods ({out['cyclePeriods']}) are not one time scale")
     elif hz > band[1]:
-        warnings.append(f"The video's cadence {hz:.2f} Hz is above the {band[0]:.2f}-{band[1]:.2f} Hz band for "
-                        f"{kg} kg; not retimed (only a slow video is)")
+        warnings.append(f"The video's cadence {hz:.2f} Hz is above the {where}; not retimed (only a slow video is)")
     return out, warnings
 
 
@@ -457,7 +497,8 @@ def gait_pattern(masks, touchdowns, project, n):
             "lead": lead, "suspensions": suspensions, "beatTolerance": round(tol, 4)}
 
 
-def clip_facts(poses, project, brief, rest, masks=None, render=None, rig=None, mass=None, accept_gait=None):
+def clip_facts(poses, project, brief, rest, masks=None, render=None, rig=None, mass=None, accept_gait=None,
+               accept_retime=None):
     """The clip's facts. `rest` is each paw chain's rest-pose tail height (`rest_heights`); the paws' heights are
     measured from it. A loop needs the video: `masks` (the ingest's working masks, (T, H, W) bool) and `render`
     (value vectors -> the rig's silhouettes at the masks' size) for the averaged cycle's check.
@@ -465,7 +506,9 @@ def clip_facts(poses, project, brief, rest, masks=None, render=None, rig=None, m
     Task 19: `rig` (the contract's rig.json) reads a loop's contacts from the forward kinematics of its smooth cycle
     and makes the bake's 60 Hz keys (the pipeline always passes it; without it the averaged cycle's paw columns are
     read and its samples are the keys, as before). `mass` ({"kg": m or [lo, hi], "source"}; else the brief's massKg)
-    sets the cadence band; `accept_gait` is the recorded reason a gait mismatch stands."""
+    sets the cadence band; `accept_gait` is the recorded reason a gait mismatch (or an unnamed gait) stands, and
+    `accept_retime` the reason a retime outside RETIME_BOUND does. With `rig`, a one-shot's facts predict each paw at
+    every key as the bake plays it (`cycle.paws`), which `bake` checks."""
     fps = float(poses["fps"])
     frames = poses["frames"]
     every = np.array([f["values"] for f in frames], float)
@@ -475,7 +518,8 @@ def clip_facts(poses, project, brief, rest, masks=None, render=None, rig=None, m
     if mass is None and brief.get("massKg") is not None:
         mass = {"kg": brief["massKg"], "source": "brief massKg"}
     if brief["loop"]:
-        found = loop_cycle(poses, project, every, paws, chains, masks, render, rest, rig, brief, mass, accept_gait)
+        found = loop_cycle(poses, project, every, paws, chains, masks, render, rest, rig, brief, mass, accept_gait,
+                           accept_retime)
         start, period, entry, cycle_out, extra = found
         speed, speed_reason = entry["authored_speed_mps"], extra.pop("speedReason", None)
         warnings += extra.pop("warnings", [])
@@ -491,6 +535,12 @@ def clip_facts(poses, project, brief, rest, masks=None, render=None, rig=None, m
                  "frames": period, "fps": fps, "contact_windows": all_windows}
         cycle_out = {"frames": every.tolist(), "fps": fps, "periodFrames": period, "start": start,
                      "drift": {"dx": 0.0, "dz": 0.0}}
+        if rig is not None:
+            # As bake_clip keys a one-shot: dx less its mean over keys 0..n-1, every other value as fitted.
+            played = every.copy()
+            played[:, poses["names"].index("dx")] -= float(played[:period, poses["names"].index("dx")].mean())
+            predicted = motion.PlanarRig(rig).paws(played, poses["names"], project)
+            cycle_out["paws"] = {project["paws"][c]: np.round(p, 7).tolist() for c, p in predicted.items()}
         extra = {"ground": ground_block(ground, "every frame, all paws"),
                  "paws": paw_report(heights, masks, ground, project, rest)}
     target = brief.get("targetSpeedMps")
@@ -534,7 +584,7 @@ def leg_period(values, names, project, fps, period):
 
 
 def loop_cycle(poses, project, every, paws, chains, masks, render, rest, rig=None, brief=None, mass=None,
-               accept_gait=None):
+               accept_gait=None, accept_retime=None):
     """The loop's cycle from the video: period, steady cycles, phase average, the averaged cycle's check against the
     masks, the contacts, the gait and cadence checks, and (with `rig`) the 60 Hz keys. Returns (start, period, entry,
     cycle block, extra facts)."""
@@ -597,9 +647,10 @@ def loop_cycle(poses, project, every, paws, chains, masks, render, rest, rig=Non
             touchdowns[c] = contact_window(masks_of[c])[0][0]
     gait = {"plantedPaws": list(touchdowns), "neverPlants": [c for c in chains if c not in touchdowns],
             "phaseOrigin": contacts["origin"], **gait_pattern(masks_of, touchdowns, project, len(masks_of[chains[0]]))}
-    gate = gait_check(gait, brief, accept_gait)
-    cadence, warnings = cadence_check(period, fps, gate["expected"] or next(iter(gate["measured"]["reads"]), None),
-                                      mass, cycle.cycle_periods(masks, kept, period))
+    gate, warnings = gait_check(gait, brief, accept_gait)
+    cadence, more = cadence_check(period, fps, gate["expected"] or next(iter(gate["measured"]["reads"]), None),
+                                  mass, cycle.cycle_periods(masks, kept, period), accept_retime)
+    warnings += more + contacts.get("warnings", [])
     factor = cadence["retime"]
     speed = contacts["speed"]
     duration = period / fps / factor
@@ -693,14 +744,22 @@ def rig_contacts(avg, n, drift, names, project, rig, rest, chains, origin, fps, 
     touchdown = contact_window(first[origin])[0][0] if first[origin].any() else 0.0
     smooth = smooth.roll(touchdown)
     (ground, speed, reason, masks), heights = read(smooth)
+    trunk = [b for chain, bones in project["chains"].items() if chain not in cycle.leg_chains(project)
+             for b in bones if b in names]
+    pitch = motion.world_pitch_kept(planar, table, smooth, names, trunk)
+    short = {b: v for b, v in pitch.items() if v < motion.RANGE_KEEP}
+    warnings = [f"The smooth cycle keeps under {motion.RANGE_KEEP} of the video's world pitch range on "
+                f"{', '.join(f'{b} {v:.3f}' for b, v in short.items())} (each joint's own range is kept; a warning, "
+                f"not a refusal)"] if short else []
     report = {"orders": smooth.orders, "keptRange": smooth.kept_range(), "keep": motion.RANGE_KEEP,
+              "worldPitchKept": pitch, "dominantHarmonic": {k: v for k, v in smooth.dominant.items() if v != 1},
               "overtoneTaper": {k: v for k, v in smooth.taper.items() if v != 1.0},
               "gain": {k: round(v, 4) for k, v in smooth.gain.items() if v != 1.0},
               "jerkRatio": smooth.jerk_ratio(), "jerkMax": motion.JERK_MAX, "samplesPerCycle": DENSE}
     return {"masks": masks, "speed": speed, "speedReason": reason, "origin": origin, "smooth": smooth,
             "smoothReport": report, "start": float(kept[0] + touchdown * period), "groundHeight": ground,
             "ground": ground_block(ground, "smooth cycle (forward kinematics of the rig), all paws"),
-            "paws": paw_report(heights, masks, ground, project, rest), "planar": planar}
+            "paws": paw_report(heights, masks, ground, project, rest), "planar": planar, "warnings": warnings}
 
 
 def widened(window, n_keys):
@@ -753,6 +812,8 @@ def rig_keys(contacts, n_keys, names, project, rig, rest, period_s, factor):
     # The same rule without the fit-error allowance (STANCE_TOLERANCE): a pinned paw in the keys is on the ground.
     again = stance_masks(heights, vx, 0.0, speed, circular=True, gap=max(1, int(round(BRIDGE_PHASE * len(played)))),
                          extent=CONTACT_TOLERANCE)
+    jumps = motion.edge_jumps(paws, motion.release_windows(pinned, n_keys), n_keys, period_s / factor / n_keys)
+    edge_jumps = {project["paws"][c]: j for c, j in jumps.items()}
     agreement, still = {}, {}
     for chain in heights:
         bone = project["paws"][chain]
@@ -762,7 +823,15 @@ def rig_keys(contacts, n_keys, names, project, rig, rest, period_s, factor):
             world = np.abs(vx[chain] + speed) * factor
             still[bone] = round(float(np.mean(world[want] < STILL_SPEED)), 4)
     check = {"agreement": agreement, "gate": CONTACT_AGREEMENT, "plantedStillShare": still,
-             "stillSpeedMps": STILL_SPEED, "samples": len(played), "keys": n_keys}
+             "stillSpeedMps": STILL_SPEED, "samples": len(played), "keys": n_keys, "edgeJumps": edge_jumps,
+             "edgeJumpRule": "the velocity change at the first and last pinned key at most the swing's median "
+                             "per-key change"}
+    jumpy = {b: j for b, j in edge_jumps.items() if max(j["touchdownMps"], j["liftoffMps"]) > j["swingMedianMps"]}
+    if jumpy:
+        raise FactsError("A paw's velocity jumps at a contact edge more than anywhere typical in its swing: " + "; ".join(
+            f"{b} touchdown {j['touchdownMps']:.2f} m/s, liftoff {j['liftoffMps']:.2f} m/s against a swing median of "
+            f"{j['swingMedianMps']:.2f} m/s per key" for b, j in jumpy.items()) + f" (leg IK: {ik}). The pins do not "
+            f"ease in and out; check the leg chains and the IK residuals")
     low = {b: a for b, a in agreement.items() if a < CONTACT_AGREEMENT}
     if low:
         raise FactsError(f"The declared contacts and a re-detection from the baked keys disagree: they agree on "

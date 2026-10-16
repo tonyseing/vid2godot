@@ -3,7 +3,12 @@
 Task 19: verify shows the clip playing. For each of PHASES the verifier's folder is copied and its capture script
 patched (`phase_verifier`) to seek the clip to that phase of its length before every capture, to name each PNG for the
 phase and to record the phase, the clip and the clip time in each capture entry; the 3D skill's own files are never
-changed. A patch marker the capture script no longer holds is a refusal, not a capture of the rest pose."""
+changed. A patch marker the capture script no longer holds is a refusal, not a capture of the rest pose.
+
+Fix round 1, ruling 5: that the clip plays is measured, not self-reported. The patch also records the paw bones'
+world positions at each phase, and `phase_evidence` requires, for each profile and view, that the captures of every
+two phases differ (image hash, and a share of pixels over PIXEL_FLOOR differing by more than PIXEL_TOLERANCE in some
+channel), and that some paw bone moves more than PAW_MOVE_MIN between every two phases."""
 import json
 import math
 import os
@@ -18,6 +23,9 @@ from anim.ledger import StageError, sha256_file
 DEFAULT = Path.home() / ".agents/skills/game-asset-3d-pipeline/forge/godot/verify.py"
 PHASES = (0.0, 1 / 3, 2 / 3)
 CAPTURE_SCRIPT = "capture_asset.gd"
+PIXEL_FLOOR = 0.001        # share of a capture's pixels that must differ between two phases
+PIXEL_TOLERANCE = 8        # a pixel differs when a channel differs by more than this (of 255)
+PAW_MOVE_MIN = 0.005       # m: some paw bone moves at least this far between two phases
 SEEK = """
 \tvar clip_player: AnimationPlayer = null
 \tfor node in model.find_children("*", "AnimationPlayer", true, false):
@@ -31,15 +39,31 @@ SEEK = """
 \tclip_player.play(CLIP_NAME)
 \tclip_player.seek(clip_seconds, true)
 \tclip_player.pause()
+\tvar paw_positions := {}
+\tvar paw_skeleton: Skeleton3D = null
+\tfor node in model.find_children("*", "Skeleton3D", true, false):
+\t\tpaw_skeleton = node as Skeleton3D
+\t\tbreak
+\tif paw_skeleton == null:
+\t\t_fail("No Skeleton3D in the GLB to read the paw bones from")
+\t\treturn
+\tfor paw_name in PAW_BONES:
+\t\tvar bone_index: int = paw_skeleton.find_bone(str(paw_name))
+\t\tif bone_index < 0:
+\t\t\t_fail("The GLB's skeleton has no paw bone " + str(paw_name))
+\t\t\treturn
+\t\tvar paw_origin: Vector3 = paw_skeleton.global_transform * paw_skeleton.get_bone_global_pose(bone_index).origin
+\t\tpaw_positions[str(paw_name)] = [paw_origin.x, paw_origin.y, paw_origin.z]
 """
 # (what the 3D skill's capture script holds, what vid2godot puts there); each must occur exactly once.
 PATCHES = (("extends SceneTree\n", "extends SceneTree\n\nconst CLIP_NAME := {clip}\nconst CLIP_PHASE := {phase}\n"
-                                    "const PHASE_TAG := {tag}\n"),
+                                    "const PHASE_TAG := {tag}\nconst PAW_BONES := {paws}\n"),
            ("\tscene.add_child(model)\n", "\tscene.add_child(model)\n" + SEEK.lstrip("\n")),
            ('"captures/%s-%s.png" % [profile["name"], view["name"]]',
             '"captures/phase%03d-%s-%s.png" % [PHASE_TAG, profile["name"], view["name"]]'),
            ('captures.append({"path": filename,',
-            'captures.append({"phase": CLIP_PHASE, "clip": CLIP_NAME, "clipSeconds": clip_seconds, "path": filename,'))
+            'captures.append({"phase": CLIP_PHASE, "clip": CLIP_NAME, "clipSeconds": clip_seconds, "paws": paw_positions, '
+            '"path": filename,'))
 
 
 class VerifyError(StageError):
@@ -58,9 +82,10 @@ def phase_tag(phase):
     return int(round(phase * 1000))
 
 
-def phase_verifier(script, clip, phase, out_dir):
+def phase_verifier(script, clip, phase, out_dir, paw_bones=()):
     """A copy of the verifier's folder in `out_dir` whose capture script seeks `clip` to `phase` (a share of its
-    length) before capturing; returns the copy's verify.py. Refuses when the capture script lacks a patch point."""
+    length) before capturing and records `paw_bones`' world positions there; returns the copy's verify.py. Refuses
+    when the capture script lacks a patch point."""
     script, out_dir = Path(script), Path(out_dir)
     source = script.parent / CAPTURE_SCRIPT
     if not source.is_file():
@@ -72,7 +97,8 @@ def phase_verifier(script, clip, phase, out_dir):
                               f"{marker.strip()!r}, where vid2godot seeks the clip to each phase; update "
                               f"anim/verify.py's PATCHES")
         text = text.replace(marker, replacement.replace("{clip}", json.dumps(clip))
-                            .replace("{phase}", f"{phase:.6f}").replace("{tag}", str(phase_tag(phase))))
+                            .replace("{phase}", f"{phase:.6f}").replace("{tag}", str(phase_tag(phase)))
+                            .replace("{paws}", json.dumps([str(b) for b in paw_bones])))
     if out_dir.exists():
         shutil.rmtree(out_dir)
     shutil.copytree(script.parent, out_dir, ignore=shutil.ignore_patterns("__pycache__"))
@@ -85,7 +111,9 @@ def combine(reports, script):
     captures (each with its phase), the phases and runs, and the 3D skill's verifier the patches were made from."""
     first = reports[0][2]
     source = Path(script).parent / CAPTURE_SCRIPT
-    return {**first, "captures": [c for _, _, r in reports for c in (r.get("captures") or [])],
+    # The worst run's status: one failed phase fails the engine's report.
+    status = next((r.get("status") for _, _, r in reports if r.get("status") != "passed"), "passed")
+    return {**first, "status": status, "captures": [c for _, _, r in reports for c in (r.get("captures") or [])],
             "phases": [round(p, 6) for p, _, _ in reports],
             "runs": [{"phase": round(p, 6), "report": str(path), "status": r.get("status"),
                       "captureScriptSha256": sha256_file(Path(path).parent / "verifier" / CAPTURE_SCRIPT)
@@ -93,6 +121,69 @@ def combine(reports, script):
                      for p, path, r in reports],
             "verifier": {"path": str(script), "sha256": sha256_file(script),
                          "captureScriptSha256": sha256_file(source) if source.is_file() else None}}
+
+
+def pixels_differ(a, b, tolerance=PIXEL_TOLERANCE):
+    """The share of pixels that differ by more than `tolerance` in some channel (1.0 for different sizes)."""
+    import numpy as np
+    from PIL import Image
+    with Image.open(a) as first, Image.open(b) as second:
+        x, y = np.asarray(first.convert("RGB"), int), np.asarray(second.convert("RGB"), int)
+    if x.shape != y.shape:
+        return 1.0
+    return float(np.mean(np.abs(x - y).max(axis=2) > tolerance))
+
+
+def phase_evidence(runs):
+    """That the clip plays, from one engine's phase runs [(phase, report)]: (evidence, problems). For each
+    profile/view, every two phases' captures must differ (hash, and pixels over PIXEL_FLOOR); for every two phases,
+    some paw bone must move over PAW_MOVE_MIN."""
+    views, paws, problems = {}, {}, []
+    for phase, report in runs:
+        for item in report.get("captures") or []:
+            if not isinstance(item, dict) or not isinstance(item.get("path"), str):
+                continue
+            views.setdefault(f"{item.get('profile')}/{item.get('view')}", {})[phase] = item["path"]
+            if isinstance(item.get("paws"), dict) and phase not in paws:
+                paws[phase] = item["paws"]
+    evidence = {"pixelFloor": PIXEL_FLOOR, "pixelTolerance": PIXEL_TOLERANCE, "pawMoveMin": PAW_MOVE_MIN,
+                "views": {}, "paws": []}
+    phases = [phase for phase, _ in runs]
+    for key, by_phase in sorted(views.items()):
+        pairs = []
+        for i, a in enumerate(phases):
+            for b in phases[i + 1:]:
+                if a not in by_phase or b not in by_phase:
+                    problems.append(f"{key}: no capture at phase {a if a not in by_phase else b:.2f}")
+                    continue
+                files = [Path(by_phase[a]), Path(by_phase[b])]
+                if not all(f.is_file() for f in files):
+                    continue          # check_report names the missing file
+                same = sha256_file(files[0]) == sha256_file(files[1])
+                share = 0.0 if same else pixels_differ(*files)
+                pairs.append({"phases": [round(a, 6), round(b, 6)], "sameHash": same,
+                              "pixelsDiffer": round(share, 6)})
+                if same or share <= PIXEL_FLOOR:
+                    problems.append(f"{key}: phases {a:.2f} and {b:.2f} render the same image "
+                                    f"({'same hash' if same else 'different hash'}; {share:.4f} of the pixels differ, "
+                                    f"floor {PIXEL_FLOOR:g}): the clip is not playing in the captures")
+        evidence["views"][key] = pairs
+    for i, a in enumerate(phases):
+        if a not in paws:
+            problems.append(f"phase {a:.2f} records no paw positions: the capture script was not patched to read them")
+            continue
+        for b in phases[i + 1:]:
+            if b not in paws:
+                continue
+            bones = sorted(set(paws[a]) & set(paws[b]))
+            moves = {bone: math.dist(paws[a][bone], paws[b][bone]) for bone in bones}
+            largest = max(moves.values(), default=0.0)
+            evidence["paws"].append({"phases": [round(a, 6), round(b, 6)], "maxMoveM": round(largest, 6),
+                                     "moves": {k: round(v, 6) for k, v in moves.items()}})
+            if largest <= PAW_MOVE_MIN:
+                problems.append(f"phases {a:.2f} and {b:.2f}: no paw bone moved (largest {largest:.4f} m, floor "
+                                f"{PAW_MOVE_MIN:g} m; {', '.join(bones) or 'no bones'}): the clip is not playing")
+    return evidence, problems
 
 
 def run_verify(script, model, out, godot, launcher=None):

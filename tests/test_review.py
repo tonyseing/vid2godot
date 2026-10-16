@@ -96,6 +96,59 @@ class ReviewTests(unittest.TestCase):
         timeline = review.contact_timeline({"frames": frames}, project, rest)
         self.assertEqual(timeline, {"paw_hl": [True] * 3 + [False] * 3, "paw_fl": [False] * 3 + [True] * 3})
 
+    def test_contact_timeline_uses_the_declared_contacts_of_facts(self):
+        """Fix round 1, ruling 8: once facts has run, the lab's strip is facts' declared contacts (height AND
+        stillness) at each frame's phase of the cycle, so lab and facts agree; a one-shot's are its windows."""
+        project = {"paws": {"hind_L": "paw_hl", "front_L": "paw_fl"}}
+        frames = [{"paws": {"hind_L": [0.0, 0.0], "front_L": [0.0, 0.0]}} for _ in range(6)]
+        loop = {"start": 2.0, "period": 4.0, "entry": {"loop": True, "contacts": {"paw_hl": [0.0, 0.5],
+                                                                                   "paw_fl": [0.75, 0.25]}}}
+        timeline = review.contact_timeline({"frames": frames}, project, {"hind_L": 0.0, "front_L": 0.0}, loop)
+        self.assertEqual(timeline["paw_hl"], [False, False, True, True, False, False])
+        self.assertEqual(timeline["paw_fl"], [False, True, True, False, False, True])
+        shot = {"entry": {"loop": False, "contact_windows": {"paw_hl": [[0.0, 0.5]], "paw_fl": []}}}
+        timeline = review.contact_timeline({"frames": frames[:5]}, project, {"hind_L": 0.0, "front_L": 0.0}, shot)
+        self.assertEqual(timeline, {"paw_hl": [True, True, False, False, False], "paw_fl": [False] * 5})
+
+    def test_contact_timeline_before_facts_needs_stillness_too(self):
+        """Before facts, the strip reads facts' rule from the frames: near the shared ground AND world-still, so a
+        low paw sliding with the body is not on the ground."""
+        project = {"paws": {"hind_L": "paw_hl", "hind_R": "paw_hr", "front_L": "paw_fl"}}
+        frames = [{"paws": {"hind_L": [-f / 24.0, 0.0 if f < 6 else 0.1], "hind_R": [-f / 24.0, 0.0 if f >= 6 else 0.1],
+                            "front_L": [0.0, 0.0 if f < 3 else 0.1]}, "index": f} for f in range(12)]
+        timeline = review.contact_timeline({"frames": frames, "fps": 24.0}, project,
+                                           {"hind_L": 0.0, "hind_R": 0.0, "front_L": 0.0})
+        self.assertEqual(timeline["paw_hl"], [True] * 6 + [False] * 6)
+        self.assertFalse(any(timeline["paw_fl"]), "low, but sliding with the body")
+
+    @unittest.skipUnless(shutil.which("node"), "node runs the lab's script")
+    def test_the_lab_escapes_names_and_values(self):
+        """Fix round 1, ruling 8: bone names and values reach the page as text, never as markup."""
+        import subprocess
+        bad = "<img src=x onerror=alert(1)>"
+        motion = review.motion_summary({"cadence": {"videoHz": bad, "hz": 2.5, "retime": 1.0, "bandHz": None,
+                                                    "massKg": None, "massSource": bad},
+                                        "gaitCheck": {"expected": bad, "measured": {"text": bad, "reads": [bad]},
+                                                      "accepted": bad},
+                                        "contactCheck": {"agreement": {bad: bad}, "gate": bad,
+                                                         "edgeJumps": {bad: {"touchdownMps": bad, "liftoffMps": 1,
+                                                                             "swingMedianMps": 2}}},
+                                        "warnings": [bad], "entry": {"contacts": {bad: [bad, bad]}}})
+        page = review.lab_page("lope", REPORT, 0.9, {bad: [True, False]}, {"glb": "ab" * 32}, motion)
+        script = page.split("<script>", 1)[1].split("</script>", 1)[0]
+        stub = """
+const nodes = {};
+const document = {getElementById: (id) => (nodes[id] = nodes[id] || {id, value: "", style: {}}), onkeydown: null};
+const navigator = {clipboard: {writeText: async () => {}}};
+""" + script + """
+console.log(JSON.stringify(Object.values(nodes).map((n) => n.innerHTML || "").join("\\n")));
+"""
+        out = subprocess.run(["node", "-e", stub], capture_output=True, text=True, timeout=60)
+        self.assertEqual(out.returncode, 0, out.stderr)
+        html = json.loads(out.stdout)
+        self.assertNotIn("<img", html)
+        self.assertIn("&lt;img src=x onerror=alert(1)&gt;", html)
+
     def failing(self, template=None):
         filled = json.loads(json.dumps(template or self.template))
         filled.update({"reviewer": "agent", "verdict": "fail", "observations": "legs jump back at frame 2"})

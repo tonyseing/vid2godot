@@ -53,23 +53,29 @@ const width = 1000 / frames.length;
 $("chart").innerHTML = `<line x1="0" x2="1000" y1="${120 - DATA.threshold * 110}" y2="${120 - DATA.threshold * 110}" stroke="currentColor" stroke-dasharray="4 4"/>` +
   `<polyline fill="none" stroke="var(--accent)" stroke-width="2" points="${frames.map((f, i) => `${i * width + width / 2},${120 - f.iou * 110}`).join(" ")}"/>` +
   frames.map((f, i) => (f.flags.length || f.iou < DATA.threshold) ? `<rect x="${i * width}" y="0" width="${width}" height="6" fill="var(--low)"/>` : "").join("");
+// Every name and value reaches the page as text (fix round 1): bone names and facts' values are escaped.
+const text = (v) => String(v).replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;")
+  .replace(/"/g, "&quot;").replace(/'/g, "&#39;");
+const list = (v) => (Array.isArray(v) ? v : []).map(text).join("-");
 $("contacts").innerHTML = Object.entries(DATA.timeline).map(([paw, on]) =>
-  `<div class="paw"><span>${paw}</span><div class="bar">${on.map((c) => `<span class="${c ? "on" : ""}"></span>`).join("")}</div></div>`).join("");
+  `<div class="paw"><span>${text(paw)}</span><div class="bar">${(Array.isArray(on) ? on : []).map((c) => `<span class="${c ? "on" : ""}"></span>`).join("")}</div></div>`).join("");
 if (DATA.motion) {
   const m = DATA.motion, c = m.cadence || {}, g = m.gait || {}, k = m.contactCheck || {};
   const row = (name, value) => `<div class="paw"><span>${name}</span><span>${value}</span></div>`;
-  const text = (v) => String(v).replace(/&/g, "&amp;").replace(/</g, "&lt;");
   $("motion").className = "";
   $("motion").innerHTML = [
-    row("Cadence", `video ${c.videoHz} Hz, played ${c.hz} Hz; band ${c.bandHz ? c.bandHz.join("-") + " Hz" : "none"}` +
-      ` (${c.massKg ? c.massKg.join("-") + " kg, " + text(c.massSource) : "no mass"})`),
-    row("Retime", c.retime === 1 ? "none" : `<b class="low">x${c.retime}</b> (speed and duration scaled)`),
+    row("Cadence", `video ${text(c.videoHz)} Hz, played ${text(c.hz)} Hz; band ${c.bandHz ? list(c.bandHz) + " Hz" : "none"}` +
+      ` (${c.massKg ? list(c.massKg) + " kg, " + text(c.massSource) : "no mass"})`),
+    row("Retime", c.retime === 1 ? "none" : `<b class="low">x${text(c.retime)}</b> (speed and duration scaled)`),
     row("Gait", `brief: ${text(g.expected)}; measured: ${text((g.measured || {}).text)}; reads as ` +
       `${text(((g.measured || {}).reads || []).join(", ") || "none")}` +
-      (g.accepted ? `; <b class="low">mismatch accepted: ${text(g.accepted)}</b>` : "")),
-    row("Contacts", Object.entries(m.contacts || {}).map(([p, w]) => `${p} ${w[0]}-${w[1]}`).join(" · ")),
-    row("Keys check", Object.entries(k.agreement || {}).map(([p, a]) => `${p} ${a}`).join(" · ") +
-      (k.gate ? ` (gate ${k.gate})` : "")),
+      (g.accepted ? `; <b class="low">accepted: ${text(g.accepted)}</b>` : "")),
+    row("Contacts", Object.entries(m.contacts || {}).map(([p, w]) => `${text(p)} ${list(w)}`).join(" · ")),
+    row("Keys check", Object.entries(k.agreement || {}).map(([p, a]) => `${text(p)} ${text(a)}`).join(" · ") +
+      (k.gate ? ` (gate ${text(k.gate)})` : "")),
+    row("Edge jumps", Object.entries(k.edgeJumps || {}).map(([p, j]) => `${text(p)} touchdown ${text(j.touchdownMps)}, ` +
+      `liftoff ${text(j.liftoffMps)}, swing median ${text(j.swingMedianMps)} m/s`).join(" · ") || "none"),
+    ...(m.warnings || []).map((w) => row("Warning", `<b class="low">${text(w)}</b>`)),
   ].join("");
 }
 $("slider").oninput = (e) => show(Number(e.target.value));

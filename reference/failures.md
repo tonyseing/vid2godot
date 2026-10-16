@@ -51,6 +51,12 @@
 |---|---|---|
 | "changed after the template was made" | An output changed after `review --template` | Run `review --template` again and review the new output |
 | "Round N was already reviewed" | A revised output needs a new round | `review --template`, then review |
+| `facts`: "The brief ... names no gait facts can check" | The loop brief's `gait` names none of walk, trot, pace, canter/lope, gallop (or their -ing forms) | Name the gait in the brief, or `facts --accept-gait "<why>"` (a warning in facts.json, the ledger and the lab) |
+| `facts`: "The cadence retime F ... is outside 0.5-2.0" | The video is far slower than the body size says, or the mass is wrong | Check the mass (brief `massKg`, `--mass-kg`); if it stands, `facts --accept-retime "<why>"` |
+| `facts` warns: "Body mass ... of an open mesh (N open edges)" | The mass is the rig's mesh volume and the mesh is not closed | Give the brief's `massKg` or `facts --mass-kg`; nothing is retimed on that mass |
+| `facts`: "A paw's velocity jumps at a contact edge" | The pin does not ease in or out (`contactCheck.edgeJumps` against the swing's median) | Check the leg chains and the `ik` residuals; the pins should ease over 4 keys |
+| `facts` warns: "keeps under 0.95 of the video's world pitch range" | A trunk or tail bone's world pitch is a small sum of joints the smoothing moved apart | Look at that bone in the sheet; its own joint range is kept |
+| `verify`: "phases ... render the same image" / "no paw bone moved" | The captures do not show the clip playing (the seek did nothing, or the clip does not move those bones) | Open the captures; check the patched `capture_asset.gd` and the GLB's clip |
 | `verify`: "The 3D skill's capture script changed" | game-asset-3d-pipeline's `capture_asset.gd` no longer holds a line vid2godot patches to seek the clip to each phase | Update `PATCHES` in `anim/verify.py` to the new script; never verify the rest pose alone |
 | `verify`: "Capture ... records phase ..., not phase ..." | A capture was not taken at its run's clip phase | Rerun `verify`; if it persists, check the patched `verify/<engine>/phaseNNN/verifier/capture_asset.gd` |
 | "Frame N needs an explanation, or a re-mark and refit" | A low or flagged frame has no `action: "explained"` and note | Explain what the overlay shows, or mark and refit |
