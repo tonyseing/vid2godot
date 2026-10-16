@@ -78,6 +78,22 @@ class GenerateTests(unittest.TestCase):
         for phrase in ("No cuts, no zoom", "Exactly four legs", "light grey (#c8c8c8)", "grey wolf, loping"):
             self.assertIn(phrase, prompt)
 
+    def test_slow_motion_prompt(self):
+        """Task 20: a brief's slowMotion asks for the motion in slow motion with every step clearly visible, the
+        factor stated; the strict lines stay. Without it the prompt is unchanged."""
+        plain = generate.build_prompt(BRIEF, "#c8c8c8")
+        self.assertNotIn("slow motion", plain.lower())
+        self.assertEqual(generate.build_prompt({**BRIEF, "slowMotion": None}, "#c8c8c8"), plain)
+        prompt = generate.build_prompt({**BRIEF, "slowMotion": 3}, "#c8c8c8")
+        for phrase in ("slow motion", "3 times slower than real time", "every step clearly visible",
+                       "No cuts, no zoom", "Exactly four legs", "The same animal", "Strict side profile",
+                       "camera tracks alongside", "grey wolf, loping"):
+            self.assertIn(phrase, prompt)
+        self.assertIn("2.5 times slower", generate.build_prompt({**BRIEF, "slowMotion": 2.5}, "#c8c8c8"))
+        for line in plain.splitlines():
+            self.assertIn(line, prompt)
+        self.assertTrue(prompt.splitlines()[0].startswith(plain.splitlines()[0] + " Filmed in slow motion"))
+
     def test_two_candidates_recorded(self):
         client = FakeClient()
         record = generate.run_generate(client, self.tmp / "gen", "bytedance/seedance-2.5", BRIEF, self.png, "#c8c8c8")

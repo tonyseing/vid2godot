@@ -64,9 +64,10 @@ if (DATA.motion) {
   const row = (name, value) => `<div class="paw"><span>${name}</span><span>${value}</span></div>`;
   $("motion").className = "";
   $("motion").innerHTML = [
-    row("Cadence", `video ${text(c.videoHz)} Hz, played ${text(c.hz)} Hz; band ${c.bandHz ? list(c.bandHz) + " Hz" : "none"}` +
+    row("Cadence", `video ${text(c.videoHz)} Hz, played ${text(c.hz)} Hz; ${text(c.gait || "")} band ${c.bandHz ? list(c.bandHz) + " Hz" : "none"}` +
       ` (${c.massKg ? list(c.massKg) + " kg, " + text(c.massSource) : "no mass"})`),
-    row("Retime", c.retime === 1 ? "none" : `<b class="low">x${text(c.retime)}</b> (speed and duration scaled)`),
+    row("Retime", (c.retime === 1 ? "none" : `<b class="low">x${text(c.retime)}</b> (speed and duration scaled)`) +
+      (c.expectedRetime && c.expectedRetime !== 1 ? `; brief slowMotion expected x${text(c.expectedRetime)}` : "")),
     row("Gait", `brief: ${text(g.expected)}; measured: ${text((g.measured || {}).text)}; reads as ` +
       `${text(((g.measured || {}).reads || []).join(", ") || "none")}` +
       (g.accepted ? `; <b class="low">accepted: ${text(g.accepted)}</b>` : "")),

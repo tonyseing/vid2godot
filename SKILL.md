@@ -27,15 +27,15 @@ From the project root: `python3 <skill>/anim/pipeline.py <command> --work asset-
 |---|---|
 | `init --model <glb> --clip <name>` | Start the ledger |
 | `contract --project-contract <json>` | Check the rig |
-| `brief --file <json>` | `clip subject motion gait loop planar videoSeconds`; a loop needs two cycles |
+| `brief --file <json>` | `clip subject motion gait loop planar videoSeconds`; a loop needs two cycles. Small fast animal: `slowMotion` |
 | `reference` | Open `reference/reference.png` |
 | `generate --model-id <id> [--max-cost USD]` | Two candidates |
 | `accept --candidate N --checks <json>` | After opening both strips and full frames (`reference/prompting.md`) |
-| `ingest` | Drops pulldown repeats. Read `flags`, `warnings` |
+| `ingest` | Drops pulldown repeats; read `flags`, `warnings` |
 | `fit` | Clip-wide camera scale and leg identity; restarts, leg swaps and a periodic second pass. Prints `lowFrames` |
 | `lab` | Open `review/lab.html`, every low frame's overlay |
 | `gridframe --frame N`; `fit --marks <json> --span A:B` | Fix flips (below) |
-| `facts [--mass-kg KG] [--accept-gait REASON] [--accept-retime REASON]` | Period and averaged cycle from the video (refuses under 0.85 IoU); contacts from the motion (near the ground, world-still). Refuses footfalls unlike the brief's `gait` unless you record why; retimes a slow video to the body-size cadence band (brief `massKg` or `--mass-kg`); 60 Hz keys with planted paws pinned, refused if they disagree with the contacts. `reference/motion.md` |
+| `facts [--mass-kg KG] [--accept-gait REASON] [--accept-retime REASON]` | Period and averaged cycle from the video (refuses under 0.85 IoU); contacts from the motion (near the ground, world-still). Refuses footfalls unlike the brief's `gait` unless accepted; refuses a stride under 10 frames (`slowMotion`); retimes a slow video to the gait's body-size cadence band (brief `massKg` or `--mass-kg`); 60 Hz keys, planted paws pinned, checked against contacts. `reference/motion.md` |
 | `bake` | Keys facts' cycle; refuses if a paw misses facts' pin. Open `bake/sheet.png`, `bake/closeup.png` |
 | `review --template`; `review --file <json>` | Fill it from what you saw; explain or refit low frames |
 | `verify --godot47 <bin> --godot45 <bin> --launcher <launcher>` | Phone/tablet captures of the clip playing (phases 0, 1/3, 2/3) on both engines via game-asset-3d-pipeline's `verify.py`. Open every capture |
@@ -56,7 +56,7 @@ Keys are the contract's `paws` bones. More fixes: `reference/failures.md`.
 
 ## Shipping
 
-`export` refuses `game/assets`; this skill ends there. Show the owner the bundle. Passing `review` and `verify`
+`export` refuses `game/assets`. Show the owner the bundle. Passing `review` and `verify`
 is mechanical, not approval: the clip enters the game only once the owner approves. Owner notes ("frame 47, legs
 jump back") become marks or a span refit and a new review; after two failed artistic rounds, ask whether to go on.
 

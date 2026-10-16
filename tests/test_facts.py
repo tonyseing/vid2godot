@@ -43,7 +43,7 @@ def gallop_values(period, frames=120, powers=(0.6, 0.3, 0.1)):
                      for p in PHASES.values()], axis=1)
 
 
-def analytic_values(f, period=9.6, amplitude=0.015):
+def analytic_values(f, period=10.4, amplitude=0.015):
     """Every value column as a known function of (real) frame time: the root offsets are linear, so linear
     interpolation is exact on them and they expose any error in the sample times; the joints are sines whose
     amplitude keeps the linear-interpolation error, amplitude * (2 pi / period)^2 / 8 ~ 8.0e-4, under 1e-3."""
@@ -109,8 +109,10 @@ class FactsTests(unittest.TestCase):
         self.assertAlmostEqual(entry["footfall_phase"]["paw_fl"], 0.25, delta=1 / 12)
         self.assertAlmostEqual(entry["duty_factor"]["paw_hr"], 0.5, delta=1 / 12)
         self.assertEqual(list(entry)[:5], ["duration_s", "loop", "authored_speed_mps", "stride_m", "contacts"])
-        # Changed with fix round 1: the toy brief names no gait, which is accepted and warned about.
-        self.assertEqual([w for w in result["warnings"] if not w.startswith("Gait not checked")], [])
+        # Changed with fix round 1: the toy brief names no gait, which is accepted and warned about. Task 20: every
+        # gait has a cadence band, so the toy's (read as a walk) warns that it has no body mass to check against.
+        self.assertEqual([w for w in result["warnings"] if not w.startswith(("Gait not checked",
+                                                                              "Cadence not checked"))], [])
         cycle = result["cycle"]
         self.assertEqual(len(cycle["frames"]), 13)
         self.assertEqual(cycle["frames"][-1], cycle["frames"][0])
@@ -121,7 +123,8 @@ class FactsTests(unittest.TestCase):
         self.assertGreaterEqual(result["start"], 6, "the cycle starts after the lead-in")
 
     def test_fractional_period(self):
-        for truth, n in ((9.6, 10), (12.4, 12)):
+        # Task 20: 10.4, not 9.6, frames: a stride under facts.MIN_STRIDE_FRAMES (10) is refused.
+        for truth, n in ((10.4, 10), (12.4, 12)):
             with self.subTest(period=truth):
                 result = run(synthetic(frames=120, period=truth))
                 entry, cycle = result["entry"], result["cycle"]
@@ -156,14 +159,14 @@ class FactsTests(unittest.TestCase):
         # Fix round 2: the bake (Task 11) keys cycle.frames, so check them against the analytic clip (now: the
         # average, over the cycles facts averaged, of the analytic clip at each cycle's phase samples). The toy video
         # draws the small analytic angles at a visible gain.
-        poses = synthetic(frames=120, period=9.6)
+        poses = synthetic(frames=120, period=10.4)
         for entry in poses["frames"]:
             entry["values"] = analytic_values(entry["index"])
         result = run(poses, gain=1 / 0.015)
         cycle = result["cycle"]
         period, keys = cycle["periodFrames"], cycle["frames"]
         n = len(keys) - 1
-        self.assertAlmostEqual(period, 9.6, delta=0.1)
+        self.assertAlmostEqual(period, 10.4, delta=0.1)
         self.assertEqual(n, 10)
         self.assertEqual(n, result["entry"]["frames"])
         np.testing.assert_allclose(np.array(keys[:n]), expected_cycle(result, analytic_values), rtol=0, atol=1e-3)
@@ -206,7 +209,7 @@ class FactsTests(unittest.TestCase):
 
     def test_drift_at_a_sub_frame_period(self):
         # analytic_values' root offsets are linear in frame time, so the resample at s + P is exact on them.
-        poses = synthetic(frames=120, period=9.6)
+        poses = synthetic(frames=120, period=10.4)
         for entry in poses["frames"]:
             entry["values"] = analytic_values(entry["index"])
         result = run(poses, gain=1 / 0.015)
@@ -739,7 +742,7 @@ class CadenceTests(unittest.TestCase):
     BRIEF = {**LOPE, "gait": "canid lope: a 3-beat canter", "massKg": 200, "targetSpeedMps": None}
 
     def test_the_band_for_a_mass(self):
-        self.assertEqual([round(x, 2) for x in facts.cadence_band([30, 50])], [2.41, 2.61])
+        self.assertEqual([round(x, 2) for x in facts.cadence_band([30, 50], "canter")], [2.41, 2.61])
         self.assertEqual(facts.mass_range(40), [30.0, 50.0])
         self.assertEqual(facts.mass_range([20, 25]), [20.0, 25.0])
 
@@ -770,7 +773,8 @@ class CadenceTests(unittest.TestCase):
         self.assertTrue(any("mass" in w for w in result["warnings"]))
 
     def test_a_fast_video_warns_and_is_not_retimed(self):
-        result = run(lope(period=8, frames=96), brief=self.BRIEF)
+        # Task 20: 10 frames (2.4 Hz, over the 200 kg band), not 8: a stride under 10 frames is refused.
+        result = run(lope(period=10, frames=120), brief=self.BRIEF)
         self.assertEqual(result["cadence"]["retime"], 1.0)
         self.assertTrue(any("above" in w for w in result["warnings"]))
 
@@ -810,10 +814,102 @@ class CadenceTests(unittest.TestCase):
         closed = run(lope(), brief={**self.BRIEF, "massKg": None}, mass={"kg": 200, "source": source, "openEdges": 0})
         self.assertGreater(closed["cadence"]["retime"], 1.5)
 
-    def test_trots_and_walks_have_no_band(self):
-        result = run(lope(), brief={**self.BRIEF, "gait": "trot"}, accept_gait="test")
-        self.assertIsNone(result["cadence"]["bandHz"])
+    def test_every_gait_has_a_band(self):
+        """Task 20: Heglund & Taylor 1988 (Table 3) bands per gait over the mass range: the preferred trotting speed
+        (3.35 M^-0.130) for a trot or a pace, the preferred galloping speed (4.44 M^-0.156, unchanged: 2.41-2.61 Hz
+        at 30-50 kg) for a canter/lope or any gallop, and a walk from the minimum trotting speed (2.42 M^-0.091) at
+        half its Froude number (x 0.5^0.2)."""
+        def band(a, b, kg):
+            return [a * kg[1] ** b, a * kg[0] ** b]
+        wolf, vole = [30.0, 50.0], facts.mass_range(0.03)
+        walk_a = 2.42 * 0.5 ** 0.2
+        for kg in (wolf, vole):
+            for gait, (a, b) in (("walk", (walk_a, -0.091)), ("trot", (3.35, -0.130)), ("pace", (3.35, -0.130)),
+                                 ("canter", (4.44, -0.156)), ("gallop", (4.44, -0.156)),
+                                 ("transverse gallop", (4.44, -0.156)), ("rotary gallop", (4.44, -0.156))):
+                with self.subTest(gait=gait, kg=kg):
+                    np.testing.assert_allclose(facts.cadence_band(kg, gait), band(a, b, kg), rtol=1e-9)
+        self.assertEqual([round(x, 2) for x in facts.cadence_band(wolf, "gallop")], [2.41, 2.61])
+        centres = {g: sum(facts.cadence_band(40, g)) / 2 for g in ("walk", "trot", "canter")}
+        self.assertLess(centres["walk"], centres["trot"])
+        self.assertLess(centres["trot"], centres["canter"])
+        self.assertAlmostEqual(sum(facts.cadence_band(0.03, "trot")) / 2, 5.3, delta=0.1)
+        with self.assertRaisesRegex(facts.FactsError, "amble"):
+            facts.cadence_band(40, "amble")
+
+    def test_a_trot_and_a_walk_are_retimed_to_their_own_bands(self):
+        """Task 20: the retime is no longer for gallops only; a trot or a walk the brief names is checked against
+        its own band and a slow video is retimed to its centre."""
+        for words, gait, law in (("a working trot", "trot", "3.35 M^-0.130"),
+                                 ("a lateral walk", "walk", "M^-0.091")):
+            with self.subTest(gait=gait):
+                result = run(lope(), brief={**self.BRIEF, "gait": words}, accept_gait="test: the toy lope")
+                cadence = result["cadence"]
+                self.assertEqual(cadence["gait"], gait)
+                self.assertIs(cadence["checked"], True)
+                np.testing.assert_allclose(cadence["bandHz"], facts.cadence_band([150, 250], gait), atol=1e-4)
+                centre = sum(cadence["bandHz"]) / 2
+                self.assertGreater(cadence["retime"], 1.0)
+                self.assertAlmostEqual(cadence["retime"], centre / cadence["videoHz"], places=3)
+                self.assertIn(law, cadence["law"])
+                self.assertAlmostEqual(result["entry"]["duration_s"], result["period"] / 24.0 / cadence["retime"],
+                                       places=6)
+                self.assertTrue(any("retimed" in w and gait in w for w in result["warnings"]), result["warnings"])
+
+    def test_slow_motion_is_the_expected_retime(self):
+        """Task 20: the brief's slowMotion is the expected retime; the measured cadence still decides, both are
+        recorded, and the 0.5-2.0 bound is on the measured factor over the expected one."""
+        brief = {**self.BRIEF, "massKg": 40}
+        result = run(lope(), brief={**brief, "slowMotion": 2})
+        cadence = result["cadence"]
+        self.assertEqual(cadence["expectedRetime"], 2)
+        self.assertAlmostEqual(cadence["retime"], 2.09, delta=0.01)
+        self.assertAlmostEqual(cadence["retimeVsExpected"], cadence["retime"] / 2, places=4)
+        self.assertNotIn("retimeAccepted", cadence)
+        self.assertTrue(any("slowMotion 2" in w and "2.09" in w for w in result["warnings"]), result["warnings"])
+        plain = run(lope(), brief=self.BRIEF)["cadence"]
+        self.assertEqual(plain["expectedRetime"], 1.0)
+
+    def test_slow_motion_far_from_the_measured_retime_is_refused_unless_accepted(self):
+        brief = {**self.BRIEF, "slowMotion": 4}
+        with self.assertRaisesRegex(facts.FactsError, r"retime 1\.6.*slowMotion 4.*0\.5-2\.0.*--accept-retime"):
+            run(lope(), brief=brief)
+        result = run(lope(), brief=brief, accept_retime="the video came out nearer real time")
+        self.assertAlmostEqual(result["cadence"]["retime"], 1.62, delta=0.02)
+        self.assertEqual(result["cadence"]["retimeAccepted"], "the video came out nearer real time")
+
+    def test_slow_motion_asked_for_but_the_video_is_not_slow_warns(self):
+        result = run(lope(period=10, frames=120), brief={**self.BRIEF, "slowMotion": 2})
         self.assertEqual(result["cadence"]["retime"], 1.0)
+        self.assertEqual(result["cadence"]["expectedRetime"], 2)
+        self.assertTrue(any("slowMotion 2" in w and "not retimed" in w for w in result["warnings"]),
+                        result["warnings"])
+
+    def test_a_stride_under_ten_frames_is_refused_with_slow_motion_guidance(self):
+        """Task 20: a stride under MIN_STRIDE_FRAMES (10) frames undersamples the steps (the field vole: ~5-6
+        frames at 24 fps); facts refuses before averaging, naming the brief's slowMotion."""
+        self.assertEqual(facts.MIN_STRIDE_FRAMES, 10)
+        with self.assertRaisesRegex(facts.FactsError, r"stride of 8\.0\d* frames.*under 10.*slowMotion"):
+            run(lope(period=8, frames=96), brief=self.BRIEF)
+        with self.assertRaisesRegex(facts.FactsError, r"slowMotion 2.*raise it"):
+            run(lope(period=8, frames=96), brief={**self.BRIEF, "slowMotion": 2})
+
+    def test_the_slow_motion_advice_names_a_factor_from_the_band(self):
+        """Task 20: with the brief's gait and a mass, the advice names the band's stride and the smallest factor that
+        gives MIN_STRIDE_FRAMES frames (the vole: a 0.03 kg trot centres on 5.3 Hz, so at least 2.2 at 24 fps)."""
+        advice = facts.slow_motion_advice({"gait": "a quick trot"}, {"kg": 0.03, "source": "brief massKg"}, 24.0)
+        self.assertRegex(advice, r"trot band .*5\.\d+ Hz.*slowMotion of at least 2\.2")
+        self.assertIn("slowMotion set", facts.slow_motion_advice({}, None, 24.0))
+
+    def test_no_clear_period_with_a_short_best_candidate_names_slow_motion(self):
+        found = {"period": None, "fundamentalLag": 5.84, "score": 0.06, "reason": "no lag is clearly the period"}
+        with unittest.mock.patch.object(facts.cycle, "mask_period", return_value=found):
+            with self.assertRaisesRegex(facts.FactsError, r"no full cycle found.*5\.84 frames.*slowMotion"):
+                run(lope(), brief=self.BRIEF)
+        with unittest.mock.patch.object(facts.cycle, "mask_period", return_value={**found, "fundamentalLag": 14.0}):
+            with self.assertRaises(facts.FactsError) as caught:
+                run(lope(), brief=self.BRIEF)
+        self.assertNotIn("slowMotion", str(caught.exception))
 
 
 class RigFactsTests(unittest.TestCase):

@@ -9,7 +9,10 @@ from anim.ledger import StageError
 REQUIRED = ("clip", "subject", "motion", "gait", "loop", "planar", "videoSeconds")
 DEFAULTS = {"resolution": "720p", "aspectRatio": "16:9", "iouThreshold": 0.90,
             "backgrounds": ["#c8c8c8", "#7f7f7f", "#00b140"], "limitsDeg": {}, "fitChains": None,
-            "targetSpeedMps": None, "massKg": None}
+            "targetSpeedMps": None, "massKg": None, "slowMotion": None}
+# Task 20: a slowMotion factor asks the video model for the motion that many times slower than real time (a small,
+# fast animal's steps undersampled at 24 fps); facts expects that retime.
+SLOW_MOTION = (1.0, 8.0)
 TWO_VIEW = ("This motion leaves the side plane. One side camera cannot see depth, so the fit would match the "
             "outline while the 3D pose is wrong. It needs the two-view method, which this version does not support.")
 
@@ -52,6 +55,11 @@ def load_brief(path, project, clip):
         pair = isinstance(mass, list) and len(mass) == 2 and all(is_number(m) and math.isfinite(m) for m in mass)
         if not (pair and 0 < mass[0] < mass[1]) and not (is_number(mass) and math.isfinite(mass) and mass > 0):
             raise BriefError("massKg must be null, a body mass above 0 kg, or [lightest, heaviest] kg")
+    slow = brief["slowMotion"]
+    low, high = SLOW_MOTION
+    if slow is not None and not (is_number(slow) and math.isfinite(slow) and low < slow <= high):
+        raise BriefError(f"slowMotion must be null or a factor over {low:g} and at most {high:g} (the video "
+                         f"that many times slower than real time)")
     chains = brief["fitChains"]
     if chains is None:
         chains = list(project["chains"])

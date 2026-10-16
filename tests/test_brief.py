@@ -67,6 +67,16 @@ class BriefTests(unittest.TestCase):
             with self.assertRaises(BriefError):
                 load_brief(path, PROJECT, "walk")
 
+    def test_slow_motion(self):
+        """Task 20: an optional slowMotion factor (the video asked for that many times slower than real time, for a
+        small fast animal whose steps 24 fps would undersample) defaults to none."""
+        self.assertIsNone(self.load()["slowMotion"])
+        self.assertEqual(self.load(slowMotion=3)["slowMotion"], 3)
+        self.assertEqual(self.load(slowMotion=2.5)["slowMotion"], 2.5)
+        for bad in (1, 0.5, 0, -2, 9, True, "3", float("nan"), float("inf"), [3]):
+            with self.subTest(slowMotion=bad), self.assertRaises(BriefError):
+                self.load(slowMotion=bad)
+
     def test_body_mass(self):
         """Task 19 step 3: an optional massKg (a number, or [lightest, heaviest]) sets the cadence band."""
         self.assertIsNone(self.load()["massKg"])

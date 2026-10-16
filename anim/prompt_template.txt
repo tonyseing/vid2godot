@@ -1,4 +1,4 @@
-Side view of this exact {subject}, {motion}. Gait: {gait}.
+Side view of this exact {subject}, {motion}. Gait: {gait}.{slow}
 Strict side profile for the whole clip: the camera tracks alongside at the animal's speed, keeping it centred and the same size in frame.
 One continuous shot. No cuts, no zoom, no camera rotation, no change of angle.
 Exactly four legs, all visible. The same animal, coat, markings and proportions as the image.

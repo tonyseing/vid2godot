@@ -52,6 +52,7 @@
 | "changed after the template was made" | An output changed after `review --template` | Run `review --template` again and review the new output |
 | "Round N was already reviewed" | A revised output needs a new round | `review --template`, then review |
 | `facts`: "The brief ... names no gait facts can check" | The loop brief's `gait` names none of walk, trot, pace, canter/lope, gallop (or their -ing forms) | Name the gait in the brief, or `facts --accept-gait "<why>"` (a warning in facts.json, the ledger and the lab) |
+| `facts`: "stride of N frames ... under 10 frames", or no clear period with a best candidate under 10 frames | A small, fast animal's steps are undersampled at 24 fps (the field vole's trot: 4.5 frames) | Set the brief's `slowMotion` to the factor `facts` names (or more) and regenerate (`reference/motion.md`) |
 | `facts`: "The cadence retime F ... is outside 0.5-2.0" | The video is far slower than the body size says, or the mass is wrong | Check the mass (brief `massKg`, `--mass-kg`); if it stands, `facts --accept-retime "<why>"` |
 | `facts` warns: "Body mass ... of an open mesh (N open edges)" | The mass is the rig's mesh volume and the mesh is not closed | Give the brief's `massKg` or `facts --mass-kg`; nothing is retimed on that mass |
 | `facts`: "A paw's velocity jumps at a contact edge" | The pin does not ease in or out (`contactCheck.edgeJumps` against the swing's median) | Check the leg chains and the `ik` residuals; the pins should ease over 4 keys |

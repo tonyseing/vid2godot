@@ -26,8 +26,10 @@ moves with it, and the footfall phases stay the phase origin's while the contact
 keys, played as the clip plays them, are detected again (the same rule, without the fit-error allowance): under
 CONTACT_AGREEMENT per paw facts refuses. The footfall
 pattern is checked against the brief's `gait` (`expected_gait`, `gait_reads`), and the cadence against the
-Heglund-Taylor band for the body mass (`cadence_check`): a slow video with one consistent period is retimed to the band
-centre, recorded in `cadence` and the warnings."""
+Heglund-Taylor band for the gait and the body mass (`cadence_check`, CADENCE_LAWS; Task 20: walk, trot or pace,
+canter or gallop): a slow video with one consistent period is retimed to the band centre, recorded in `cadence` and the
+warnings. The brief's `slowMotion` is the expected retime (the measured one decides; both are recorded), and a stride
+under MIN_STRIDE_FRAMES video frames is refused: the video undersamples the steps."""
 import re
 
 import numpy as np
@@ -73,6 +75,24 @@ MASS_SPREAD = 0.25           # a single massKg m is the range [m (1 - spread), m
 CADENCE_CONSISTENCY = 0.10   # every steady cycle's own period within this share of the clip's: one time scale
 RETIME_BOUND = (0.5, 2.0)    # a retime factor outside this needs `facts --accept-retime <reason>` (fix round 1)
 GALLOPS = ("canter", "gallop", "transverse gallop", "rotary gallop")
+# Task 20: stride frequency f = a M^b Hz (M in kg) per gait, each the centre of its band over the mass range. Heglund &
+# Taylor 1988 (J Exp Biol 138:301-318, Table 3; 16 species, 30 g mice to 170 kg horses): the preferred trotting speed
+# for a trot (a pace, the lateral two-beat, takes the trot's), the preferred galloping speed for a canter/lope and the
+# gallops (the band the wolf lope was checked against, unchanged). Heglund & Taylor have no walk equation; the walk is
+# their minimum trotting speed's (2.42 M^-0.091, about the walk-trot change at Froude number 0.5, Alexander & Jayes
+# 1983) at the comfortable walk's Froude number 0.25 (Alexander 1989): at one leg length the stride frequency goes as
+# Froude^0.2 (relative stride 2.3 Froude^0.3, Alexander 1976), so a = 2.42 x 0.5^0.2. reference/motion.md.
+CADENCE_LAWS = {
+    "walk": (2.42 * 0.5 ** 0.2, -0.091, "a walk: Heglund & Taylor 1988's minimum trotting speed 2.42 M^-0.091 Hz at "
+                                        "half its Froude number (x 0.5^0.2; Alexander & Jayes 1983, Alexander 1989)"),
+    "trot": (3.35, -0.130, "Heglund & Taylor 1988: stride frequency at the preferred trotting speed 3.35 M^-0.130 Hz"),
+    "gallop": (4.44, -0.156, "Heglund & Taylor 1988: stride frequency at the preferred galloping speed "
+                             "4.44 M^-0.156 Hz"),
+}
+GAIT_LAW = {"walk": "walk", "trot": "trot", "pace": "trot", **{g: "gallop" for g in GALLOPS}}
+# Task 20: a stride must span at least this many video frames: under it (the field vole's ~5-6 frames at 24 fps) the
+# legs change between frames faster than the video samples them, and no repeating period can be read.
+MIN_STRIDE_FRAMES = 10
 # The brief's `gait` vocabulary: the earliest of these whole words (or their inflections) names the expected gait.
 GAIT_WORDS = ((r"transverse gallop(?:s|ing|ed)?", "transverse gallop"), (r"rotary gallop(?:s|ing|ed)?", "rotary gallop"),
               (r"gallop(?:s|ing|ed)?", "gallop"), (r"canter(?:s|ing|ed)?", "canter"), (r"lop(?:e|es|ing|ed)", "canter"),
@@ -361,43 +381,55 @@ def mass_range(kg):
     return [round(float(kg) * (1 - MASS_SPREAD), 6), round(float(kg) * (1 + MASS_SPREAD), 6)]
 
 
-def cadence_band(kg):
-    """The Heglund-Taylor stride-frequency band (Hz) over a mass range: [f(heaviest), f(lightest)]."""
+def stride_hz(mass_kg, gait):
+    """The stride frequency (Hz) of the gait's law (CADENCE_LAWS) at a body mass."""
+    if gait not in GAIT_LAW:
+        raise FactsError(f"No cadence band for a {gait!r}: the bands are for {VOCABULARY}")
+    a, b, _ = CADENCE_LAWS[GAIT_LAW[gait]]
+    return a * float(mass_kg) ** b
+
+
+def cadence_band(kg, gait):
+    """The gait's stride-frequency band (Hz) over a mass range: [f(heaviest), f(lightest)]."""
     low, high = mass_range(kg)
-    return [motion.heglund_taylor_hz(high), motion.heglund_taylor_hz(low)]
+    return [stride_hz(high, gait), stride_hz(low, gait)]
 
 
-def cadence_check(period, fps, gait_name, mass, periods, accept_retime=None):
-    """The stride frequency against the body-size band (galloping gaits: canter, gallop): the block for facts.json
-    and the warnings. A video under the band whose steady cycles share one period (each within
+def cadence_check(period, fps, gait_name, mass, periods, accept_retime=None, slow_motion=None):
+    """The stride frequency against the gait's body-size band (Task 20: every gait in GAIT_LAW): the block for
+    facts.json and the warnings. A video under the band whose steady cycles share one period (each within
     CADENCE_CONSISTENCY of the clip's) is retimed to the band centre; the factor scales the clip's speed.
     Fix round 1: a mass from an open mesh's volume (`openEdges` > 0) is checked against but never retimes; a factor
-    outside RETIME_BOUND refuses unless `accept_retime` records why."""
+    outside RETIME_BOUND refuses unless `accept_retime` records why. Task 20: `slow_motion` (the brief's slowMotion)
+    is the expected retime: recorded beside the measured one, and the bound is on measured / expected."""
     hz = fps / period
-    out = {"videoHz": round(hz, 4), "massKg": None, "massSource": None, "bandHz": None, "centreHz": None,
-           "checked": False, "consistent": None, "cyclePeriods": [round(p, 3) for p in periods], "retime": 1.0,
-           "hz": round(hz, 4), "law": "Heglund & Taylor 1988: stride frequency at the preferred galloping speed "
-                                      "4.44 M^-0.156 Hz"}
+    expected = float(slow_motion) if slow_motion else 1.0
+    law = GAIT_LAW.get(gait_name)
+    out = {"videoHz": round(hz, 4), "gait": gait_name, "massKg": None, "massSource": None, "bandHz": None,
+           "centreHz": None, "checked": False, "consistent": None, "cyclePeriods": [round(p, 3) for p in periods],
+           "retime": 1.0, "expectedRetime": slow_motion if slow_motion else 1.0, "hz": round(hz, 4),
+           "law": CADENCE_LAWS[law][2] if law else None}
     warnings = []
+    asked = f"slowMotion {slow_motion:g}" if slow_motion else None
     open_edges = (mass or {}).get("openEdges") or 0
     if mass is not None:
         out["massKg"], out["massSource"] = mass_range(mass["kg"]), mass["source"]
         if open_edges:
             out["massOpenEdges"] = int(open_edges)
-    if gait_name not in GALLOPS:
-        out["reason"] = f"no Heglund-Taylor band for a {gait_name or 'gait the brief does not name'}"
+    if law is None:
+        out["reason"] = f"no cadence band for a {gait_name or 'gait the brief does not name'}"
         return out, warnings
     if mass is None:
         out["reason"] = "no body mass"
         warnings.append("Cadence not checked: no body mass (the brief's massKg or `facts --mass-kg`)")
         return out, warnings
-    band = cadence_band(mass["kg"])
+    band = cadence_band(mass["kg"], gait_name)
     centre = sum(band) / 2
     consistent = bool(periods) and all(abs(p - period) / period <= CADENCE_CONSISTENCY for p in periods)
     out.update({"bandHz": [round(b, 4) for b in band], "centreHz": round(centre, 4), "checked": True,
                 "consistent": consistent})
     kg = "-".join(f"{m:g}" for m in out["massKg"])
-    where = f"{band[0]:.2f}-{band[1]:.2f} Hz band for {kg} kg"
+    where = f"{band[0]:.2f}-{band[1]:.2f} Hz {gait_name} band for {kg} kg"
     untrusted = (f"the mass is the {mass['source']} of an open mesh ({int(open_edges)} open edges); give the brief's "
                  f"massKg or `facts --mass-kg`") if open_edges else None
     if untrusted:
@@ -409,23 +441,33 @@ def cadence_check(period, fps, gait_name, mass, periods, accept_retime=None):
     elif hz < band[0] and consistent:
         factor = centre / hz
         low, high = RETIME_BOUND
+        ratio = factor / expected
         accepted = ""
-        if not low <= factor <= high:
+        if slow_motion:
+            out["retimeVsExpected"] = round(ratio, 6)
+        if not low <= ratio <= high:
             if not accept_retime:
+                against = (f" against the brief's {asked} (the measured over the expected retime is {ratio:.2f})"
+                           if slow_motion else "")
+                far = "from the slow motion asked for" if slow_motion else "slower than the body size says"
                 raise FactsError(f"The cadence retime {factor:.2f} (the video's {hz:.2f} Hz to {centre:.2f} Hz, the "
-                                 f"{where}) is outside {low}-{high}: the video is far slower than the body size says "
-                                 f"or the mass is wrong. Check the mass (the brief's massKg or `facts --mass-kg`), or "
+                                 f"{where}){against} is outside {low}-{high}: the video is far {far} or the mass is "
+                                 f"wrong. Check the mass (the brief's massKg or `facts --mass-kg`), or "
                                  f"record why this retime stands with `facts --accept-retime <reason>`")
             out["retimeAccepted"] = accept_retime
             accepted = f"; outside {low}-{high}, accepted: {accept_retime}"
         out["retime"], out["hz"] = round(factor, 6), round(centre, 4)
-        warnings.append(f"The video's cadence {hz:.2f} Hz is under the {where}: retimed by {factor:.3f} to "
-                        f"{centre:.2f} Hz (the speed by the same factor){accepted}")
+        expected_note = f" (the brief's {asked} expected {expected:g})" if slow_motion else ""
+        warnings.append(f"The video's cadence {hz:.2f} Hz is under the {where}: retimed by {factor:.3f}"
+                        f"{expected_note} to {centre:.2f} Hz (the speed by the same factor){accepted}")
     elif hz < band[0]:
         warnings.append(f"The video's cadence {hz:.2f} Hz is under the {where} and not retimed: the steady cycles' "
                         f"own periods ({out['cyclePeriods']}) are not one time scale")
     elif hz > band[1]:
         warnings.append(f"The video's cadence {hz:.2f} Hz is above the {where}; not retimed (only a slow video is)")
+    if slow_motion and hz >= band[0]:
+        warnings.append(f"The brief's {asked} expected a retime of {expected:g}, but the video's cadence {hz:.2f} Hz "
+                        f"is not under the {where}: not retimed (the measured cadence decides)")
     return out, warnings
 
 
@@ -592,6 +634,24 @@ def leg_period(values, names, project, fps, period):
             "gate": PERIOD_MAX_SCORE}
 
 
+def slow_motion_advice(brief, mass=None, fps=24.0):
+    """What to do about a stride the video undersamples (Task 20): regenerate in slow motion. With the brief's gait
+    and a body mass, name the band's centre and the smallest factor that gives a stride MIN_STRIDE_FRAMES frames."""
+    brief = brief or {}
+    asked = brief.get("slowMotion")
+    gait = expected_gait(brief.get("gait"))
+    hint = ""
+    if gait in GAIT_LAW and mass is not None:
+        centre = sum(cadence_band(mass["kg"], gait)) / 2
+        hint = (f" (the {gait} band for {'-'.join(f'{m:g}' for m in mass_range(mass['kg']))} kg centres on "
+                f"{centre:.2f} Hz, {fps / centre:.1f} frames at {fps:g} fps: a slowMotion of at least "
+                f"{MIN_STRIDE_FRAMES * centre / fps:.1f})")
+    if asked:
+        return (f"The brief's slowMotion {asked:g} was not slow enough: raise it so a stride spans at least "
+                f"{MIN_STRIDE_FRAMES} frames{hint}, and regenerate")
+    return (f"Regenerate with the brief's slowMotion set so a stride spans at least {MIN_STRIDE_FRAMES} frames{hint}")
+
+
 def loop_cycle(poses, project, every, paws, chains, masks, render, rest, rig=None, brief=None, mass=None,
                accept_gait=None, accept_retime=None):
     """The loop's cycle from the video: period, steady cycles, phase average, the averaged cycle's check against the
@@ -605,13 +665,21 @@ def loop_cycle(poses, project, every, paws, chains, masks, render, rest, rig=Non
     count = len(every)
     found = cycle.mask_period(masks, fps)
     if found["period"] is None:
+        best = found.get("fundamentalLag")
+        short = (f"; the best candidate, {best:.2f} frames, is under {MIN_STRIDE_FRAMES} frames: the steps may be "
+                 f"too fast for {fps:g} fps. {slow_motion_advice(brief, mass, fps)}") if best is not None and \
+            best < MIN_STRIDE_FRAMES else ""
         raise FactsError(f"no full cycle found in the video between 0.25 s and 2.5 s: {found['reason']}; the clip "
-                         f"must hold at least two cycles")
+                         f"must hold at least two cycles{short}")
     period = found["period"]
     pairs = cycle.leg_pairs(names, project)
     doubled = cycle.half_period(every, pairs, period)
     if doubled:
         period *= 2
+    if period < MIN_STRIDE_FRAMES:
+        raise FactsError(f"The video's stride of {period:.2f} frames ({fps / period:.2f} Hz at {fps:g} fps) is under "
+                         f"{MIN_STRIDE_FRAMES} frames: the video undersamples the steps. "
+                         f"{slow_motion_advice(brief, mass, fps)}")
     found = {**{k: (round(v, 4) if isinstance(v, float) else v) for k, v in found.items()}, "doubled": doubled}
     n = max(2, int(round(period)))
     first = int(np.ceil(LEAD_IN * count))
@@ -658,7 +726,8 @@ def loop_cycle(poses, project, every, paws, chains, masks, render, rest, rig=Non
             "phaseOrigin": contacts["origin"], **gait_pattern(masks_of, touchdowns, project, len(masks_of[chains[0]]))}
     gate, warnings = gait_check(gait, brief, accept_gait)
     cadence, more = cadence_check(period, fps, gate["expected"] or next(iter(gate["measured"]["reads"]), None),
-                                  mass, cycle.cycle_periods(masks, kept, period), accept_retime)
+                                  mass, cycle.cycle_periods(masks, kept, period), accept_retime,
+                                  brief.get("slowMotion"))
     warnings += more + contacts.get("warnings", [])
     factor = cadence["retime"]
     speed = contacts["speed"]

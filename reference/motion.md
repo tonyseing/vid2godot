@@ -54,20 +54,61 @@ a transverse gallop (Biancardi & Minetti 2012), and the Seedance wolf lope reads
 
 ## The cadence
 
-For a canter or gallop, the stride frequency is checked against the band of the preferred-gallop frequency
-4.44 M^-0.156 Hz (Heglund & Taylor 1988) over the body mass M: the brief's `massKg` (a number m means
-[0.75 m, 1.25 m]; or `[lightest, heaviest]`), else `facts --mass-kg`, else the rig's mesh volume at 1000 kg/m3.
+The stride frequency is checked against a band for the gait the brief names (else the measured footfalls' gait)
+over the body mass M: the brief's `massKg` (a number m means [0.75 m, 1.25 m]; or `[lightest, heaviest]`), else
+`facts --mass-kg`, else the rig's mesh volume at 1000 kg/m3. The band runs from the law at the heaviest mass to
+the law at the lightest (Task 20; before it, only a canter or gallop had a band):
+
+| Gait | Law (Hz, M in kg) | Source | 40 kg (30-50) | 0.03 kg (0.0225-0.0375) |
+|---|---|---|---|---|
+| walk | 2.11 M^-0.091 | derived, below | 1.48-1.55 (centre 1.51) | 2.84-2.98 (2.91) |
+| trot, pace | 3.35 M^-0.130 | H&T 1988 Table 3, preferred trotting speed | 2.01-2.15 (2.08) | 5.13-5.49 (5.31) |
+| canter/lope, gallop (transverse, rotary) | 4.44 M^-0.156 | H&T 1988 Table 3, preferred galloping speed | 2.41-2.61 (2.51) | 7.41-8.02 (7.72) |
+
+- **Heglund & Taylor 1988** (H&T): N. C. Heglund and C. R. Taylor, "Speed, stride frequency and energy cost per
+  stride: how do they change with body size and gait?", J. Exp. Biol. 138:301-318. Treadmill stride frequencies of
+  16 quadruped species, 30 g mice to a 170 kg horse; Table 3 gives f = a M^b at five equivalent speeds (95 %
+  limits on the preferred trot: a 2.90-3.50, b -0.099 to -0.149; preferred gallop: a 4.08-4.84, b -0.131 to -0.180).
+  The canter/gallop law is unchanged, so the wolf lope's 2.41-2.61 Hz band and its 1.581 retime stand.
+- **Pace**: two lateral beats at trotting speeds; H&T measured no pace, so it takes the trot's law.
+- **Walk**: H&T have too few constant-speed walks for an equation. The walk law is their minimum trotting speed's
+  frequency, 2.42 M^-0.091 (the slowest trot: near the walk-trot change, which quadrupeds make at a Froude number
+  u^2/(g h) of about 0.5; R. McN. Alexander and A. S. Jayes 1983, "A dynamic similarity hypothesis for the gaits
+  of quadrupedal mammals", J. Zool. 201:135-152), moved to a comfortable walk's Froude number, about 0.25
+  (R. McN. Alexander 1989, "Optimization and gaits in the locomotion of vertebrates", Physiol. Rev. 69:1199-1227).
+  At one leg length h the relative stride is 2.3 Fr^0.3 (R. McN. Alexander 1976, "Estimates of speeds of
+  dinosaurs", Nature 261:129-130), so the stride frequency u / stride goes as Fr^0.2: a = 2.42 x 0.5^0.2 = 2.11.
+  It is an estimate from dynamic similarity, not a fitted equation; read a walk's retime with that in mind.
+
 The volume is a mass only for a closed mesh: with open (non-manifold) edges the cadence is checked against it and
 warned about, naming the source and the open-edge count, and never retimed (the chase3d wolf has 1590 open edges and
-reads 85 kg, so give its mass). 30-50 kg is 2.41-2.61 Hz.
+reads 85 kg, so give its mass). With no mass it warns and does not check.
 
 A video under the band whose steady cycles each repeat within 10 % of the clip's period (one time scale: AI video
-is often slow motion) is **retimed** to the band centre: the clip's duration divides by the factor and its speed
-multiplies by it; the stride stays. The factor is `cadence.retime` in `facts.json`, a warning and the lab's Motion
-section. Over the band, or with cycles that disagree, it warns and does not retime. A factor outside 0.5-2.0 is
-refused (the mass is likely wrong) unless `facts --accept-retime "<why>"` records why (`cadence.retimeAccepted`, the
-ledger). A retimed speed can then be far from the brief's `targetSpeedMps` (the stride is the video's): read that
-warning.
+is often slow motion) is **retimed** to the band centre, whatever the gait: the clip's duration divides by the
+factor and its speed multiplies by it; the stride stays. The factor is `cadence.retime` in `facts.json` (with
+`cadence.gait` and `cadence.law`), a warning and the lab's Motion section. Over the band, or with cycles that
+disagree, it warns and does not retime. A factor outside 0.5-2.0 of the expected retime (below) is refused (the
+mass is likely wrong) unless `facts --accept-retime "<why>"` records why (`cadence.retimeAccepted`, the ledger). A
+retimed speed can then be far from the brief's `targetSpeedMps` (the stride is the video's): read that warning.
+
+### Small, fast animals: `slowMotion`
+
+A stride must span at least 10 video frames (`facts.MIN_STRIDE_FRAMES`). Under it the legs change between frames
+faster than the video samples them, and no period can be read: the field vole's real-time trot (5.3 Hz) is 4.5
+frames at 24 fps, and Seedance's vole shuffled with a 5-6 frame stride and no clear period (Task 20). `facts`
+refuses a measured stride under 10 frames, and a clip with no clear period whose best candidate is under 10 frames,
+with the band's centre and the smallest factor that would do (10 x centre Hz / fps; the vole: 2.2).
+
+The brief's `"slowMotion": F` (over 1, at most 8; default none) asks for it: `generate` adds to the prompt's first
+line "Filmed in slow motion: the whole clip plays F times slower than real time, with every step clearly visible,
+each paw lifting off and setting down distinctly". The rest of the prompt is unchanged (strict side view, the
+camera following, one shot, no cuts or zoom, four legs, the same animal). `facts` records F as
+`cadence.expectedRetime` beside the measured `cadence.retime`, and `cadence.retimeVsExpected` (measured / F): the
+measured cadence decides, and the 0.5-2.0 bound is on that ratio. A video that is not slow enough (not under the
+band) is not retimed and warns that the slow motion asked for did not come. Without `slowMotion` the expected
+retime is 1 and nothing changes. Pick F so the band's centre gives at least 10 frames, with room (the vole trot:
+3, about 13.6 frames). A wolf galloping in real time (2.51 Hz) is 9.6 frames at 24 fps, so it needs F too.
 
 ## The keys
 

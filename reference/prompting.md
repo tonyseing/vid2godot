@@ -38,6 +38,9 @@ profile for the whole clip, the camera tracking alongside at the animal's speed 
 same size, one continuous shot with no cuts, zoom, rotation or change of angle, exactly four legs all visible,
 the same animal, coat, markings and proportions, and a plain flat background in the reference's colour with no
 floor, shadow, scenery or text. Change the brief, not the template.
+A small, fast animal (a stride under 10 frames at 24 fps, e.g. a vole or a mouse) needs the brief's `slowMotion`
+factor: the first line then asks for the clip that many times slower than real time with every step clearly
+visible, the rest unchanged (`reference/motion.md`, "Small, fast animals").
 
 ## Accepting a candidate
 

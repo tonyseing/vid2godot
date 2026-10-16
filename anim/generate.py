@@ -153,8 +153,13 @@ def estimate_cost(info, w, h, seconds, fps=FPS, resolution=None, audio=None):
 
 
 def build_prompt(brief, background):
+    """The strict prompt. Task 20: a brief's slowMotion adds, on the first line, slow motion at that factor with
+    every step clearly visible; without it the prompt is as before."""
     name = NAMES.get(background.lower(), "flat colour")
-    return TEMPLATE.format(subject=brief["subject"], motion=brief["motion"], gait=brief["gait"],
+    factor = brief.get("slowMotion")
+    slow = (f" Filmed in slow motion: the whole clip plays {factor:g} times slower than real time, with every "
+            f"step clearly visible, each paw lifting off and setting down distinctly.") if factor else ""
+    return TEMPLATE.format(subject=brief["subject"], motion=brief["motion"], gait=brief["gait"], slow=slow,
                            background=f"{name} ({background.lower()})").strip()
 
 
