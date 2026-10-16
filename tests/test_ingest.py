@@ -196,6 +196,27 @@ class IngestUnitTests(unittest.TestCase):
         self.assertTrue(mask[100, 140:180].all())
         self.assertFalse(mask[85:95, 135:185].any())
 
+    def test_silhouette_closes_a_background_coloured_pinhole(self):
+        """A pinhole of background colour inside the body (a highlight, a compression speck) is closed: holes up to
+        PINHOLE_PX video pixels are filled whatever their colour."""
+        img = np.zeros((180, 320, 3), dtype=np.uint8)
+        img[:] = GREY
+        img[60:140, 100:220] = (40, 30, 25)
+        img[90:94, 150:154] = GREY                # 16 px of background colour inside the body
+        mask = ingest.silhouette(img, ingest.background_colour(img))
+        self.assertLessEqual(16, ingest.PINHOLE_PX)
+        self.assertTrue(mask[90:94, 150:154].all())
+        self.assertEqual(int(mask.sum()), 80 * 120)
+
+    def test_silhouette_keeps_a_hole_larger_than_a_pinhole(self):
+        img = np.zeros((180, 320, 3), dtype=np.uint8)
+        img[:] = GREY
+        img[60:140, 100:220] = (40, 30, 25)
+        img[90:100, 150:160] = GREY               # 100 px: more than a pinhole, a real gap
+        mask = ingest.silhouette(img, ingest.background_colour(img))
+        self.assertGreater(100, ingest.PINHOLE_PX)
+        self.assertFalse(mask[91:99, 151:159].any())
+
     def test_border_touch_flagged(self):
         mask = ingest.silhouette(frame(290), np.array(GREY, dtype=float))
         self.assertTrue(ingest.touches_border(mask))

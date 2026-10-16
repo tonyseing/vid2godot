@@ -35,13 +35,15 @@ if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
 from anim.blender_run import run_blender  # noqa: E402
+from anim import facts, ingest, paws  # noqa: E402
 from anim.camera import SideCamera  # noqa: E402
 from anim.ingest import background_colour, run_ingest  # noqa: E402
 from anim.raster import score_fit  # noqa: E402
 
 EVAL_FRAMES = sorted(set(range(0, 121, 8)) | {36, 48, 60, 80, 84, 92, 96, 108})
 SPANS = ((0, 25), (26, 50), (51, 75), (76, 100), (101, 120))      # inclusive frame ranges
-TARGETS = {"meanIoU": 0.85, "span": {"76-100": 0.80}, "frame": {"80": 0.75}}
+TARGETS = {"meanIoU": 0.85, "span": {"76-100": 0.80}, "frame": {"80": 0.75}, "forepawMissShare": 0.20,
+           "cycle": True}
 PAW_MISS_PX = 15.0
 FALSE_FILL_TOL = 20.0          # a mask pixel this close to the background colour is background
 FALSE_FILL_PX = 300            # working pixels of background in the mask that make a false-fill frame
@@ -53,83 +55,9 @@ def sha256(path):
 
 
 # --------------------------------------------------------------------------------------------- paws in a mask
-BODY_ROW_SHARE = 0.5       # a body row is at least this share of the widest row
-MIN_BRANCH_SHARE = 0.3     # a second paw's branch is at least this share of the longest leg
-BLOB_SHARE = 0.12          # a paw's blob: silhouette within this share of the leg's length of its far end
-NEIGHBOURS = [(-1, -1), (-1, 0), (-1, 1), (0, -1), (0, 1), (1, -1), (1, 0), (1, 1)]
-
-
-def body_line(mask):
-    """The lowest row of the body: the last row at least BODY_ROW_SHARE as wide as the widest."""
-    widths = mask.sum(axis=1)
-    return int(np.nonzero(widths >= BODY_ROW_SHARE * widths.max())[0].max())
-
-
-def _shift(a, dy, dx, fill):
-    out = np.full_like(a, fill)
-    h, w = a.shape
-    out[max(dy, 0):h + min(dy, 0), max(dx, 0):w + min(dx, 0)] = a[max(-dy, 0):h + min(-dy, 0),
-                                                                  max(-dx, 0):w + min(-dx, 0)]
-    return out
-
-
-def geodesic(region, seeds):
-    """8-connected step distance from `seeds` inside `region` (-1 where unreachable)."""
-    dist = np.where(seeds, 0, -1).astype(np.int32)
-    frontier, step = seeds & region, 0
-    while frontier.any():
-        step += 1
-        grown = np.zeros_like(frontier)
-        for dy, dx in NEIGHBOURS:
-            grown |= _shift(frontier, dy, dx, False)
-        grown &= region & (dist < 0)
-        dist[grown] = step
-        frontier = grown
-    return dist
-
-
 def find_paws(mask, max_paws=6):
-    """Paw points (the far ends of the leg branches below the body line, and the blob near each end), in working
-    pixels [u, v]. A leg's far end is measured along the silhouette (geodesic distance) from the body line."""
-    if not mask.any():
-        return []
-    line = body_line(mask)
-    rows, cols = np.nonzero(mask)
-    top, bottom, left, right = line, rows.max() + 1, cols.min(), cols.max() + 1
-    if bottom - top < 3:
-        return []
-    region = mask[top:bottom, left:right].copy()
-    seeds = np.zeros_like(region)
-    seeds[0] = region[0]
-    d0 = geodesic(region, seeds)
-    if d0.max() <= 0:
-        return []
-    leg = d0.max()
-    big = 10 * (region.shape[0] + region.shape[1])
-    allowed = d0 >= MIN_BRANCH_SHARE * leg
-    score = np.where(allowed, d0.astype(float) + big, -np.inf)
-    points, from_tips = [], []
-    while len(from_tips) < max_paws:
-        flat = int(np.argmax(score))
-        if not np.isfinite(score.flat[flat]):
-            break
-        branch = score.flat[flat] - (big if not from_tips else 0)
-        if from_tips and branch < MIN_BRANCH_SHARE * leg:
-            break
-        v, u = divmod(flat, region.shape[1])
-        tip = np.zeros_like(region)
-        tip[v, u] = True
-        dt = geodesic(d0 >= 0, tip)
-        near = (dt >= 0) & (dt <= max(2, BLOB_SHARE * leg))
-        bv, bu = np.nonzero(near)
-        points.append([float(u + left), float(v + top)])
-        points.append([float(bu.mean() + left), float(bv.mean() + top)])
-        from_tips.append((dt, d0[v, u]))
-        candidate = np.full(region.shape, np.inf)
-        for dist_t, d0_t in from_tips:
-            candidate = np.minimum(candidate, np.where(dist_t >= 0, dist_t + d0 - d0_t, big + d0))
-        score = np.where(allowed, candidate, -np.inf)
-    return points
+    """Paw points (each leg branch's far end and the blob near it, anim.paws), in working pixels [u, v]."""
+    return paws.points(paws.find_paws(mask, max_paws))
 
 
 # ------------------------------------------------------------------------------------------------- the metrics
@@ -187,6 +115,44 @@ def leg_swaps(poses, pairs, chains, limit=SWAP_MIN_RAD):
     return out
 
 
+def period_metrics(poses):
+    """facts' own cycle search on the fitted joint angles: whether a full cycle is found, its period and score."""
+    values = np.array([e["values"] for e in sorted(poses["frames"], key=lambda e: e["index"])], float)[:, 2:]
+    found = facts.period_search(values, float(poses["fps"]))
+    return {"found": found["period"] is not None,
+            "periodFrames": None if found["period"] is None else round(found["period"], 3),
+            "score": round(found["score"], 4), "gate": facts.PERIOD_MAX_SCORE}
+
+
+def facts_outcome(poses, project, brief):
+    """The facts stage itself on the fit: "ok" with its start and period, or its refusal."""
+    try:
+        result = facts.clip_facts(poses, project, brief)
+    except facts.FactsError as error:
+        return {"ok": False, "error": str(error)}
+    return {"ok": True, "start": round(result["start"], 3), "period": round(result["period"], 3)}
+
+
+def legacy_silhouette(img, bg, threshold=40.0):
+    """The ingest silhouette before Task 17b: every enclosed hole filled, whatever its colour."""
+    subject = np.linalg.norm(img.astype(float) - bg, axis=2) > threshold
+    mask = ndimage.binary_opening(subject, structure=np.ones((3, 3)))
+    labels, count = ndimage.label(mask)
+    if count == 0:
+        return mask
+    sizes = ndimage.sum(mask, labels, range(1, count + 1))
+    return ndimage.binary_fill_holes(labels == int(np.argmax(sizes)) + 1)
+
+
+BASELINE_KEYS = ("meanIoU", "spans", "minIoU", "minFrame", "forepawMissShare", "legSwaps", "period", "facts",
+                 "meanIoUAll", "minutes")
+
+
+def baseline_block(metrics, fitter):
+    """The fixture's baseline block from a measured run of the baseline fitter."""
+    return {"fitter": fitter, **{k: metrics[k] for k in BASELINE_KEYS if k in metrics}}
+
+
 def false_fill(masks, registered, tol=FALSE_FILL_TOL, limit=FALSE_FILL_PX):
     """Per frame, the working-mask pixels whose registered colour is background (within `tol`): the pixels a hole
     fill added between touching paws. Working pixel o is registered pixel 2o (the work scale is 1/2)."""
@@ -201,8 +167,11 @@ def false_fill(masks, registered, tol=FALSE_FILL_TOL, limit=FALSE_FILL_PX):
 
 
 # ------------------------------------------------------------------------------------------- build, fit, measure
-def build(work, out):
-    """Re-ingest a work folder's accepted video with this repository's ingest; write the fixture."""
+def build(work, out, baseline_script=None, baseline_run=None, fitter=None, blender=None):
+    """Re-ingest a work folder's accepted video with this repository's ingest; write the fixture. The false fill is
+    counted for these masks and for the old ingest's (every hole filled). With `baseline_script` (the baseline
+    fitter's fit_clip.py) the clip is fitted with it into `baseline_run`; with `baseline_run` alone an existing
+    measured run of the same masks is reused. Either way the baseline block is measured and written."""
     work, out = Path(work), Path(out)
     fit_args = json.loads((work / "fit" / "fit_clip.args.json").read_text())
     accepted = json.loads((work / "generate" / "accepted.json").read_text())["candidate"]
@@ -211,11 +180,19 @@ def build(work, out):
     if sha256(video) != accepted["sha256"]:
         raise SystemExit(f"{video} does not match the accepted hash")
     out.mkdir(parents=True, exist_ok=True)
+    camera = SideCamera.from_json(reference["camera"])
     with tempfile.TemporaryDirectory() as tmp:
-        meta = run_ingest(video, work / "reference" / "mask.png", SideCamera.from_json(reference["camera"]), tmp,
-                          fit_args["workScale"])
+        meta = run_ingest(video, work / "reference" / "mask.png", camera, tmp, fit_args["workScale"])
         masks = np.load(Path(tmp) / "masks.npz")["masks"]
         filled = false_fill(masks, Path(tmp) / "registered")
+    with tempfile.TemporaryDirectory() as tmp:
+        current = ingest.silhouette
+        ingest.silhouette = legacy_silhouette
+        try:
+            run_ingest(video, work / "reference" / "mask.png", camera, tmp, fit_args["workScale"])
+        finally:
+            ingest.silhouette = current
+        legacy = false_fill(np.load(Path(tmp) / "masks.npz")["masks"], Path(tmp) / "registered")
     np.savez_compressed(out / "masks.npz", masks=masks)
     model = Path(fit_args["model"])
     fixture = {
@@ -228,9 +205,25 @@ def build(work, out):
         "project": fit_args["project"], "brief": fit_args["brief"], "camera": meta["camera"],
         "workScale": meta["workScale"], "fps": meta["fps"], "frames": meta["frames"],
         "registration": meta["registration"], "flags": meta["flags"], "marks": {},
-        "falseFill": filled, "evalFrames": EVAL_FRAMES, "spans": [list(s) for s in SPANS], "targets": TARGETS,
+        "falseFill": {**filled, "frameCount": len(filled["frames"]),
+                      "legacy": {**legacy, "frameCount": len(legacy["frames"])}},
+        "evalFrames": EVAL_FRAMES, "spans": [list(s) for s in SPANS], "targets": TARGETS,
     }
     (out / "fixture.json").write_text(json.dumps(fixture, indent=1) + "\n")
+    if baseline_script or baseline_run:
+        if baseline_script:
+            metrics = run(out, baseline_run, blender, baseline_script)
+        else:
+            run_dir = Path(baseline_run)
+            if not np.array_equal(np.load(run_dir / "masks.npz")["masks"], masks):
+                raise SystemExit(f"{run_dir} was fitted to other masks; pass --baseline-script to refit")
+            poses = json.loads((run_dir / "poses.json").read_text())
+            metrics = measure(fixture, poses, run_dir / "projection.npz", run_dir / "masks.npz")
+            old = run_dir / "metrics.json"
+            if old.is_file():
+                metrics["minutes"] = json.loads(old.read_text()).get("minutes")
+        fixture["baseline"] = baseline_block(metrics, fitter or str(baseline_script or baseline_run))
+        (out / "fixture.json").write_text(json.dumps(fixture, indent=1) + "\n")
     return fixture
 
 
@@ -262,6 +255,7 @@ def measure(fixture, poses, projection, masks_npz):
     swaps = leg_swaps(poses, fixture["project"]["legPairs"], fixture["project"]["chains"])
     return {**iou_metrics(ious, frames, spans), "meanIoUAll": report["meanIoU"], "forepawMissShare": miss,
             "forepawMisses": far, "legSwaps": {pair: len(f) for pair, f in swaps.items()}, "legSwapFrames": swaps,
+            "period": period_metrics(poses), "facts": facts_outcome(poses, fixture["project"], fixture["brief"]),
             "cameraScale": poses.get("cameraScale")}
 
 
@@ -298,6 +292,15 @@ def failures(fixture, metrics):
     for span, value in (fixture.get("baseline") or {}).get("spans", {}).items():
         if metrics["spans"][span] < value:
             out.append(f"span {span} IoU {metrics['spans'][span]} is worse than the baseline {value}")
+    if targets.get("cycle") and not metrics["period"]["found"]:
+        out.append(f"no full cycle in the fitted angles (facts' period score {metrics['period']['score']} is not "
+                   f"under {facts.PERIOD_MAX_SCORE})")
+    if "forepawMissShare" in targets and metrics["forepawMissShare"] > targets["forepawMissShare"]:
+        out.append(f"forepaw miss share {metrics['forepawMissShare']} > {targets['forepawMissShare']}")
+    for pair, count in metrics["legSwaps"].items():
+        allowed = (fixture.get("baseline") or {}).get("legSwaps", {}).get(pair)
+        if allowed is not None and count > allowed:
+            out.append(f"{pair} swaps {count} times, more than the baseline's {allowed}")
     return out
 
 
@@ -307,6 +310,10 @@ def main(argv=None):
     b = sub.add_parser("build")
     b.add_argument("--work", required=True)
     b.add_argument("--out", required=True)
+    b.add_argument("--baseline-script", help="the baseline fitter's fit_clip.py: fit the new masks with it")
+    b.add_argument("--baseline-run", help="the folder of that fit (or of an existing fit of the same masks)")
+    b.add_argument("--fitter", help="the baseline fitter's name for the block, such as 'vid2godot 71fc632'")
+    b.add_argument("--blender")
     r = sub.add_parser("run")
     r.add_argument("--fixture", required=True)
     r.add_argument("--out", required=True)
@@ -314,8 +321,10 @@ def main(argv=None):
     r.add_argument("--blender")
     a = parser.parse_args(argv)
     if a.command == "build":
-        fixture = build(a.work, a.out)
-        print(json.dumps({"frames": fixture["frames"], "falseFillFrames": fixture["falseFill"]["frames"]}))
+        fixture = build(a.work, a.out, a.baseline_script, a.baseline_run, a.fitter, a.blender)
+        print(json.dumps({"frames": fixture["frames"], "falseFillFrames": fixture["falseFill"]["frames"],
+                          "legacyFalseFillFrames": fixture["falseFill"]["legacy"]["frames"],
+                          "baseline": fixture.get("baseline")}))
     else:
         metrics = run(a.fixture, a.out, a.blender, a.script)
         print(json.dumps({k: v for k, v in metrics.items() if k not in ("frames", "forepawMisses")}))

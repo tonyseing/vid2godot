@@ -30,8 +30,10 @@
 | `facts`: "too short to hold two cycles" or "No full cycle after the lead-in" | The video is too short (the first 10% is lead-in) | Raise `videoSeconds` in the brief and generate again |
 | "Measured ground speed ... is more than 25% from the brief's" | The video moves at another pace than the target | Note it in the review; generate again if the gait reads wrong |
 | `fit --span` refuses | No full fit exists yet | Run `fit` first; spans refine it |
-| IoU falls frame by frame through the clip; forelegs fold into the chest | Tracking held a local minimum | `fit` restarts each chain, tries each leg pair exchanged, and re-solves any frame under 0.85 IoU from scratch; mark the frames that stay low and refit their span |
+| IoU falls frame by frame through the clip; forelegs fold into the chest | Tracking held a local minimum; a leg inside the body costs no IoU | `fit` restarts each chain, tries each leg pair exchanged, re-solves any frame under 0.85 IoU from scratch, and pulls fitted paws to the paws found in the mask; mark the frames that stay low and refit their span |
 | The loop shows the animal still settling from the reference pose | The first cycles are a warm-up | `facts` takes the steadiest full cycle; if the clip never settles, generate a longer video |
+| `facts`: "No steady cycle that starts at the … touchdown fits" | The steady part is shorter than a cycle plus the shift to the touchdown | Generate a longer video |
+| `facts`: "no full cycle found" on a fit with high IoU | The fitted angles are not periodic (joints wander where the silhouette cannot see them) | Mark paws on a few frames per cycle and refit; check the forepaws are outside the body |
 
 ## Review, verify, export
 

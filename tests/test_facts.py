@@ -264,3 +264,41 @@ class FactsTests(unittest.TestCase):
         self.assertGreaterEqual(result["start"], 34)
         self.assertLessEqual(result["start"] + result["period"], 95)
         self.assertEqual(result["entry"]["footfall_phase"]["paw_hl"], 0.0)
+
+    def test_period_search_reports_the_score(self):
+        """The period search returns the period and its refined score, and, when no minimum in range is under the
+        gate, no period and the best score it saw (for reports that must say how far from periodic a fit is)."""
+        values = joint_values(synthetic())
+        found = facts.period_search(values, 24.0)
+        self.assertAlmostEqual(found["period"], 12, delta=0.1)
+        self.assertLess(found["score"], 0.01)
+        noise = np.random.default_rng(0).normal(size=(60, 4))
+        missing = facts.period_search(noise, 24.0)
+        self.assertIsNone(missing["period"])
+        self.assertGreater(missing["score"], facts.PERIOD_MAX_SCORE)
+
+    def test_touchdown_shift_never_wraps_back_into_the_warm_up(self):
+        """The steadiest cycle starts so late that the shift to the hind_R touchdown runs past the clip's end; moving
+        the start back a whole period would put it in the warm-up (frames before 28), so facts refuses instead."""
+        poses = synthetic(frames=48)
+        for entry in poses["frames"]:
+            f = entry["index"]
+            gain = 0.3 + 0.7 * min(1.0, max(0.0, (f - 20) / 8))
+            entry["values"] = entry["values"][:2] + [gain * v for v in entry["values"][2:]]
+        values = joint_values(poses)
+        period = facts.period_frames(values, 24.0)
+        self.assertGreaterEqual(facts.steadiest_start(values, period), 28)
+        with self.assertRaisesRegex(facts.FactsError, "steady"):
+            facts.clip_facts(poses, {**PROJECT, "phaseOrigin": "hind_R"}, LOPE)
+
+    def test_touchdown_shift_moves_back_within_the_steady_part(self):
+        """A long steady part: the same late shift moves back a whole period and stays in the steady part."""
+        poses = synthetic(frames=72)
+        for entry in poses["frames"]:
+            f = entry["index"]
+            gain = 0.3 + 0.7 * min(1.0, max(0.0, (f - 20) / 8))
+            entry["values"] = entry["values"][:2] + [gain * v for v in entry["values"][2:]]
+        result = facts.clip_facts(poses, {**PROJECT, "phaseOrigin": "hind_R"}, LOPE)
+        self.assertGreaterEqual(result["start"], 28)
+        self.assertLessEqual(result["start"] + result["period"], 71)
+        self.assertEqual(result["entry"]["footfall_phase"]["paw_hr"], 0.0)

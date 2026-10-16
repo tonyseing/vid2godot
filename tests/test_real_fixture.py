@@ -81,12 +81,70 @@ class MetricTests(unittest.TestCase):
             self.assertEqual(counts["counts"][0], 70 * 140 - int((img[::2, ::2] == 40).all(axis=2).sum()))
             self.assertEqual(counts["frames"], [0])
 
+    def metrics(self, **change):
+        base = {"meanIoU": 0.86, "spans": {"0-25": 0.95, "76-100": 0.81}, "frames": {"80": 0.76},
+                "forepawMissShare": 0.1, "legSwaps": {"front_L/front_R": 0, "hind_L/hind_R": 1},
+                "period": {"found": True, "periodFrames": 15.2, "score": 0.12}}
+        base.update(change)
+        return base
+
     def test_failures_name_each_missed_target_and_regressed_span(self):
         fixture = {"targets": rf.TARGETS, "baseline": {"spans": {"0-25": 0.9, "76-100": 0.7}}}
-        metrics = {"meanIoU": 0.86, "spans": {"0-25": 0.89, "76-100": 0.81}, "frames": {"80": 0.76}}
+        metrics = self.metrics(spans={"0-25": 0.89, "76-100": 0.81})
         self.assertEqual(rf.failures(fixture, metrics), ["span 0-25 IoU 0.89 is worse than the baseline 0.9"])
-        metrics = {"meanIoU": 0.8, "spans": {"0-25": 0.95, "76-100": 0.7}, "frames": {"80": 0.6}}
+        metrics = self.metrics(meanIoU=0.8, spans={"0-25": 0.95, "76-100": 0.7}, frames={"80": 0.6})
         self.assertEqual(len(rf.failures(fixture, metrics)), 3)
+
+    def test_failures_require_a_cycle_visible_forepaws_and_no_more_swaps(self):
+        """Temporal coherence: facts' own period search must find a full cycle in the fitted angles; forepaws must
+        be where the video shows paws; and no leg pair may swap more often than in the baseline."""
+        fixture = {"targets": rf.TARGETS,
+                   "baseline": {"spans": {}, "legSwaps": {"front_L/front_R": 0, "hind_L/hind_R": 1}}}
+        self.assertEqual(rf.failures(fixture, self.metrics()), [])
+        problems = rf.failures(fixture, self.metrics(
+            period={"found": False, "periodFrames": None, "score": 0.66}, forepawMissShare=0.48,
+            legSwaps={"front_L/front_R": 2, "hind_L/hind_R": 1}))
+        self.assertEqual(len(problems), 3, problems)
+        self.assertIn("no full cycle", problems[0])
+        self.assertIn("0.66", problems[0])
+        self.assertIn("forepaw", problems[1])
+        self.assertIn("front_L/front_R", problems[2])
+
+    def test_period_metrics_use_the_facts_search(self):
+        names = ["dx", "dz", "a", "b"]
+        periodic = [{"index": f, "values": [0.0, 0.0, math.sin(2 * math.pi * f / 15.2),
+                                            math.cos(2 * math.pi * f / 15.2)]} for f in range(121)]
+        found = rf.period_metrics({"names": names, "fps": 24.0, "frames": periodic})
+        self.assertTrue(found["found"])
+        self.assertAlmostEqual(found["periodFrames"], 15.2, delta=0.2)
+        rng = np.random.default_rng(1)
+        noise = [{"index": f, "values": [0.0, 0.0, *rng.normal(size=2)]} for f in range(121)]
+        missing = rf.period_metrics({"names": names, "fps": 24.0, "frames": noise})
+        self.assertFalse(missing["found"])
+        self.assertIsNone(missing["periodFrames"])
+        self.assertGreater(missing["score"], 0.2)
+
+    def test_baseline_block_is_written_from_a_measured_run(self):
+        metrics = {**self.metrics(), "minIoU": 0.67, "minFrame": 80, "meanIoUAll": 0.79, "minutes": 19.0,
+                   "forepawMisses": {"0:front_L": 90.0}, "frames": {"0": 0.9}}
+        block = rf.baseline_block(metrics, "vid2godot 71fc632")
+        self.assertEqual(block["fitter"], "vid2godot 71fc632")
+        for key in ("meanIoU", "spans", "minIoU", "minFrame", "forepawMissShare", "legSwaps", "period",
+                    "meanIoUAll"):
+            self.assertEqual(block[key], metrics[key])
+        self.assertNotIn("forepawMisses", block)
+
+    def test_legacy_silhouette_fills_the_pocket_the_current_one_keeps(self):
+        """The old ingest filled every enclosed hole; the fixture counts its false fill beside the new one's."""
+        from anim import ingest
+        img = np.full((180, 320, 3), 200, np.uint8)
+        img[60:100, 100:220] = 40
+        img[100:150, 110:122] = 40
+        img[100:150, 190:202] = 40
+        img[140:150, 110:202] = 40
+        bg = ingest.background_colour(img)
+        self.assertTrue(rf.legacy_silhouette(img, bg)[120, 150])
+        self.assertFalse(ingest.silhouette(img, bg)[120, 150])
 
 
 @unittest.skipUnless(REAL and BLENDER, "set VID2GODOT_REAL_FIXTURE and VID2GODOT_BLENDER to fit the real clip")

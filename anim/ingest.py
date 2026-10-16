@@ -114,6 +114,11 @@ def cadence(unique, n_total, container_fps):
     return keep, float(container_fps), [i / container_fps for i in keep]
 
 
+# Video pixels: an enclosed hole this small is closed whatever its colour (16 working px at the usual work scale of 1/2
+# with a registration scale near 1); a gap between touching paws is far larger and stays open.
+PINHOLE_PX = 64
+
+
 def background_colour(img, border=8):
     edge = np.concatenate([img[:border].reshape(-1, 3), img[-border:].reshape(-1, 3),
                            img[:, :border].reshape(-1, 3), img[:, -border:].reshape(-1, 3)])
@@ -122,7 +127,9 @@ def background_colour(img, border=8):
 
 def silhouette(img, bg, threshold=40.0):
     """The largest subject component. Enclosed pixels are filled only where their colour is the subject's (the same
-    background-distance test): two paws that touch enclose a pocket of background, and that pocket stays out."""
+    background-distance test): two paws that touch enclose a pocket of background, and that pocket stays out. A
+    pinhole (an enclosed hole of at most PINHOLE_PX pixels, such as a highlight or a compression speck) is closed
+    whatever its colour."""
     subject = np.linalg.norm(img.astype(float) - bg, axis=2) > threshold
     mask = ndimage.binary_opening(subject, structure=np.ones((3, 3)))
     labels, count = ndimage.label(mask)
@@ -130,7 +137,13 @@ def silhouette(img, bg, threshold=40.0):
         return mask
     sizes = ndimage.sum(mask, labels, range(1, count + 1))
     largest = labels == int(np.argmax(sizes)) + 1
-    return largest | (ndimage.binary_fill_holes(largest) & subject)
+    holes = ndimage.binary_fill_holes(largest) & ~largest
+    hole_labels, hole_count = ndimage.label(holes)
+    pinholes = np.zeros_like(holes)
+    if hole_count:
+        hole_sizes = ndimage.sum(holes, hole_labels, range(1, hole_count + 1))
+        pinholes = np.isin(hole_labels, np.nonzero(hole_sizes <= PINHOLE_PX)[0] + 1)
+    return largest | (holes & subject) | pinholes
 
 
 def touches_border(mask, margin=2):

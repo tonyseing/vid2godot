@@ -7,20 +7,24 @@ LEAD_IN = 0.10
 PERIOD_MAX_SCORE = 0.2
 # Cycles whose normalised difference from their neighbour cycles is within this of the steadiest are equally steady.
 STEADY_TOL = 0.01
+# A cycle moved back whole periods (to start at the phase origin's touchdown) may be at most this much less steady
+# (normalised score) than the steadiest: more means it reaches back into the warm-up.
+WRAP_TOL = 0.05
 
 
 class FactsError(StageError):
     pass
 
 
-def period_frames(values, fps, min_s=0.25, max_s=2.5):
-    """The fundamental period in frames, at sub-frame precision.
+def period_search(values, fps, min_s=0.25, max_s=2.5):
+    """The fundamental period in frames, at sub-frame precision, and its score: {"period": P or None, "score": s}.
 
     The lag score (mean squared difference between the clip and itself shifted by the lag) is normalised by twice the
     mean total variance, so 0 is a perfect repeat and about 1 is no relation. A parabola through each whole-frame local
     minimum and its neighbours gives the sub-frame period and the score there; the first local minimum in range whose
     refined score is below PERIOD_MAX_SCORE is the fundamental (its multiples come later). Gating on the refined score,
-    not the whole-frame one, keeps a short period that falls between frames from losing to its double."""
+    not the whole-frame one, keeps a short period that falls between frames from losing to its double. With no such
+    minimum the period is None and the score is the lowest refined score in range (how far from periodic it is)."""
     x = values - values.mean(axis=0)
     low, high = max(2, int(np.ceil(min_s * fps))), min(int(max_s * fps), len(x) // 2)
     if high < low + 1:
@@ -28,6 +32,7 @@ def period_frames(values, fps, min_s=0.25, max_s=2.5):
     variance = float(np.mean(np.sum(x ** 2, axis=1)))
     scores = {lag: float(np.mean(np.sum((x[:-lag] - x[lag:]) ** 2, axis=1))) / (2 * variance) if variance else np.inf
               for lag in range(low - 1, high + 2) if 0 < lag < len(x)}
+    lowest = np.inf
     for lag in range(low, high + 1):
         before, here, after = scores.get(lag - 1, np.inf), scores[lag], scores.get(lag + 1, np.inf)
         if here <= before and here <= after:
@@ -36,8 +41,20 @@ def period_frames(values, fps, min_s=0.25, max_s=2.5):
             vertex = here - (before - after) ** 2 / (8 * curve) if fitted else here
             if vertex < PERIOD_MAX_SCORE:
                 offset = 0.5 * (before - after) / curve if fitted else 0.0
-                return float(lag + min(0.5, max(-0.5, offset)))
-    raise FactsError(f"no full cycle found between {min_s} s and {max_s} s; the clip must hold at least two cycles")
+                return {"period": float(lag + min(0.5, max(-0.5, offset))), "score": float(vertex)}
+            lowest = min(lowest, float(vertex))
+    if not np.isfinite(lowest):
+        lowest = min(scores[lag] for lag in range(low, high + 1))
+    return {"period": None, "score": float(lowest)}
+
+
+def period_frames(values, fps, min_s=0.25, max_s=2.5):
+    """The fundamental period in frames (see `period_search`); FactsError when the clip holds no full cycle."""
+    found = period_search(values, fps, min_s, max_s)
+    if found["period"] is None:
+        raise FactsError(f"no full cycle found between {min_s} s and {max_s} s (best period score "
+                         f"{found['score']:.2f}, gate {PERIOD_MAX_SCORE}); the clip must hold at least two cycles")
+    return found["period"]
 
 
 def resample(series, times):
@@ -56,36 +73,38 @@ def best_start(values, period):
     return min(candidates, key=lambda s: float(np.sum((values[s] - later[s - first]) ** 2)))
 
 
+def steadiness(values, period, start):
+    """How far the cycle starting at (real) frame `start` is, phase for phase (n samples per period), from the cycle
+    one period later and the one a period earlier, wherever the clip holds them: the mean squared difference,
+    normalised like the period score (by twice the mean total variance). None when the clip holds neither."""
+    n = max(2, int(round(period)))
+    phase = np.arange(n) * period / n
+    here = resample(values, start + phase)
+    terms = [float(np.mean(np.sum((here - resample(values, start + shift + phase)) ** 2, axis=1)))
+             for shift in (period, -period) if 0 <= start + shift and start + shift + period <= len(values) - 1]
+    if not terms:
+        return None
+    x = values - values.mean(axis=0)
+    return float(np.mean(terms)) / (2 * float(np.mean(np.sum(x ** 2, axis=1))) or 1.0)
+
+
 def steadiest_start(values, period):
     """The whole frame after the lead-in that starts the steadiest full cycle.
 
     An AI video starts from the reference pose and settles over a cycle or two, and a small warm-up swing can match
     its own next swing better than a full one does, so the seam alone (`best_start`) can pick the warm-up. Each start
-    is scored instead by how far its whole cycle is, phase for phase (n samples per period), from the cycle one
-    period later and the cycle one period earlier, wherever the clip holds them (mean squared difference; the seam is
-    the first sample), normalised like the period score (by twice the mean total variance). Only starts with a
-    neighbouring cycle are scored; a clip too short for any falls back to the seam. Among the starts within
-    STEADY_TOL of the steadiest, the cleanest seam wins (as `best_start`), so a clip that repeats exactly keeps the
-    seam choice."""
+    is scored instead by its `steadiness`. Only starts with a neighbouring cycle are scored; a clip too short for any
+    falls back to the seam. Among the starts within STEADY_TOL of the steadiest, the cleanest seam wins (as
+    `best_start`), so a clip that repeats exactly keeps the seam choice."""
     first, length = int(np.ceil(LEAD_IN * len(values))), len(values)
     candidates = list(range(first, int(np.floor(length - 1 - period)) + 1))
     if not candidates:
         raise FactsError("No full cycle after the lead-in; generate a longer video")
-    n = max(2, int(round(period)))
-    phase = np.arange(n) * period / n
-    scores = {}
-    for s in candidates:
-        here = resample(values, s + phase)
-        terms = [float(np.mean(np.sum((here - resample(values, s + shift + phase)) ** 2, axis=1)))
-                 for shift in (period, -period) if 0 <= s + shift and s + shift + period <= length - 1]
-        if terms:
-            scores[s] = float(np.mean(terms))
+    scores = {s: v for s in candidates if (v := steadiness(values, period, s)) is not None}
     if not scores:
         return best_start(values, period)
-    x = values - values.mean(axis=0)
-    scale = 2 * float(np.mean(np.sum(x ** 2, axis=1))) or 1.0
     low = min(scores.values())
-    steady = [s for s, v in scores.items() if v <= low + STEADY_TOL * scale]
+    steady = [s for s, v in scores.items() if v <= low + STEADY_TOL]
     later = resample(values, np.array(steady, float) + period)
     return min(steady, key=lambda s: float(np.sum((values[s] - later[steady.index(s)]) ** 2)))
 
@@ -154,9 +173,20 @@ def clip_facts(poses, project, brief):
         masks = {c: contact_mask(cycle[c][:, 1]) for c in chains}
         touchdown = int(round(contact_window(masks[origin])[0][0] * n))
         if touchdown:
+            steadiest = start
             start += touchdown * period / n
             if start > last:
                 start -= float(np.ceil((start - last) / period)) * period
+                if start >= first:
+                    # Moving back whole periods must not land in the warm-up: the moved cycle must be about as
+                    # steady as the steadiest one.
+                    moved, best = steadiness(values, period, start), steadiness(values, period, steadiest)
+                    if moved is not None and best is not None and moved > best + WRAP_TOL:
+                        raise FactsError(
+                            f"No steady cycle that starts at the {origin} touchdown fits in the clip: the steadiest "
+                            f"cycle starts at frame {steadiest}, its touchdown falls too late, and the cycle a period "
+                            f"earlier (from frame {start:.1f}) is not steady (score {moved:.2f} vs {best:.2f}); "
+                            f"generate a longer video")
             if start < first:
                 raise FactsError(f"No full cycle that starts at the {origin} touchdown fits after the lead-in "
                                  f"(the first {first} frames); generate a longer video")

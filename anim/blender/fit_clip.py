@@ -20,7 +20,10 @@ scales with coarse grid searches over the legs, and the best is polished with lo
 The prior only steadies the tracking (W_SMOOTH is small next to the silhouette term), and a tracked frame does not
 keep the first local minimum it finds: each leg pair is tried exchanged, the spine and neck from rest and every chain
 from random restarts, and a frame still below RESTART_IOU is solved again from scratch like the first frame; when
-that global solution wins, tracking continues from it without the old velocity.
+that global solution wins, tracking continues from it without the old velocity. Candidates are compared with the
+tracked pose at one pyramid level, and a winner is kept only if, polished, it also wins at full resolution
+(anim/fitsearch.py). Approach-C paw keypoints (anim/paws.py) add a soft, capped paw term: a leg folded into the body
+costs nothing in IoU but leaves a paw in the mask unclaimed.
 
 Left and right legs give the same side silhouette, so after the forward pass each leg pair's identity is relabelled
 per frame by dynamic programming (marks plus smooth velocity; a span refit also takes up to two fixed frames on
@@ -38,6 +41,7 @@ import bpy  # noqa: E402
 import numpy as np  # noqa: E402
 from mathutils import Matrix  # noqa: E402
 import rigutil  # noqa: E402
+from anim import fitsearch, paws  # noqa: E402
 from anim.camera import SideCamera  # noqa: E402
 
 LEVELS = (0.25, 0.5, 1.0)                       # pyramid levels, as fractions of the working resolution
@@ -154,12 +158,17 @@ class Rig:
         return out
 
     def tails_xz(self, angles, dx, dz, names_):
+        return {n: p for (n, _), p in zip([(n, "tail") for n in names_],
+                                          self.points_xz(angles, dx, dz, [(n, "tail") for n in names_]))}
+
+    def points_xz(self, angles, dx, dz, wanted):
+        """The x/z world points of [(bone, "head" | "tail")], from one forward-kinematics pass."""
         mats = self.pose(angles)
-        out = {}
-        for n in names_:
+        out = []
+        for n, end in wanted:
             i = self.index[n]
-            p = self.arm_world @ mats[i] @ np.array([0.0, self.length[i], 0.0, 1.0])
-            out[n] = np.array([p[0] + dx, p[2] + dz])
+            p = self.arm_world @ mats[i] @ np.array([0.0, self.length[i] if end == "tail" else 0.0, 0.0, 1.0])
+            out.append(np.array([p[0] + dx, p[2] + dz]))
         return out
 
 
@@ -359,10 +368,56 @@ print(f"VID2GODOT_FIT pyramid ready in {time.time() - t0:.1f}s; samples "
       + ", ".join(f"{k}: {levels[k].samples}" for k in LEVELS), flush=True)
 
 
+# ----------------------------------------------------------------------------------------- automatic paw keypoints
+# Approach C as soft marks (anim/paws.py): the paws found in each mask, kept where they persist from frame to frame;
+# each fitted paw (the middle of its paw bone) should be near a detected paw its leg can reach, each detected paw near
+# a fitted paw (or the tail tip or the head, which may hang below the body line), and a paw drawn inside the torso
+# costs its depth while a detected paw has no leg. The term is zero within PAW_DEADZONE, so a clean fit is unchanged.
+paw_chains = [c for pair in project["legPairs"] for c in pair if c in brief["fitChains"] and c in project["paws"]]
+paw_bones = [project["paws"][c] for c in paw_chains]
+root_bones = [project["chains"][c][0] for c in paw_chains]
+other_bones = [b for b in ([project["chains"]["tail"][-1]] if "tail" in project["chains"] else [])
+               + ([project["headBone"]] if project.get("headBone") else []) if b in rig.index]
+KEY_POINTS = ([(b, "head") for b in paw_bones] + [(b, "tail") for b in paw_bones]
+              + [(b, "head") for b in root_bones] + [(b, "tail") for b in other_bones])
+REACH_SLACK = 1.2               # a leg reaches at most this share more than its rest length (camera scale, stretch)
+
+
+def key_points(x, cam):
+    """(fitted paws, leg roots, other extremities) in working px."""
+    if FAST:
+        pts = rig.points_xz(x[2:N], x[0], x[1], KEY_POINTS)
+    else:
+        apply(x)
+        pts = [np.array(rigutil.bone_point(arm, b, end)) for b, end in KEY_POINTS]
+    uv = cam.project(np.array(pts)) if pts else np.zeros((0, 2))
+    n = len(paw_bones)
+    return 0.5 * (uv[:n] + uv[n:2 * n]), uv[2 * n:3 * n], uv[3 * n:]
+
+
+t0 = time.time()
+detected = paws.track([np.array([p["blob"] for p in paws.find_paws(m, max_paws=max(2, len(paw_bones)))])
+                       for m in masks]) if paw_bones else [np.zeros((0, 2))] * frame_count
+body_rows = [paws.body_line(m) if m.any() else 0 for m in masks]
+if paw_bones:
+    rest_paws, rest_roots, _ = key_points(np.concatenate([np.zeros(N), [1.0]]), base_camera)
+    reach = REACH_SLACK * np.hypot(*(rest_paws - rest_roots).T)
+print(f"VID2GODOT_FIT paw keypoints in {time.time() - t0:.1f}s: "
+      f"{sum(len(d) for d in detected)} over {frame_count} frames", flush=True)
+
+
+def paw_term(x, f, cam):
+    if not paw_bones or not len(detected[f]):
+        return 0.0
+    fitted, roots, others = key_points(x, cam)
+    return paws.penalty(fitted, detected[f], body_rows[f], masks[f], roots, reach, others)
+
+
 # ------------------------------------------------------------------------------------------------ the objective
 def score(x, f, prior, k, w_marks=W_MARKS):
     uv, cam = posed_uv(x)
     loss, _ = levels[k].loss(uv, f)
+    loss += paw_term(x, f, cam)
     if f in marks and w_marks:
         points = mark_points(x, cam, list(marks[f]))
         loss += w_marks * float(np.mean([np.hypot(*(points[b] - p)) for b, p in marks[f].items()]))
@@ -550,30 +605,28 @@ def frame_iou(x, f):
 
 def search(x, f, prior, free_scale):
     """Leave the tracked pose's local minimum: each leg pair exchanged, the spine and neck from rest, and RESTARTS
-    random restarts of every chain, each solved over its own joints at the middle level and kept when the whole
-    objective (prior included) improves; any change is then polished at full resolution."""
+    random restarts of every chain (about the best pose so far), each solved over its own joints at the middle level.
+    The tracked pose and every candidate are scored there alike (prior included); a winner is polished at full
+    resolution and kept only if its full-resolution objective beats the tracked pose's (fitsearch.search)."""
     k = LEVELS[1]
-    best, start = score(x, f, prior, k), x.copy()
-    candidates = []
-    for pair in pairs:
-        candidates.append((swapped(x, pair), pair[2] + pair[3]))
+    candidates = [(lambda best, y=swapped(x, pair): y, pair[2] + pair[3]) for pair in pairs]
     if trunk:
-        y = x.copy()
-        y[trunk] = 0.0
-        candidates.append((y, trunk + [0, 1]))
+        rest = x.copy()
+        rest[trunk] = 0.0
+        candidates.append((lambda best, y=rest: y, trunk + [0, 1]))
+
+    def perturb(best, idx):
+        y = best.copy()
+        y[idx] += rng.normal(0.0, RESTART_SIGMA, len(idx))
+        return y
     for chain, idx in chain_indices.items():
-        for _ in range(RESTARTS):
-            candidates.append((None, idx))
-    for y, idx in candidates:
-        if y is None:            # a random restart about the best pose so far
-            y = x.copy()
-            y[idx] += rng.normal(0.0, RESTART_SIGMA, len(idx))
-        y, loss = descend(clamp(y), f, prior, schedule=(k,), only=set(idx))
-        if loss < best - 1e-6:
-            x, best = y, loss
-    if not np.array_equal(x, start):
-        x, _ = descend(x, f, prior, free_scale=free_scale, schedule=LEVELS[2:])
-    return x
+        candidates += [(lambda best, idx=idx: perturb(best, idx), idx)] * RESTARTS
+    return fitsearch.search(
+        x, candidates,
+        solve=lambda y, idx: descend(clamp(y), f, prior, schedule=(k,), only=set(idx))[0],
+        coarse=lambda y: score(y, f, prior, k),
+        fine=lambda y: score(y, f, prior, 1.0),
+        polish=lambda y: descend(y, f, prior, free_scale=free_scale, schedule=LEVELS[2:])[0])
 
 
 def restart(x, f, free_scale):
