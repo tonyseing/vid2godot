@@ -228,7 +228,7 @@ def run_generate(client, out_dir, model_id, brief, reference_png, background, ca
     warnings = []
     if each is None:
         warnings.append("first candidate's cost is unbounded (price unknown)")
-    record = {"modelRequested": model_id, "estimateUsd": estimate, "pricingBasis": basis, "prompt": prompt,
+    record = {"modelRequested": model_id, "estimateUsd": None if each is None else estimate, "pricingBasis": basis, "prompt": prompt,
               "size": [w, h], "generateAudio": audio,
               "candidates": [], "jobs": [], "warnings": warnings}
     spent, observed, unpriced = 0.0, 0.0, []

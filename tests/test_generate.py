@@ -396,7 +396,7 @@ class PerSecondGenerateTests(unittest.TestCase):
         self.assertFalse(client.submit_called)
         client = FakeClient(info=info, cost=0.5)
         record = generate.run_generate(client, self.tmp / "gen2", "m", BRIEF, self.png, "#c8c8c8", max_cost=5.0)
-        self.assertEqual(record["estimateUsd"], 0)
+        self.assertIsNone(record["estimateUsd"])
         self.assertTrue(record["pricingBasis"].startswith("unknown"))
         self.assertIn("first candidate's cost is unbounded (price unknown)", record["warnings"])
 
