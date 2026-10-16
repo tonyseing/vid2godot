@@ -1,4 +1,9 @@
-"""Godot checks through game-asset-3d-pipeline's verifier, and the evaluation bundle export."""
+"""Godot checks through game-asset-3d-pipeline's verifier, and the evaluation bundle export.
+
+Task 19: verify shows the clip playing. For each of PHASES the verifier's folder is copied and its capture script
+patched (`phase_verifier`) to seek the clip to that phase of its length before every capture, to name each PNG for the
+phase and to record the phase, the clip and the clip time in each capture entry; the 3D skill's own files are never
+changed. A patch marker the capture script no longer holds is a refusal, not a capture of the rest pose."""
 import json
 import math
 import os
@@ -11,6 +16,30 @@ from pathlib import Path, PurePosixPath
 from anim.ledger import StageError, sha256_file
 
 DEFAULT = Path.home() / ".agents/skills/game-asset-3d-pipeline/forge/godot/verify.py"
+PHASES = (0.0, 1 / 3, 2 / 3)
+CAPTURE_SCRIPT = "capture_asset.gd"
+SEEK = """
+\tvar clip_player: AnimationPlayer = null
+\tfor node in model.find_children("*", "AnimationPlayer", true, false):
+\t\tif (node as AnimationPlayer).has_animation(CLIP_NAME):
+\t\t\tclip_player = node as AnimationPlayer
+\t\t\tbreak
+\tif clip_player == null:
+\t\t_fail("No AnimationPlayer in the GLB holds the clip " + CLIP_NAME)
+\t\treturn
+\tvar clip_seconds: float = clip_player.get_animation(CLIP_NAME).length * CLIP_PHASE
+\tclip_player.play(CLIP_NAME)
+\tclip_player.seek(clip_seconds, true)
+\tclip_player.pause()
+"""
+# (what the 3D skill's capture script holds, what vid2godot puts there); each must occur exactly once.
+PATCHES = (("extends SceneTree\n", "extends SceneTree\n\nconst CLIP_NAME := {clip}\nconst CLIP_PHASE := {phase}\n"
+                                    "const PHASE_TAG := {tag}\n"),
+           ("\tscene.add_child(model)\n", "\tscene.add_child(model)\n" + SEEK.lstrip("\n")),
+           ('"captures/%s-%s.png" % [profile["name"], view["name"]]',
+            '"captures/phase%03d-%s-%s.png" % [PHASE_TAG, profile["name"], view["name"]]'),
+           ('captures.append({"path": filename,',
+            'captures.append({"phase": CLIP_PHASE, "clip": CLIP_NAME, "clipSeconds": clip_seconds, "path": filename,'))
 
 
 class VerifyError(StageError):
@@ -23,6 +52,47 @@ def verifier(explicit=None):
         raise VerifyError(f"Godot checks use game-asset-3d-pipeline's forge/godot/verify.py, not found at {path}; "
                           "install that skill (img2godot) or pass --threed-verify")
     return path
+
+
+def phase_tag(phase):
+    return int(round(phase * 1000))
+
+
+def phase_verifier(script, clip, phase, out_dir):
+    """A copy of the verifier's folder in `out_dir` whose capture script seeks `clip` to `phase` (a share of its
+    length) before capturing; returns the copy's verify.py. Refuses when the capture script lacks a patch point."""
+    script, out_dir = Path(script), Path(out_dir)
+    source = script.parent / CAPTURE_SCRIPT
+    if not source.is_file():
+        raise VerifyError(f"The 3D skill's capture script is missing beside {script}: {source}")
+    text = source.read_text()
+    for marker, replacement in PATCHES:
+        if text.count(marker) != 1:
+            raise VerifyError(f"The 3D skill's capture script changed: {source} holds {text.count(marker)} of "
+                              f"{marker.strip()!r}, where vid2godot seeks the clip to each phase; update "
+                              f"anim/verify.py's PATCHES")
+        text = text.replace(marker, replacement.replace("{clip}", json.dumps(clip))
+                            .replace("{phase}", f"{phase:.6f}").replace("{tag}", str(phase_tag(phase))))
+    if out_dir.exists():
+        shutil.rmtree(out_dir)
+    shutil.copytree(script.parent, out_dir, ignore=shutil.ignore_patterns("__pycache__"))
+    (out_dir / CAPTURE_SCRIPT).write_text(text)
+    return out_dir / script.name
+
+
+def combine(reports, script):
+    """One engine's report from its phase runs [(phase, report path, report)]: the first run's fields, every run's
+    captures (each with its phase), the phases and runs, and the 3D skill's verifier the patches were made from."""
+    first = reports[0][2]
+    source = Path(script).parent / CAPTURE_SCRIPT
+    return {**first, "captures": [c for _, _, r in reports for c in (r.get("captures") or [])],
+            "phases": [round(p, 6) for p, _, _ in reports],
+            "runs": [{"phase": round(p, 6), "report": str(path), "status": r.get("status"),
+                      "captureScriptSha256": sha256_file(Path(path).parent / "verifier" / CAPTURE_SCRIPT)
+                      if (Path(path).parent / "verifier" / CAPTURE_SCRIPT).is_file() else None}
+                     for p, path, r in reports],
+            "verifier": {"path": str(script), "sha256": sha256_file(script),
+                         "captureScriptSha256": sha256_file(source) if source.is_file() else None}}
 
 
 def run_verify(script, model, out, godot, launcher=None):
@@ -56,7 +126,7 @@ def _number(value):
     return isinstance(value, (int, float)) and not isinstance(value, bool) and math.isfinite(value)
 
 
-def check_report(report, model_sha, clip, duration_s, fps, version_prefix, launcher_used=False):
+def check_report(report, model_sha, clip, duration_s, fps, version_prefix, launcher_used=False, phase=None):
     if not isinstance(report, dict):
         return ["The Godot report is not a JSON object"]
     problems = []
@@ -79,6 +149,11 @@ def check_report(report, model_sha, clip, duration_s, fps, version_prefix, launc
                 path = item.get("path") if isinstance(item, dict) else None
                 if not isinstance(path, str) or not Path(path).is_file():
                     problems.append(f"Capture missing on disk: {path!r}")
+                if phase is not None and isinstance(item, dict):
+                    got = item.get("phase")
+                    if not _number(got) or abs(got - phase) > 1e-6 or item.get("clip") != clip:
+                        problems.append(f"Capture {path!r} records phase {got!r} of clip {item.get('clip')!r}, not "
+                                        f"phase {phase:.6f} of {clip!r}")
     facts = report.get("facts")
     animations = facts.get("animations") if isinstance(facts, dict) else None
     if not isinstance(animations, list):

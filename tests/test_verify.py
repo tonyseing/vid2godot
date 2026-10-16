@@ -222,14 +222,30 @@ class VerifyExportPipelineTests(unittest.TestCase):
 
     def setUp(self):
         self.tmp = Path(tempfile.mkdtemp())
-        model = self.tmp / "fox.glb"
+        self.work = self.ledger_to_review(self.tmp)
+        # Changed with Task 19: verify patches the 3D skill's capture script for each clip phase, so the fake
+        # verifier sits in a folder beside a capture script.
+        self.script = self.fake_skill(self.tmp / "skill", PHASED)
+        self.engines = ["--godot47", str(self.tmp / "godot-4.7"), "--godot45", str(self.tmp / "godot-4.5")]
+
+    @staticmethod
+    def fake_skill(folder, verifier):
+        folder.mkdir(parents=True)
+        (folder / "verify.py").write_text(verifier)
+        (folder / "capture_asset.gd").write_text(CAPTURE_GD)
+        return folder / "verify.py"
+
+    @staticmethod
+    def ledger_to_review(tmp):
+        """A synthetic ledger through `review` (stand-in files); returns the work folder."""
+        model = tmp / "fox.glb"
         model.write_bytes(b"fox")
-        self.work = self.tmp / "work"
-        ledger = Ledger.init(self.work, model, "lope")
+        work = tmp / "work"
+        ledger = Ledger.init(work, model, "lope")
         made = {}
 
         def make(name, content=None):
-            path = self.work / name
+            path = work / name
             path.parent.mkdir(parents=True, exist_ok=True)
             path.write_text(content if content is not None else name)
             made[name] = path
@@ -249,9 +265,7 @@ class VerifyExportPipelineTests(unittest.TestCase):
         make("review/overlays/00000.png")
         make("review/overlays/00001.png")
         ledger.record("review", {"lab": make("review/lab.html")}, {"review": make("review/review.json")})
-        self.script = self.tmp / "fake_verify.py"
-        self.script.write_text(CAPTURING)
-        self.engines = ["--godot47", str(self.tmp / "godot-4.7"), "--godot45", str(self.tmp / "godot-4.5")]
+        return work
 
     def tearDown(self):
         shutil.rmtree(self.tmp)
@@ -264,19 +278,125 @@ class VerifyExportPipelineTests(unittest.TestCase):
         code, data, err = run_cli("export", "--work", str(self.work), "--destination", str(destination))
         self.assertEqual(code, 0, err)
         manifest = json.loads((destination / "MANIFEST.json").read_text())
-        for name in ("captures/4.7/phone-front.png", "captures/4.7/tablet-side.png", "captures/4.5/phone-front.png",
-                     "captures/4.5/tablet-side.png", "lab.html", "overlays/00000.png", "overlays/00001.png"):
+        for name in ("captures/4.7/phase000-phone-side.png", "captures/4.7/phase667-tablet-side.png",
+                     "captures/4.5/phase333-phone-side.png", "captures/4.5/phase000-tablet-side.png", "lab.html",
+                     "overlays/00000.png", "overlays/00001.png"):
             self.assertIn(name, manifest)
             self.assertEqual(manifest[name], sha256_file(destination / name))
-        self.assertEqual((destination / "captures" / "4.5" / "phone-front.png").read_bytes(),
-                         b"4.5.1.stable.officialphone-front.png")
+        self.assertEqual((destination / "captures" / "4.5" / "phase000-phone-side.png").read_bytes(),
+                         b"4.5.1.stable.officialphase000-phone-side.png")
 
     def test_verify_refuses_a_headless_report(self):
-        headless = self.tmp / "headless_verify.py"
-        headless.write_text(CAPTURING.replace('if "--launcher" in args:', "if False:")
-                            .replace('"activation-suppressed capture" if "--launcher" in args else ', ""))
+        headless = self.fake_skill(self.tmp / "headless", PHASED.replace(
+            '"mode": "activation-suppressed capture", "captures": captures',
+            '"mode": "headless", "captures": []'))
         code, _, err = run_cli("verify", "--work", str(self.work), *self.engines, "--launcher",
                                str(self.tmp / "launcher.mjs"), "--threed-verify", str(headless))
         self.assertEqual(code, 1)
         self.assertIn("[4.7]", err)
         self.assertIn("capture", err)
+
+
+# Task 19 step 5: the 3D skill's capture script, as far as vid2godot's phase patch reads it.
+CAPTURE_GD = '''extends SceneTree
+
+func _capture() -> void:
+	var model := packed.instantiate() as Node3D
+	scene.add_child(model)
+	for profile in PROFILES:
+		for view in VIEWS:
+			var filename: String = "captures/%s-%s.png" % [profile["name"], view["name"]]
+			captures.append({"path": filename, "profile": profile["name"], "view": view["name"]})
+'''
+
+PHASED = '''
+import hashlib, json, re, sys
+from pathlib import Path
+HERE = Path(__file__).resolve().parent
+args = dict(zip(sys.argv[1::2], sys.argv[2::2]))
+out = Path(args["--out"]); out.mkdir(parents=True, exist_ok=True)
+sha = hashlib.sha256(Path(args["--model"]).read_bytes()).hexdigest()
+version = "4.5.1.stable.official" if "4.5" in Path(args["--godot"]).name else "4.7.2.stable.official"
+script = (HERE / "capture_asset.gd").read_text()
+phase = float(re.search(r"const CLIP_PHASE := ([0-9.]+)", script).group(1))
+clip = re.search(r'const CLIP_NAME := "([^"]+)"', script).group(1)
+tag = int(re.search(r"const PHASE_TAG := ([0-9]+)", script).group(1))
+assert "clip_player.seek(clip_seconds, true)" in script
+captures = []
+folder = out / "run-1" / "project" / "captures"; folder.mkdir(parents=True, exist_ok=True)
+for name in ("phone-side", "tablet-side"):
+    path = folder / ("phase%03d-%s.png" % (tag, name))
+    path.write_bytes(version.encode() + path.name.encode())
+    captures.append({"profile": name.split("-")[0], "view": "side", "path": str(path), "phase": phase, "clip": clip,
+                     "clipSeconds": 0.5 * phase})
+report = {"status": "passed", "modelSha256": sha, "engine": {"version": version},
+          "mode": "activation-suppressed capture", "captures": captures,
+          "facts": {"animations": [{"name": "lope", "lengthSeconds": 0.5, "tracks": 30, "loopMode": 0}]}}
+(out / "godot-report.json").write_text(json.dumps(report))
+'''
+
+
+class PhaseCaptureTests(unittest.TestCase):
+    """Task 19 step 5: verify captures the clip playing, at PHASES of its length, in every view: the 3D skill's
+    capture script is copied and patched to seek the clip before each capture, and the report records the phase."""
+
+    def setUp(self):
+        self.tmp = Path(tempfile.mkdtemp())
+        self.addCleanup(shutil.rmtree, self.tmp)
+        self.skill = self.tmp / "forge" / "godot"
+        self.skill.mkdir(parents=True)
+        (self.skill / "verify.py").write_text(PHASED)
+        (self.skill / "capture_asset.gd").write_text(CAPTURE_GD)
+        (self.skill / "inspect_asset.gd").write_text("extends SceneTree\n")
+
+    def test_the_patch_seeks_the_clip_and_tags_each_capture(self):
+        script = verify.phase_verifier(self.skill / "verify.py", "lope", 1 / 3, self.tmp / "patched")
+        self.assertEqual(script, self.tmp / "patched" / "verify.py")
+        self.assertEqual((self.tmp / "patched" / "inspect_asset.gd").read_text(), "extends SceneTree\n")
+        patched = (self.tmp / "patched" / "capture_asset.gd").read_text()
+        self.assertIn('const CLIP_NAME := "lope"', patched)
+        self.assertIn("const CLIP_PHASE := 0.333333", patched)
+        self.assertIn("clip_player.play(CLIP_NAME)", patched)
+        self.assertLess(patched.index("scene.add_child(model)"), patched.index("clip_player.seek"))
+        self.assertIn('"captures/phase%03d-%s-%s.png" % [PHASE_TAG,', patched)
+        self.assertIn('captures.append({"phase": CLIP_PHASE, "clip": CLIP_NAME, "clipSeconds": clip_seconds,', patched)
+        self.assertEqual((self.skill / "capture_asset.gd").read_text(), CAPTURE_GD, "the skill's copy is untouched")
+
+    def test_a_changed_capture_script_is_refused(self):
+        (self.skill / "capture_asset.gd").write_text(CAPTURE_GD.replace("scene.add_child(model)", "add(model)"))
+        with self.assertRaisesRegex(verify.VerifyError, "capture script"):
+            verify.phase_verifier(self.skill / "verify.py", "lope", 0.0, self.tmp / "patched")
+
+    def test_check_report_requires_the_phase_on_every_capture(self):
+        model = self.tmp / "m.glb"
+        model.write_bytes(b"glb")
+        script = verify.phase_verifier(self.skill / "verify.py", "lope", 2 / 3, self.tmp / "patched")
+        report = verify.run_verify(script, model, self.tmp / "out", Path(self.tmp / "godot-4.7"), self.tmp / "l.mjs")
+        sha = sha256_file(model)
+        self.assertEqual(verify.check_report(report, sha, "lope", 0.5, 60.0, "4.7", launcher_used=True,
+                                             phase=2 / 3), [])
+        problems = verify.check_report(report, sha, "lope", 0.5, 60.0, "4.7", launcher_used=True, phase=0.0)
+        self.assertTrue(any("phase" in p for p in problems), problems)
+        del report["captures"][0]["phase"]
+        problems = verify.check_report(report, sha, "lope", 0.5, 60.0, "4.7", launcher_used=True, phase=2 / 3)
+        self.assertTrue(any("phase" in p for p in problems), problems)
+
+    def test_verify_runs_every_phase_on_both_engines_and_export_bundles_them(self):
+        work = VerifyExportPipelineTests.ledger_to_review(self.tmp)
+        engines = ["--godot47", str(self.tmp / "godot-4.7"), "--godot45", str(self.tmp / "godot-4.5")]
+        code, data, err = run_cli("verify", "--work", str(work), *engines, "--launcher", str(self.tmp / "l.mjs"),
+                                  "--threed-verify", str(self.skill / "verify.py"))
+        self.assertEqual(code, 0, err)
+        for prefix in ("4.7", "4.5"):
+            report = json.loads((work / "verify" / prefix / "godot-report.json").read_text())
+            self.assertEqual(report["phases"], [0.0, 0.333333, 0.666667])
+            self.assertEqual(sorted({c["phase"] for c in report["captures"]}), [0.0, 0.333333, 0.666667])
+            self.assertEqual(len(report["captures"]), 6)
+            self.assertEqual(len(report["runs"]), 3)
+            self.assertEqual(report["verifier"]["path"], str(self.skill / "verify.py"))
+        destination = self.tmp / "asset-work" / "fox" / "lope-eval"
+        code, _, err = run_cli("export", "--work", str(work), "--destination", str(destination))
+        self.assertEqual(code, 0, err)
+        names = json.loads((destination / "MANIFEST.json").read_text())
+        for tag in ("000", "333", "667"):
+            self.assertIn(f"captures/4.5/phase{tag}-phone-side.png", names)

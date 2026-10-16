@@ -420,17 +420,27 @@ def cmd_verify(a):
     facts = load_json(ledger.output("facts", "facts"))
     outputs, problems = {}, []
     for prefix, engine in (("4.7", a.godot47), ("4.5", a.godot45)):
-        report = verify_mod.run_verify(script, glb, ledger.work / "verify" / prefix, engine, a.launcher)
-        # The clip's length tolerance is 1.5 frames at the baked clip's own (resampled) rate, not the ingest rate.
-        problems += [f"[{prefix}] {p}" for p in verify_mod.check_report(
-            report, sha256_file(glb), ledger.clip, facts["entry"]["duration_s"], facts["cycle"]["fps"], prefix,
-            launcher_used=True)]
-        outputs[f"report{prefix.replace('.', '')}"] = ledger.work / "verify" / prefix / "godot-report.json"
+        folder = ledger.work / "verify" / prefix
+        reports = []
+        # The clip playing: one capture run per phase of its length, each with the 3D skill's capture script
+        # patched to seek the clip there first (verify.phase_verifier).
+        for phase in verify_mod.PHASES:
+            out = folder / f"phase{verify_mod.phase_tag(phase):03d}"
+            patched = verify_mod.phase_verifier(script, ledger.clip, phase, out / "verifier")
+            report = verify_mod.run_verify(patched, glb, out, engine, a.launcher)
+            # The clip's length tolerance is 1.5 frames at the baked clip's own (key) rate, not the ingest rate.
+            problems += [f"[{prefix}] phase {phase:.2f}: {p}" for p in verify_mod.check_report(
+                report, sha256_file(glb), ledger.clip, facts["entry"]["duration_s"], facts["cycle"]["fps"], prefix,
+                launcher_used=True, phase=phase)]
+            reports.append((phase, out / "godot-report.json", report))
+        combined = verify_mod.combine(reports, script)
+        (folder / "godot-report.json").write_text(json.dumps(combined, indent=2))
+        outputs[f"report{prefix.replace('.', '')}"] = folder / "godot-report.json"
     if problems:
         raise StageError("Godot verification failed:\n- " + "\n- ".join(problems))
     ledger.record("verify", {"glb": glb}, outputs)
     emit({"ok": True, "reports": {k: str(v) for k, v in outputs.items()},
-          "next": "Open every capture PNG listed in both reports, then `export`."})
+          "next": "Open every capture PNG listed in both reports (each phase of the clip), then `export`."})
 
 
 @command("export")
