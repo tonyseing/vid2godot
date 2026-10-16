@@ -6,7 +6,7 @@ import numpy as np
 from PIL import Image
 
 from anim import raster
-from anim.facts import contact_mask
+from anim.facts import contact_masks
 from anim.ledger import StageError, sha256_file
 
 ARTISTIC_ROUNDS = 2
@@ -32,8 +32,10 @@ def draw_overlays(work, poses, projection_npz, masks_npz, out_dir):
 
 
 def contact_timeline(poses, project):
-    return {bone: contact_mask(np.array([f["paws"][chain][1] for f in poses["frames"]])).tolist()
-            for chain, bone in project["paws"].items()}
+    """Each paw's frames on the ground, against the one ground shared by every paw (facts.ground_height)."""
+    masks = contact_masks({chain: np.array([f["paws"][chain][1] for f in poses["frames"]])
+                           for chain in project["paws"]})
+    return {bone: masks[chain].tolist() for chain, bone in project["paws"].items()}
 
 
 def lab_page(clip, report, threshold, timeline, hashes):

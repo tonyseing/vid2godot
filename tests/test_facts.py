@@ -362,3 +362,122 @@ class VideoCycleTests(unittest.TestCase):
         self.assertAlmostEqual(result["maskPeriod"]["period"], 12, delta=0.15)
         self.assertAlmostEqual(result["period"], 24, delta=0.3)
         self.assertTrue(result["maskPeriod"]["doubled"])
+
+
+def lope(frames=120, period=20, windows=None, lift=0.1):
+    """A three-beat lope with a lead and one suspension: each paw is on the ground (height 0) over its window (phase
+    fractions [touchdown, liftoff)) and lifts off steeply, arcing up to `lift` between; the joints swing at the touchdown phases."""
+    windows = windows or {"hind_L": (0.0, 0.3), "hind_R": (0.3, 0.55), "front_L": (0.3, 0.55),
+                          "front_R": (0.55, 0.8)}
+    poses = synthetic(frames=frames, period=period, phases={c: w[0] for c, w in windows.items()})
+    for entry in poses["frames"]:
+        t = entry["index"] / period
+        for chain, (on, off) in windows.items():
+            phase = (t - on) % 1.0
+            stance = (off - on) % 1.0
+            swing = 0.0 if phase < stance else math.sin(math.pi * (phase - stance) / (1.0 - stance)) ** 0.25
+            entry["paws"][chain][1] = lift * swing
+    return poses
+
+
+class GroundContactTests(unittest.TestCase):
+    """Task 17b fix round 3: contacts are measured against one ground shared by every paw, not each paw's own
+    lowest point, so a paw that never comes down to it has no contact (`plants: false`), and the beats, lead,
+    suspension and ground speed come from the planted paws only."""
+
+    def test_ground_is_shared_by_all_paws(self):
+        heights = {"hind_L": np.array([0.0, 0.0, 0.1, 0.2]), "front_L": np.array([0.05, 0.06, 0.1, 0.2])}
+        ground = facts.ground_height(heights)
+        self.assertAlmostEqual(ground, 0.0, delta=1e-9)
+        masks = facts.contact_masks(heights, ground)
+        self.assertEqual(masks["hind_L"].tolist(), [True, True, False, False])
+        self.assertFalse(masks["front_L"].any(), "a paw 5 cm over the shared ground never touches it")
+
+    def test_lope_beats_lead_and_suspension(self):
+        result = run(lope())
+        self.assertAlmostEqual(result["period"], 20, delta=0.1)
+        gait = result["gait"]
+        self.assertEqual(gait["beats"], 3)
+        self.assertEqual([sorted(b) for b in gait["beatPaws"]], [["hind_L"], ["front_L", "hind_R"], ["front_R"]])
+        np.testing.assert_allclose(gait["beatPhases"], [0.0, 0.3, 0.55], atol=0.051)
+        self.assertEqual(gait["lead"], {"front": "front_R", "hind": "hind_R"})
+        self.assertEqual(len(gait["suspensions"]), 1)
+        np.testing.assert_allclose(gait["suspensions"][0], [0.8, 1.0], atol=0.051)
+        self.assertEqual(gait["neverPlants"], [])
+        self.assertTrue(all(p["plants"] for p in result["paws"].values()))
+        self.assertAlmostEqual(result["speedMps"], 3.0, delta=0.05)
+
+    def test_a_paw_that_never_reaches_the_ground_never_plants(self):
+        poses = lope()
+        for entry in poses["frames"]:
+            entry["paws"]["front_L"][1] += 0.06          # front_L's lowest point is 6 cm over the ground
+        result = run(poses)
+        self.assertIs(result["paws"]["front_L"]["plants"], False)
+        self.assertAlmostEqual(result["paws"]["front_L"]["lowestAboveGround"], 0.06, delta=0.005)
+        self.assertTrue(all(result["paws"][c]["plants"] for c in ("hind_L", "hind_R", "front_R")))
+        gait = result["gait"]
+        self.assertEqual(gait["neverPlants"], ["front_L"])
+        self.assertEqual(gait["beats"], 3)
+        self.assertEqual(gait["beatPaws"], [["hind_L"], ["hind_R"], ["front_R"]])
+        self.assertEqual(gait["lead"], {"front": None, "hind": "hind_R"})
+        entry = result["entry"]
+        self.assertNotIn("paw_fl", entry["contacts"])
+        self.assertNotIn("paw_fl", entry["footfall_phase"])
+        self.assertEqual(entry["duty_factor"]["paw_fl"], 0.0)
+        self.assertAlmostEqual(result["speedMps"], 3.0, delta=0.05, msg="speed from the three planted paws")
+
+    def test_under_two_planted_paws_have_no_speed(self):
+        poses = lope()
+        for entry in poses["frames"]:
+            for chain in ("front_L", "front_R", "hind_R"):
+                entry["paws"][chain][1] += 0.06
+        result = run(poses)
+        self.assertIsNone(result["speedMps"])
+        self.assertIsNone(result["strideM"])
+        self.assertIsNone(result["entry"]["authored_speed_mps"])
+        self.assertIsNone(result["entry"]["stride_m"])
+        self.assertRegex(result["speedReason"], "1 paw plants")
+        self.assertEqual(result["gait"]["neverPlants"], ["front_L", "hind_R", "front_R"])
+        self.assertEqual(result["gait"]["beats"], 1)
+
+    def test_one_shot_uses_the_shared_ground(self):
+        frames = [{"index": f, "values": [0.0, 0.0, 0.1 * f, 0.0, 0.0, 0.0], "flags": [],
+                   "paws": {"hind_L": [-3.0 * f / 24.0, 0.0], "hind_R": [-3.0 * f / 24.0, 0.0],
+                            "front_L": [-3.0 * f / 24.0, 0.1 + 0.01 * (f % 2)], "front_R": [0.0, 0.2]}}
+                  for f in range(11)]
+        poses = {"fps": 24.0, "names": ["dx", "dz", "a", "b", "c", "d"], "frames": frames}
+        result = facts.clip_facts(poses, PROJECT, {"clip": "pounce", "loop": False, "targetSpeedMps": None})
+        self.assertEqual({c: p["plants"] for c, p in result["paws"].items()},
+                         {"hind_L": True, "front_L": False, "hind_R": True, "front_R": False})
+        self.assertEqual(result["entry"]["contact_windows"]["paw_fl"], [])
+        self.assertNotIn("paw_fl", result["entry"]["contacts"], "no [0, 0] window that would read as a footfall")
+        self.assertAlmostEqual(result["speedMps"], 3.0, places=3)
+
+    def test_leg_period_says_whether_it_passes(self):
+        """legPeriod's score is lower-is-better against its gate; `passes` says so explicitly."""
+        poses = synthetic(frames=120)
+        values = np.array([f["values"] for f in poses["frames"]])
+        good = facts.leg_period(values, poses["names"], PROJECT, 24.0, 12.0)
+        self.assertLess(good["scoreAtPeriod"], good["gate"])
+        self.assertIs(good["passes"], True)
+        noise = values.copy()
+        noise[:, 2:] = np.random.default_rng(1).uniform(-1.5, 1.5, (120, 4))
+        bad = facts.leg_period(noise, poses["names"], PROJECT, 24.0, 12.0)
+        self.assertGreater(bad["scoreAtPeriod"], bad["gate"])
+        self.assertIs(bad["passes"], False)
+        self.assertIs(run(synthetic())["legPeriod"]["passes"], True)
+
+    def test_a_one_sample_lift_inside_a_stance_is_one_contact(self):
+        """Fit noise can lift a planted paw a few millimetres over the tolerance for one sample (the real lope's
+        hind_L does); one free sample between contact samples is bridged, two or more are a real lift."""
+        heights = {"hind_L": np.array([0.1, 0.0, 0.03, 0.0, 0.1, 0.1, 0.1, 0.1]),
+                   "hind_R": np.array([0.0, 0.0, 0.1, 0.1, 0.1, 0.0, 0.0, 0.0])}
+        masks = facts.contact_masks(heights, 0.0, circular=True)
+        self.assertEqual(masks["hind_L"].tolist(), [False, True, True, True, False, False, False, False])
+        self.assertEqual(facts.contact_window(masks["hind_L"])[0], [0.125, 0.5])
+        two = facts.contact_masks({"p": np.array([0.0, 0.1, 0.1, 0.0, 0.1, 0.1])}, 0.0, circular=True)["p"]
+        self.assertEqual(two.tolist(), [True, False, False, True, False, False])
+        wrap = facts.contact_masks({"p": np.array([0.03, 0.0, 0.1, 0.1, 0.1, 0.0])}, 0.0, circular=True)["p"]
+        self.assertEqual(wrap.tolist(), [True, True, False, False, False, True], "the gap at the seam is bridged")
+        edge = facts.contact_masks({"p": np.array([0.03, 0.0, 0.1, 0.1, 0.1, 0.0])}, 0.0)["p"]
+        self.assertEqual(edge.tolist(), [False, True, False, False, False, True], "a clip's ends are not joined")
