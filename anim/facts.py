@@ -29,8 +29,14 @@ pattern is checked against the brief's `gait` (`expected_gait`, `gait_reads`), a
 Heglund-Taylor band for the gait and the body mass (`cadence_check`, CADENCE_LAWS; Task 20: walk, trot or pace,
 canter or gallop): a slow video with one consistent period is retimed to the band centre, recorded in `cadence` and the
 warnings. The brief's `slowMotion` is the expected retime (the measured one decides; both are recorded), and a stride
-under MIN_STRIDE_FRAMES video frames is refused: the video undersamples the steps."""
+under MIN_STRIDE_FRAMES video frames is refused: the video undersamples the steps.
+
+Round 4 (the field vole): the metre tolerances are the wolf's and scale with the rig's leg length (`tolerances`,
+recorded as `bodyScale`); stillness is read from the smooth cycle capped at VELOCITY_ORDER harmonics; the ground
+speed comes from stances only; and a stance the strict reading breaks into touchdowns that all lie inside the paw's
+backward slide is read as that slide (`read_cycle`, recorded as `contactReading`)."""
 import re
+from typing import NamedTuple, Optional
 
 import numpy as np
 
@@ -71,6 +77,20 @@ CONTACT_AGREEMENT = 0.95     # declared contacts vs a re-detection from the bake
 # 1.6-1.8). The round-3 gate (the same rule at the first and last pinned key) is enforced either way.
 EDGE_GATE_SPAN = False
 STILL_SPEED = 0.10           # m/s: the report's "still" for a planted paw in the played clip
+# Round 4 (vole): the metre tolerances above (CONTACT_TOLERANCE, STANCE_TOLERANCE, STILL_SPEED) are the reference
+# body's, the chase3d wolf's: they scale with the rig's leg length (`leg_length`: the mean rest height of the leg
+# chains' top joints, hips and withers, from the contract's rig.json) over REFERENCE_LEG_M, the wolf's own (its
+# rig.json: hips 0.645 m, withers 0.800 m), so at the wolf they are exactly those values.
+REFERENCE_LEG_M = 0.7225002944469452
+# Stillness is read from a velocity without the averaged cycle's per-key jitter: the paws' forward kinematics of
+# the smooth cycle with every column capped at VELOCITY_ORDER harmonics (the most a 15-frame cycle such as the
+# wolf's holds, so its velocity is unchanged; a slow-motion 60-frame cycle carries fit jitter up to its 29th).
+VELOCITY_ORDER = 7
+# When that reading still breaks a planted paw's stance into several touchdowns, all inside the paw's backward slide,
+# the contacts are read for a noisy fit (`read_cycle`): each stance is the slide between the paw's anterior and
+# posterior extreme positions on its x track capped at NOISY['order'] harmonics (the vole round-3 fit holds planted
+# paws 4-17 mm up against a 17-19 mm lift, and its stance speeds jitter by twice the ground speed). Recorded, warned.
+NOISY = {"order": 4}
 MASS_SPREAD = 0.25           # a single massKg m is the range [m (1 - spread), m (1 + spread)]
 CADENCE_CONSISTENCY = 0.10   # every steady cycle's own period within this share of the clip's: one time scale
 RETIME_BOUND = (0.5, 2.0)    # a retime factor outside this needs `facts --accept-retime <reason>` (fix round 1)
@@ -106,6 +126,58 @@ class FactsError(StageError):
 
 class TouchdownError(FactsError):
     """A paw touches down more than once in one cycle (vole round 3: facts then resolves leg identity and retries)."""
+
+
+class Tolerances(NamedTuple):
+    """Round 4: the contact tolerances for one body: the reference (wolf) metres times `scale`, the rig's leg length
+    over REFERENCE_LEG_M."""
+    contact: float
+    stance: float
+    still_speed: float
+    scale: float
+    leg_m: Optional[float]
+    source: str
+
+    def block(self):
+        return {"legLengthM": None if self.leg_m is None else round(self.leg_m, 6), "referenceLegM": REFERENCE_LEG_M,
+                "scale": round(self.scale, 6), "contactToleranceM": round(self.contact, 6),
+                "stanceToleranceM": round(self.stance, 6), "stillSpeedMps": round(self.still_speed, 6),
+                "slipShare": SLIP_SHARE, "velocityOrder": VELOCITY_ORDER, "source": self.source}
+
+
+REFERENCE = Tolerances(CONTACT_TOLERANCE, STANCE_TOLERANCE, STILL_SPEED, 1.0, None,
+                       "the reference (wolf) tolerances: no rig with leg chains to scale them")
+
+
+def leg_length(rig, project):
+    """The rig's leg length: the mean rest height (world z) of each leg chain's top joint, the head of its first bone
+    (the hips; the withers for a chain that starts at the scapula), from the contract's rig.json. (None, why) when
+    the rig names no leg chain's first bone."""
+    bones = {b.get("name"): b for b in (rig or {}).get("bones") or [] if isinstance(b, dict)}
+    chains = [c for pair in project.get("legPairs", []) for c in pair]
+    heights, missing = [], []
+    for chain in chains:
+        first = (project.get("chains", {}).get(chain) or [None])[0]
+        head = bones.get(first, {}).get("head")
+        if isinstance(head, (list, tuple)) and len(head) == 3:
+            heights.append(float(head[2]))
+        else:
+            missing.append(f"{chain} ({first})")
+    if not chains or missing:
+        return None, f"no rest head for {', '.join(missing) or 'any leg chain'}"
+    return float(np.mean(heights)), (f"contract rig.json: mean rest head height of {', '.join(chains)}'s first "
+                                     f"bones ({', '.join(project['chains'][c][0] for c in chains)})")
+
+
+def tolerances(rig, project):
+    """The contact tolerances scaled to the rig (round 4): CONTACT_TOLERANCE, STANCE_TOLERANCE and STILL_SPEED times
+    leg_length / REFERENCE_LEG_M (exactly 1 at the wolf); the reference values when the rig has no leg chains."""
+    length, source = leg_length(rig, project)
+    if length is None or length <= 0:
+        return REFERENCE._replace(source=f"the reference (wolf) tolerances: the rig.json has {source}")
+    scale = length / REFERENCE_LEG_M
+    return Tolerances(CONTACT_TOLERANCE * scale, STANCE_TOLERANCE * scale, STILL_SPEED * scale, scale, length,
+                      f"{source}, over the wolf's {REFERENCE_LEG_M} m")
 
 
 def period_search(values, fps, min_s=0.25, max_s=2.5):
@@ -230,17 +302,21 @@ def contact_masks(heights, ground=None, circular=False):
     return {c: bridge(contact_mask(z, ground), circular) for c, z in heights.items()}
 
 
-def stance_masks(heights, vx, ground, speed, circular=False, gap=1, extent=STANCE_TOLERANCE):
-    """Each paw's stance (Task 19): world-still (in-place x speed within SLIP_SHARE * speed of -speed) and near the
-    shared ground: a run of still samples within STANCE_TOLERANCE that reaches CONTACT_TOLERANCE somewhere. Without
-    a ground speed (under two planted paws) stillness is not known and every sample counts as still."""
+def stance_masks(heights, vx, ground, speed, circular=False, gap=1, extent=None, tol=None, slip=SLIP_SHARE):
+    """Each paw's stance (Task 19): world-still (in-place x speed within `slip` * speed of -speed) and near the
+    shared ground: a run of still samples within the stance tolerance (`extent`, a number or one per paw; default
+    tol.stance) that reaches the contact tolerance (tol.contact) somewhere. `tol` is the body's Tolerances (round 4;
+    default the reference). Without a ground speed (under two planted paws) stillness is not known and every sample
+    counts as still."""
+    tol = tol or REFERENCE
+    extent = tol.stance if extent is None else extent
     out = {}
     for chain, z in heights.items():
         z = np.asarray(z, float)
         v = np.asarray(vx[chain], float)
-        still = np.abs(v + speed) <= SLIP_SHARE * speed if speed and speed > 0 else np.ones(len(z), bool)
-        core = still & (z <= ground + CONTACT_TOLERANCE)
-        reach = still & (z <= ground + extent)
+        still = np.abs(v + speed) <= slip * speed if speed and speed > 0 else np.ones(len(z), bool)
+        core = still & (z <= ground + tol.contact)
+        reach = still & (z <= ground + (extent[chain] if isinstance(extent, dict) else extent))
         keep = np.zeros(len(z), bool)
         for start, length in runs(reach, circular):
             index = (start + np.arange(length)) % len(z)
@@ -261,20 +337,97 @@ def speed_from(vx, masks):
     return float(-np.median(np.concatenate([np.asarray(vx[c], float)[masks[c]] for c in planted]))), None
 
 
-def motion_contacts(heights, vx, circular=False, gap=1):
-    """Contacts from the motion: the shared ground, then the ground speed from the paws near it, then each paw's
-    stance (`stance_masks`), the speed measured again from those stances and the stances read with it. Returns
-    (ground, speed, speed reason, masks)."""
+def motion_contacts(heights, vx, circular=False, gap=1, tol=None, still=None, slip=SLIP_SHARE, extent=None):
+    """Contacts from the motion: the shared ground, then a first ground speed from the paws near it while they move
+    back (in place a planted paw slides back, a swing passes forward: round 4, the swing never enters the speed), then
+    each paw's stance (`stance_masks`), the speed measured again from those stances only and the stances read with
+    it. `vx` is the in-place x speed the ground speed is measured from; `still` (default `vx`) the smoothed one the
+    stillness test reads (round 4). With no stance in two paws there is no speed. Returns (ground, speed, speed
+    reason, masks)."""
+    tol = tol or REFERENCE
+    still = vx if still is None else still
     ground = ground_height(heights)
-    near = {c: bridge(contact_mask(z, ground), circular, gap) for c, z in heights.items()}
+    near = {c: bridge(contact_mask(z, ground, tol.contact), circular, gap) & (np.asarray(still[c], float) < 0)
+            for c, z in heights.items()}
     speed, reason = speed_from(vx, near)
-    masks = stance_masks(heights, vx, ground, speed, circular, gap)
+    masks = stance_masks(heights, still, ground, speed, circular, gap, extent, tol, slip)
     if speed is not None:
         again, why = speed_from(vx, masks)
         if again is not None and again > 0:
             speed, reason = again, why
-            masks = stance_masks(heights, vx, ground, speed, circular, gap)
+            masks = stance_masks(heights, still, ground, speed, circular, gap, extent, tol, slip)
+        else:
+            speed, reason = None, why or "the paws' stances do not move back: no ground speed"
     return ground, speed, reason, masks
+
+
+def lowpass(x, order):
+    """One periodic cycle of samples with only its first `order` harmonics (round 4: a fit's per-key jitter lives in
+    the higher ones)."""
+    coeffs = np.fft.rfft(np.asarray(x, float))
+    coeffs[np.arange(len(coeffs)) > order] = 0.0
+    return np.fft.irfft(coeffs, len(x))
+
+
+def cycle_touchdowns(masks):
+    """Per paw, how many times it touches down in one cycle of samples (a run across the seam is one)."""
+    return {c: len(runs(m, circular=True)) if np.asarray(m).any() and not np.asarray(m).all() else int(np.any(m))
+            for c, m in masks.items()}
+
+
+def slide_stances(heights, x, ground, tol):
+    """The noisy-fit stance of each paw (round 4): its backward slide, from the most forward point of its in-place x
+    (smoothed: `x`) to the most backward (a treadmill gait's anterior and posterior extreme positions), when the
+    paw comes within the stance tolerance of the shared ground in it; else no stance. Returns (masks, extremes)."""
+    masks, extremes = {}, {}
+    for chain, z in heights.items():
+        xs, z = np.asarray(x[chain], float), np.asarray(z, float)
+        n = len(xs)
+        front, back = int(np.argmax(xs)), int(np.argmin(xs))
+        mask = np.zeros(n, bool)
+        mask[(front + np.arange((back - front) % n)) % n] = True
+        if not mask.any() or float(np.min(z[mask])) > ground + tol.stance:
+            mask[:] = False
+        masks[chain] = mask
+        extremes[chain] = [round(front / n, 4), round(back / n, 4)]
+    return masks, extremes
+
+
+def read_cycle(heights, vx, still, smooth_x, gap, tol, reading=None):
+    """One cycle's contacts (round 4). The strict reading is `motion_contacts` with the body's tolerances and the
+    smoothed stillness velocity `still`. When it gives a planted paw more than one touchdown and every one of them
+    lies inside that paw's backward slide, they are fragments of one stance that the fit's height and speed noise
+    broke up, and the noisy-fit reading is taken: each stance is the paw's backward slide (`slide_stances` on
+    `smooth_x()`, the paw x capped at NOISY['order'] harmonics), the ground speed measured from those stances.
+    Otherwise the strict reading stands (and the caller refuses a paw that touches down twice). `reading` forces one
+    ("strict" or "noisy fit"). Returns (ground, speed, reason, masks, report)."""
+    ground, speed, reason, masks = motion_contacts(heights, vx, True, gap, tol, still)
+    counts = cycle_touchdowns(masks)
+    report = {"reading": "strict", "touchdowns": counts}
+    if reading == "strict" or (reading is None and all(v <= 1 for v in counts.values())):
+        return ground, speed, reason, masks, report
+    slides, extremes = slide_stances(heights, smooth_x(), ground, tol)
+    outside = {c: int(np.sum(masks[c] & ~slides[c])) for c in masks if counts[c] > 1}
+    if reading is None and any(outside.values()):
+        return ground, speed, reason, masks, {**report, "slideCheck": {"samplesOutsideSlide": outside,
+                                                                        "extremes": extremes}}
+    speed, why = speed_from(vx, slides)
+    report = {"reading": "noisy fit", "touchdowns": cycle_touchdowns(slides), "strictTouchdowns": counts,
+              "order": NOISY["order"], "extremes": extremes,
+              "rule": "the strict reading broke a stance into several touchdowns, all inside the paw's backward "
+                      f"slide: each stance is the slide from the paw's most forward to its most backward point "
+                      f"(its in-place x capped at {NOISY['order']} harmonics), planted when it comes within the "
+                      f"stance tolerance of the ground; the ground speed from those stances"}
+    return ground, speed, why, slides, report
+
+
+def reading_warning(report):
+    if report["reading"] != "noisy fit":
+        return []
+    strict = ", ".join(f"{c} {v}" for c, v in report["strictTouchdowns"].items() if v != 1)
+    return [f"Contacts read for a noisy fit (round 4): the strict reading touched down {strict} times in a cycle, "
+            f"every touchdown inside the paw's backward slide; each stance is that slide (anterior to posterior "
+            f"extreme of the paw's x at {report['order']} harmonics)"]
 
 
 def circular_speed(x, dt):
@@ -593,7 +746,8 @@ def clip_facts(poses, project, brief, rest, masks=None, render=None, rig=None, m
         start, period = 0, len(frames) - 1
         heights = {c: paws[c][:, 1] for c in chains}
         vx = {c: np.gradient(paws[c][:, 0]) * fps for c in chains}
-        ground, speed, speed_reason, masks = motion_contacts(heights, vx)
+        tol = REFERENCE if rig is None else tolerances(rig, project)
+        ground, speed, speed_reason, masks = motion_contacts(heights, vx, tol=tol)
         all_windows = {project["paws"][c]: windows(masks[c]) for c in chains}
         entry = {"duration_s": period / fps, "loop": False,
                  "authored_speed_mps": None if speed is None else round(speed, 3),
@@ -607,8 +761,8 @@ def clip_facts(poses, project, brief, rest, masks=None, render=None, rig=None, m
             played[:, poses["names"].index("dx")] -= float(played[:period, poses["names"].index("dx")].mean())
             predicted = motion.PlanarRig(rig).paws(played, poses["names"], project)
             cycle_out["paws"] = {project["paws"][c]: np.round(p, 7).tolist() for c, p in predicted.items()}
-        extra = {"ground": ground_block(ground, "every frame, all paws"),
-                 "paws": paw_report(heights, masks, ground, project, rest)}
+        extra = {"ground": ground_block(ground, "every frame, all paws", tol),
+                 "paws": paw_report(heights, masks, ground, project, rest), "bodyScale": tol.block()}
     target = brief.get("targetSpeedMps")
     if speed is not None and target and abs(speed - target) / target > 0.25:
         warnings.append(f"Measured ground speed {speed:.2f} m/s is more than 25% from the brief's {target} m/s")
@@ -620,8 +774,9 @@ def clip_facts(poses, project, brief, rest, masks=None, render=None, rig=None, m
     return out
 
 
-def ground_block(ground, source):
-    return {"height": round(ground, 4), "tolerance": CONTACT_TOLERANCE, "percentile": GROUND_PERCENTILE,
+def ground_block(ground, source, tol=None):
+    tol = tol or REFERENCE
+    return {"height": round(ground, 4), "tolerance": round(tol.contact, 6), "percentile": GROUND_PERCENTILE,
             "source": source}
 
 
@@ -896,10 +1051,11 @@ def loop_rest(found, period, doubled, identity, poses, project, every, paws, cha
     # The root's travel over one period (averaged over the cycles): the bake keys the cycle in place.
     drift = {"dx": float(avg[n][0] - avg[0][0]), "dz": float(avg[n][1] - avg[0][1])}
     origin = project.get("phaseOrigin", chains[0])
+    tol = REFERENCE if rig is None else tolerances(rig, project)
     if rig is None:
-        contacts = averaged_contacts(avg, n, kinds, paw_cols, chains, origin, fps, period, kept, project, rest)
+        contacts = averaged_contacts(avg, n, kinds, paw_cols, chains, origin, fps, period, kept, project, rest, tol)
     else:
-        contacts = rig_contacts(avg, n, drift, names, project, rig, rest, chains, origin, fps, period, kept)
+        contacts = rig_contacts(avg, n, drift, names, project, rig, rest, chains, origin, fps, period, kept, tol)
     masks_of, touchdowns = contacts["masks"], {}
     for c in chains:
         if masks_of[c].any():
@@ -923,7 +1079,7 @@ def loop_rest(found, period, doubled, identity, poses, project, every, paws, cha
              "identityExchanged": exchanged, "identity": identity, "averagedCycleIoU": check["meanIoU"],
              "cycleCheck": check,
              "ground": contacts["ground"], "paws": contacts["paws"], "gait": gait, "gaitCheck": gate,
-             "cadence": cadence, "warnings": warnings}
+             "cadence": cadence, "warnings": warnings, "bodyScale": tol.block(), "contactReading": contacts["reading"]}
     if speed is None:
         extra["speedReason"] = contacts["speedReason"]
     start, shift = contacts["start"], 0.0
@@ -961,15 +1117,22 @@ def loop_rest(found, period, doubled, identity, poses, project, every, paws, cha
     return start, period, entry, cycle_out, extra
 
 
-def averaged_contacts(avg, n, kinds, paw_cols, chains, origin, fps, period, kept, project, rest):
+def averaged_contacts(avg, n, kinds, paw_cols, chains, origin, fps, period, kept, project, rest, tol=None):
     """Without the rig: contacts from the averaged cycle's paw columns at its n samples, rolled to the phase
-    origin's touchdown; the keys are the rolled average (as before Task 19)."""
+    origin's touchdown; the keys are the rolled average (as before Task 19). Round 4: `read_cycle` (the noisy-fit
+    reading's slides from the paw track's first NOISY['order'] harmonics)."""
     rate = n * fps / period
+    tol = tol or REFERENCE
+    chosen = {}
 
     def read(table):
         heights = {c: table[:n, paw_cols[c][1]] for c in chains}
         vx = {c: np.gradient(table[:, paw_cols[c][0]])[:n] * rate for c in chains}
-        return motion_contacts(heights, vx, circular=True), heights
+        noisy = lambda: {c: lowpass(table[:n, paw_cols[c][0]], NOISY["order"]) for c in chains}
+        *found, report = read_cycle(heights, vx, vx, noisy, 1, tol, chosen.get("reading"))
+        chosen.setdefault("reading", report["reading"])
+        chosen["report"] = report
+        return tuple(found), heights
     (ground, _, _, contacts_of), _ = read(avg)
     # The phase origin's touchdown starts the cycle; if it never plants, the first planted paw's does.
     origin = next((c for c in [origin] + chains if contacts_of[c].any()), origin)
@@ -985,14 +1148,18 @@ def averaged_contacts(avg, n, kinds, paw_cols, chains, origin, fps, period, kept
     windows_of = {c: tuple(contact_window(masks[c])[0]) for c in chains if masks[c].any()}
     return {"masks": masks, "speed": speed, "speedReason": reason, "origin": origin, "windows": windows_of,
             "start": float(kept[0] + touchdown * period / n), "keys": keys.tolist(), "drift": drift,
-            "groundHeight": ground, "ground": ground_block(ground, "averaged cycle, all paws"),
-            "paws": paw_report(heights, masks, ground, project, rest)}
+            "groundHeight": ground, "ground": ground_block(ground, "averaged cycle, all paws", tol),
+            "paws": paw_report(heights, masks, ground, project, rest), "reading": chosen["report"],
+            "warnings": reading_warning(chosen["report"])}
 
 
-def rig_contacts(avg, n, drift, names, project, rig, rest, chains, origin, fps, period, kept):
+def rig_contacts(avg, n, drift, names, project, rig, rest, chains, origin, fps, period, kept, tol=None, reading=None):
     """With the rig: the smooth periodic cycle (motion.SmoothCycle of the averaged values, root drift removed),
     its paws by forward kinematics at DENSE samples, the contacts from that motion, all rolled to the phase origin's
-    touchdown."""
+    touchdown. Round 4: `tol` is the body's Tolerances (default: scaled to `rig`); the heights and the ground speed
+    are read from the smooth cycle, the stillness from it capped at VELOCITY_ORDER harmonics (`read_cycle`; the
+    noisy-fit reading's slides from it capped at NOISY['order']). `reading` forces the strict or noisy-fit one."""
+    tol = tol or tolerances(rig, project)
     width = len(names)
     table = np.array(avg[:n, :width], float)
     k = np.arange(n) / n
@@ -1004,11 +1171,23 @@ def rig_contacts(avg, n, drift, names, project, rig, rest, chains, origin, fps, 
     gap = max(1, int(round(BRIDGE_PHASE * DENSE)))
     dt = period / fps / DENSE
 
+    chosen = {"reading": reading}
+
+    def capped_x(smooth_cycle, order):
+        paws = planar.paws(smooth_cycle.capped(order).at(grid), names, project)
+        return {c: paws[c][:, 0] for c in chains}
+
+    def speeds(smooth_cycle, order):
+        return {c: circular_speed(x, dt) for c, x in capped_x(smooth_cycle, order).items()}
+
     def read(smooth_cycle):
         paws = planar.paws(smooth_cycle.at(grid), names, project)
         heights = {c: paws[c][:, 1] - float(rest[c]) for c in chains}
         vx = {c: circular_speed(paws[c][:, 0], dt) for c in chains}
-        return motion_contacts(heights, vx, circular=True, gap=gap), heights
+        *found, report = read_cycle(heights, vx, speeds(smooth_cycle, VELOCITY_ORDER),
+                                    lambda: capped_x(smooth_cycle, NOISY["order"]), gap, tol, chosen["reading"])
+        chosen["reading"], chosen["report"] = report["reading"], report
+        return tuple(found), heights
     (_, _, _, first), _ = read(smooth)
     origin = next((c for c in [origin] + chains if first[c].any()), origin)
     touchdown = contact_window(first[origin])[0][0] if first[origin].any() else 0.0
@@ -1021,6 +1200,7 @@ def rig_contacts(avg, n, drift, names, project, rig, rest, chains, origin, fps, 
     warnings = [f"The smooth cycle keeps under {motion.RANGE_KEEP} of the video's world pitch range on "
                 f"{', '.join(f'{b} {v:.3f}' for b, v in short.items())} (each joint's own range is kept; a warning, "
                 f"not a refusal)"] if short else []
+    warnings += reading_warning(chosen["report"])
     report = {"orders": smooth.orders, "keptRange": smooth.kept_range(), "keep": motion.RANGE_KEEP,
               "worldPitchKept": pitch, "dominantHarmonic": {k: v for k, v in smooth.dominant.items() if v != 1},
               "overtoneTaper": {k: v for k, v in smooth.taper.items() if v != 1.0},
@@ -1028,8 +1208,9 @@ def rig_contacts(avg, n, drift, names, project, rig, rest, chains, origin, fps, 
               "jerkRatio": smooth.jerk_ratio(), "jerkMax": motion.JERK_MAX, "samplesPerCycle": DENSE}
     return {"masks": masks, "speed": speed, "speedReason": reason, "origin": origin, "smooth": smooth,
             "smoothReport": report, "start": float(kept[0] + touchdown * period), "groundHeight": ground,
-            "ground": ground_block(ground, "smooth cycle (forward kinematics of the rig), all paws"),
-            "paws": paw_report(heights, masks, ground, project, rest), "planar": planar, "warnings": warnings}
+            "ground": ground_block(ground, "smooth cycle (forward kinematics of the rig), all paws", tol),
+            "paws": paw_report(heights, masks, ground, project, rest), "planar": planar, "warnings": warnings,
+            "reading": chosen["report"], "tol": tol}
 
 
 def widened(window, n_keys):
@@ -1072,9 +1253,9 @@ def rig_keys(contacts, n_keys, names, project, rig, rest, period_s, factor):
     """The bake's keys from the smooth cycle: every planted paw pinned (motion.plan_keys) over its detection on the
     key grid, the declared contacts half a key wider at each end (`widened`), and the check: the keys played as the clip plays them (linear between
     keys), their paws detected again with the same rule (near the ground within CONTACT_TOLERANCE and world-still;
-    no STANCE_TOLERANCE, which allows for the fit's height error), against the declared contacts. Refuses under
+    no stance tolerance, which allows for the fit's height error), against the declared contacts. Refuses under
     CONTACT_AGREEMENT for any paw. Returns (keys, declared windows, {"check", "ik", "paws"})."""
-    planar, speed = contacts["planar"], contacts["speed"]
+    planar, speed, tol = contacts["planar"], contacts["speed"], contacts["tol"]
     pinned = {c: snapped(m, n_keys) for c, m in contacts["masks"].items() if m.any()}
     # Round 4: the loop starts at the key with the most room outside every pin's approach and release.
     key0, start = motion.start_key(pinned, n_keys)
@@ -1092,9 +1273,10 @@ def rig_keys(contacts, n_keys, names, project, rig, rest, period_s, factor):
     for chain, track in planar.paws(played, names, project).items():
         heights[chain] = track[:, 1] - float(rest[chain])
         vx[chain] = circular_speed(track[:, 0], dt)
-    # The same rule without the fit-error allowance (STANCE_TOLERANCE): a pinned paw in the keys is on the ground.
+    # The same rule without the fit-error allowance (the stance tolerance): a pinned paw in the keys is on the
+    # ground. Round 4: the body's contact tolerance.
     again = stance_masks(heights, vx, 0.0, speed, circular=True, gap=max(1, int(round(BRIDGE_PHASE * len(played)))),
-                         extent=CONTACT_TOLERANCE)
+                         extent=tol.contact, tol=tol)
     jumps = motion.edge_jumps(paws, motion.release_windows(pinned, n_keys, motion.PIN_RELEASE.inset_keys), n_keys,
                               period_s / factor / n_keys, span=motion.PIN_RELEASE.span(n_keys))
     edge_jumps = {project["paws"][c]: j for c, j in jumps.items()}
@@ -1105,9 +1287,9 @@ def rig_keys(contacts, n_keys, names, project, rig, rest, period_s, factor):
         agreement[bone] = round(float(np.mean(want == again[chain])), 4)
         if want.any() and speed:
             world = np.abs(vx[chain] + speed) * factor
-            still[bone] = round(float(np.mean(world[want] < STILL_SPEED)), 4)
+            still[bone] = round(float(np.mean(world[want] < tol.still_speed)), 4)
     check = {"agreement": agreement, "gate": CONTACT_AGREEMENT, "plantedStillShare": still,
-             "stillSpeedMps": STILL_SPEED, "samples": len(played), "keys": n_keys, "edgeJumps": edge_jumps,
+             "stillSpeedMps": round(tol.still_speed, 6), "samples": len(played), "keys": n_keys, "edgeJumps": edge_jumps,
              "pinRelease": {**motion.PIN_RELEASE._asdict(),
                             "touchdown_orders": list(motion.PIN_RELEASE.touchdown_orders),
                             "liftoff_orders": list(motion.PIN_RELEASE.liftoff_orders),

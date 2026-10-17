@@ -1079,7 +1079,10 @@ class RigFactsTests(unittest.TestCase):
 
     def test_a_stance_the_fit_holds_off_the_ground_is_pinned_down(self):
         from tests import toy_rig
-        result = self.facts(toy_rig.toy_gait(float_paw=("front_L", 0.04)))
+        # Round 4: the stance tolerance scales with the leg length (the toy's 0.5 m): the paw floats the same share of
+        # it as 4 cm of the wolf's 6 cm.
+        scale = facts.tolerances(toy_rig.toy_rig(), toy_rig.PROJECT).scale
+        result = self.facts(toy_rig.toy_gait(float_paw=("front_L", 0.04 * scale)))
         n = result["entry"]["frames"]
         on, off = result["entry"]["contacts"]["paw_fl"]
         shift = result["cycle"]["startPhase"]
@@ -1186,7 +1189,14 @@ class FixRoundOneFactsTests(unittest.TestCase):
         loop at a key outside every paw's approach and release span instead. The loop is cyclic, so the keys are the
         same motion, rolled: the seam's second difference (the bar's loop-seam row: the bone with the largest second
         difference at key 0 against its median elsewhere) is <= 3, the start frame moves by the same share of the
-        period, and the footfall phases stay the phase origin's."""
+        period, and the footfall phases stay the phase origin's. Round 4: read as written, at the reference (wolf)
+        tolerances and with every harmonic of the toy's noise-free 20-sample cycle in the stillness velocity; at the
+        toy's own leg length (0.5 m), or capped at VELOCITY_ORDER (7 of its 9), its contacts move by a sample and
+        the origin start is no longer the hard case this test needs."""
+        for patch in (unittest.mock.patch.object(facts, "tolerances", return_value=facts.REFERENCE),
+                      unittest.mock.patch.object(facts, "VELOCITY_ORDER", motion.max_order(20))):
+            patch.start()
+            self.addCleanup(patch.stop)
         result = self.facts()
         cycle, entry, check = result["cycle"], result["entry"], result["contactCheck"]
         n = entry["frames"]
@@ -1277,3 +1287,172 @@ class FixRoundOneFactsTests(unittest.TestCase):
         self.assertNotIn("paws", facts.clip_facts(poses, toy_rig.PROJECT, {"clip": "pounce", "loop": False,
                                                                             "targetSpeedMps": None},
                                                   toy_rig.REST)["cycle"])
+
+
+# ------------------------------------------------------------------- round 4: contacts scaled to the body (vole)
+def derived(name):
+    from pathlib import Path
+    import json
+    return json.loads((Path(__file__).resolve().parent / "fixtures" / "vole_scurry_derived.json").read_text())[name]
+
+
+def cycle_contacts(block, **kw):
+    """facts.rig_contacts on a derived averaged cycle (tests/fixtures/vole_scurry_derived.json)."""
+    names, n = block["names"], block["n"]
+    project, rig = block["project"], block["rig"]
+    chains = list(project["paws"])
+    return facts.rig_contacts(np.array(block["samples"], float), n, block["drift"], names, project, rig,
+                              block["rest"], chains, block["phaseOrigin"], block["fps"], block["periodFrames"],
+                              block["cycleStarts"], **kw)
+
+
+def touchdowns(mask):
+    mask = np.asarray(mask, bool)
+    return int(sum(1 for i in range(len(mask)) if mask[i] and not mask[i - 1]))
+
+
+class BodyScaleTests(unittest.TestCase):
+    """Round 4: facts' metre tolerances are the wolf's; they scale with the rig's leg length (the mean rest height of
+    the leg chains' top joints), so at the wolf they are exactly today's and at the 3 cm field vole a 17 mm swing is
+    no longer inside the contact tolerance."""
+
+    def test_the_wolf_rig_keeps_the_reference_tolerances(self):
+        block = derived("wolfLopeCycle")
+        tol = facts.tolerances(block["rig"], block["project"])
+        self.assertEqual(tol.leg_m, facts.REFERENCE_LEG_M)
+        self.assertEqual((tol.scale, tol.contact, tol.stance, tol.still_speed),
+                         (1.0, facts.CONTACT_TOLERANCE, facts.STANCE_TOLERANCE, facts.STILL_SPEED))
+
+    def test_the_vole_rig_scales_them(self):
+        block = derived("voleR3Cycle")
+        tol = facts.tolerances(block["rig"], block["project"])
+        self.assertAlmostEqual(tol.leg_m, 0.046, delta=1e-6)
+        scale = tol.leg_m / facts.REFERENCE_LEG_M
+        self.assertAlmostEqual(tol.scale, scale)
+        self.assertAlmostEqual(tol.contact, 0.025 * scale)
+        self.assertAlmostEqual(tol.stance, 0.06 * scale)
+        self.assertAlmostEqual(tol.still_speed, 0.10 * scale)
+        block = tol.block()
+        for key in ("legLengthM", "referenceLegM", "scale", "contactToleranceM", "stanceToleranceM", "stillSpeedMps",
+                    "source"):
+            self.assertIn(key, block)
+        self.assertIn("rig.json", block["source"])
+
+    def test_a_rig_without_leg_chains_keeps_the_reference_and_says_so(self):
+        tol = facts.tolerances(rig_of(REST), PROJECT)
+        self.assertEqual((tol.scale, tol.contact), (1.0, facts.CONTACT_TOLERANCE))
+        self.assertIsNone(tol.leg_m)
+        self.assertIn("reference", tol.source)
+
+    def test_the_wolf_lope_reads_exactly_as_before(self):
+        """The wolf's averaged cycle, read with its own (reference) tolerances, the smoothed stillness velocity and
+        the stance-only ground speed, gives e123b61b's contacts and speed to the bit."""
+        block = derived("wolfLopeCycle")
+        out = cycle_contacts(block, tol=facts.tolerances(block["rig"], block["project"]))
+        base = block["baseline"]
+        self.assertEqual(out["speed"], base["speed"])
+        self.assertEqual(out["groundHeight"], base["groundHeight"])
+        self.assertEqual(out["start"], base["start"])
+        self.assertEqual({c: [list(r) for r in facts.runs(m, circular=True)] for c, m in out["masks"].items()},
+                         base["maskRuns"])
+        self.assertEqual(out["reading"]["reading"], "strict")
+
+    def test_the_vole_touches_each_paw_down_once_per_stride(self):
+        block = derived("voleR3Cycle")
+        out = cycle_contacts(block, tol=facts.tolerances(block["rig"], block["project"]))
+        self.assertEqual({c: touchdowns(m) for c, m in out["masks"].items()}, {c: 1 for c in out["masks"]},
+                         out["reading"])
+        for chain, mask in out["masks"].items():
+            self.assertTrue(0.2 <= float(np.mean(mask)) <= 0.8, (chain, float(np.mean(mask))))
+        # The stance slide read off the marks is ~0.029 m/s; the round-3 reading mixed swing in (0.004-0.011).
+        self.assertTrue(0.02 <= out["speed"] <= 0.04, out["speed"])
+        # Each stance is the paw's backward slide; the footfalls pair diagonally: the brief's trot.
+        touch = {c: facts.contact_window(m)[0][0] for c, m in out["masks"].items()}
+        gait = {"plantedPaws": list(touch), **facts.gait_pattern(out["masks"], touch, block["project"], 240)}
+        self.assertEqual(gait["beats"], 2, gait)
+        self.assertIn("trot", facts.gait_reads(gait), gait)
+        reading = out["reading"]
+        self.assertEqual(reading["reading"], "noisy fit")
+        self.assertTrue(any(v > 1 for v in reading["strictTouchdowns"].values()), reading)
+        self.assertTrue(out["warnings"])
+
+    def test_a_second_touchdown_outside_the_backward_slide_is_not_read_away(self):
+        """The noisy-fit reading only joins touchdowns that all lie inside the paw's backward slide; a paw that
+        plants again while it swings forward keeps the strict reading (and facts refuses it)."""
+        n = 48
+        u = np.arange(n) / n
+        x = {c: 0.03 * np.cos(2 * np.pi * (u - p)) for c, p in (("a", 0.0), ("b", 0.5))}
+        vx = {c: facts.circular_speed(v, 0.01) for c, v in x.items()}
+        back = {c: vx[c] < 0 for c in x}
+        z = {c: np.where(back[c], 0.0, 0.01) for c in x}
+        swing = np.flatnonzero(~back["a"])
+        mid = swing[len(swing) // 2 - 1: len(swing) // 2 + 2]
+        z["a"][mid] = 0.0                                              # it plants again, still, mid-swing
+        vx["a"][mid] = float(np.median(vx["a"][back["a"]]))
+        tol = facts.REFERENCE._replace(contact=0.002, stance=0.004)
+        ground, speed, reason, masks, report = facts.read_cycle(z, vx, vx, lambda: x, 1, tol)
+        self.assertEqual(report["reading"], "strict")
+        self.assertGreater(report["touchdowns"]["a"], 1)
+        self.assertIn("slideCheck", report)
+
+    def test_the_vole_without_the_scaling_still_fails_as_in_round_three(self):
+        block = derived("voleR3Cycle")
+        with self.assertRaisesRegex(facts.TouchdownError, "touches down [2-9] times"):
+            cycle_contacts(block, tol=facts.REFERENCE, reading="strict")
+
+    def test_a_reference_tolerance_scaled_rule_is_used_unchanged_when_it_reads_one_stance(self):
+        from tests import toy_rig
+        poses = toy_rig.toy_gait()
+        masks, render = toy_video(poses, gain=1.0)
+        result = facts.clip_facts(poses, toy_rig.PROJECT, {**LOPE, "targetSpeedMps": 1.0}, toy_rig.REST, masks=masks,
+                                  render=render, rig=toy_rig.toy_rig(), accept_gait=TOY_GAIT)
+        self.assertEqual(result["contactReading"]["reading"], "strict")
+        self.assertEqual(result["bodyScale"]["legLengthM"], 0.5)
+        self.assertEqual(result["ground"]["tolerance"], result["bodyScale"]["contactToleranceM"])
+
+
+class StanceSpeedTests(unittest.TestCase):
+    """Round 4: the ground speed comes from detected stance only. A small animal's paws stay inside a wolf-sized
+    contact tolerance all cycle, and the median over every 'near' sample mixed the swing in (the vole's 0.0075 m/s
+    against a ~0.03 m/s stance slide)."""
+
+    def test_a_low_swing_never_enters_the_ground_speed(self):
+        t = np.arange(48) / 48
+        z = {"a": 0.002 * (t >= 0.5), "b": 0.002 * (t < 0.5)}         # every sample within 2 mm of the ground
+        vx = {"a": np.where(t < 0.5, -0.03, 0.03), "b": np.where(t >= 0.5, -0.03, 0.03)}
+        ground, speed, reason, masks = facts.motion_contacts(z, vx, circular=True)
+        self.assertAlmostEqual(speed, 0.03, places=9)
+        self.assertEqual(int(masks["a"].sum()), 24)
+
+    def test_no_stance_no_speed(self):
+        z = {"a": np.zeros(8), "b": np.zeros(8)}
+        vx = {"a": np.full(8, 0.5), "b": np.full(8, 0.5)}           # near the ground but all moving forward
+        _, speed, reason, _ = facts.motion_contacts(z, vx, circular=True)
+        self.assertIsNone(speed)
+        self.assertIsNotNone(reason)
+
+
+class SmoothedStillnessTests(unittest.TestCase):
+    """Round 4: stillness is read from a velocity without the averaged cycle's per-key jitter: the smooth cycle with
+    every column capped at VELOCITY_ORDER harmonics (a 15-sample cycle's own maximum, so the wolf is unchanged)."""
+
+    def test_a_cycle_within_the_order_is_unchanged(self):
+        block = derived("wolfLopeCycle")
+        names, n = block["names"], block["n"]
+        table = np.array(block["samples"], float)[:n]
+        smooth = motion.SmoothCycle(table, names, block["project"])
+        grid = np.arange(240) / 240
+        np.testing.assert_array_equal(smooth.capped(facts.VELOCITY_ORDER).at(grid), smooth.at(grid))
+        self.assertLess(np.max(np.abs(smooth.capped(3).at(grid) - smooth.at(grid))), 1.0)
+        self.assertTrue(np.any(smooth.capped(3).at(grid) != smooth.at(grid)))
+
+    def test_a_planted_paw_with_per_key_jitter_reads_still(self):
+        n, dt, speed = 240, 0.01, 0.03
+        u = np.arange(n) / n
+        x = np.where(u < 0.5, 0.03 - speed * u * n * dt, -0.03 + 2 * speed * (u - 0.5) * n * dt)
+        jitter = 0.001 * np.sin(2 * np.pi * 30 * u)                    # a 30th harmonic: ~0.07 m/s of noise
+        raw = facts.circular_speed(x + jitter, dt)
+        smooth = facts.circular_speed(facts.lowpass(x + jitter, 4), dt)
+        planted = (u > 0.1) & (u < 0.4)
+        self.assertGreater(np.max(np.abs(raw[planted] + speed)), speed)
+        self.assertLess(np.max(np.abs(smooth[planted] + speed)), 0.3 * speed + 0.01)

@@ -121,6 +121,20 @@ class ReviewTests(unittest.TestCase):
         self.assertEqual(timeline["paw_hl"], [True] * 6 + [False] * 6)
         self.assertFalse(any(timeline["paw_fl"]), "low, but sliding with the body")
 
+    def test_contact_timeline_before_facts_uses_the_body_tolerances(self):
+        """Round 4: before facts the strip reads facts' rule with the rig's tolerances: at a vole's scale a still
+        paw held 1 cm up is in the air, though inside a wolf-sized 2.5 cm tolerance it reads planted."""
+        from anim import facts
+        project = {"paws": {"hind_L": "paw_hl", "hind_R": "paw_hr"}}
+        frames = [{"paws": {"hind_L": [-0.03 * f / 24.0, 0.0 if f < 6 else 0.01],
+                            "hind_R": [-0.03 * f / 24.0, 0.01 if f < 6 else 0.0]}, "index": f} for f in range(12)]
+        rest = {"hind_L": 0.0, "hind_R": 0.0}
+        small = facts.REFERENCE._replace(contact=0.0016, stance=0.0038, scale=0.064)
+        wolf = review.contact_timeline({"frames": frames, "fps": 24.0}, project, rest)
+        vole = review.contact_timeline({"frames": frames, "fps": 24.0}, project, rest, tol=small)
+        self.assertEqual(vole["paw_hl"], [True] * 6 + [False] * 6)
+        self.assertEqual(wolf["paw_hl"], [True] * 12)
+
     @unittest.skipUnless(shutil.which("node"), "node runs the lab's script")
     def test_the_lab_escapes_names_and_values(self):
         """Fix round 1, ruling 8: bone names and values reach the page as text, never as markup."""

@@ -258,6 +258,15 @@ class SmoothCycle:
         out.coeffs = [c * np.exp(2j * np.pi * k * phase) for c in self.coeffs]
         return out
 
+    def capped(self, order):
+        """The same cycle with every column truncated at `order` harmonics (round 4: facts reads stillness from it).
+        A column already within `order` is unchanged."""
+        out = SmoothCycle.__new__(SmoothCycle)
+        out.names, out.n, out.ranges = self.names, self.n, self.ranges
+        out.taper, out.gain, out.dominant, out.coeffs = self.taper, self.gain, self.dominant, self.coeffs
+        out.orders = {name: min(o, int(order)) for name, o in self.orders.items()}
+        return out
+
     def kept_range(self, dense=600):
         """Per column, the smoothed range over the sampled range (1.0 for a constant column)."""
         values = self.at(np.arange(dense) / dense)

@@ -38,7 +38,24 @@ A paw is on the ground while it is **near the ground and world-still**:
   does not pin it); the real lope's front_L is world-still at 3 to 6 cm for 0.15 of a cycle;
 - world-still: the clip plays in place, so a planted paw slides back at the ground speed. Its in-place x speed is
   within 0.3 x (`SLIP_SHARE`) of minus the ground speed. The ground speed is the median backward speed of the
-  paws near the ground, measured again from the stances.
+  paws near the ground while they move back (a swing never enters it), measured again from the stances only; with
+  no stance in two paws there is none.
+
+**Body size (round 4, the field vole).** Those metres are the wolf's. They scale with the rig's leg length, the
+mean rest height of the leg chains' top joints (hips, withers) in the contract's `rig.json`, over the wolf's
+0.7225 m (`REFERENCE_LEG_M`): at the wolf they are exactly 0.025 m, 0.06 m and 0.10 m (`STILL_SPEED`), at the
+4.6 cm vole 1.6 mm, 3.8 mm and 6.4 mm/s. `facts.json` records them, the scale and the source as `bodyScale`. The
+stillness test reads a velocity without the averaged cycle's per-key jitter: the paws' kinematics of the smooth
+cycle capped at 7 harmonics (`VELOCITY_ORDER`, the most a 15-frame cycle like the wolf's holds, so it is unchanged;
+a slow-motion 60-frame cycle carries jitter up to its 29th, twice the vole's ground speed).
+
+**Noisy fit.** When that strict reading still breaks a paw's stance into several touchdowns and every one lies
+inside the paw's backward slide, they are one stance: each paw's stance is then its slide from its most forward to
+its most backward point (a treadmill gait's anterior and posterior extreme positions) on its x capped at 4
+harmonics, planted when it comes within the stance tolerance of the ground, and the speed is measured from those.
+`contactReading` records which reading was used (`strict` or `noisy fit`, the strict touchdowns, the extremes),
+and a warning says so. A touchdown outside the slide (a paw that plants again mid-swing) keeps the strict reading,
+which is refused. The vole round-3 fit needs it: its planted paws float 4-17 mm against a 17-19 mm lift.
 
 Gaps up to 0.05 of a cycle inside a stance are bridged. `gait` reads beats, lead and suspensions from these
 stances. Each stance is rounded to the key grid; `entry.contacts` reach half a key past its first and last key (the

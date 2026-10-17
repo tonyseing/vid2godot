@@ -361,8 +361,10 @@ def build_lab(ledger):
                              folder / "overlays")
     hashes = {name: ledger.require("fit")["outputs"][name]["sha256"] for name in ("poses", "projection")}
     facts = load_json(ledger.output("facts", "facts")) if ledger.state("facts") == "ok" else None
+    project = project_contract(ledger)
+    tol = facts_mod.tolerances(load_json(ledger.output("contract", "rig")), project)
     page = review_mod.lab_page(ledger.clip, report, brief["iouThreshold"],
-                               review_mod.contact_timeline(poses, project_contract(ledger), paw_rest(ledger), facts),
+                               review_mod.contact_timeline(poses, project, paw_rest(ledger), facts, tol=tol),
                                hashes, review_mod.motion_summary(facts))
     (folder / "lab.html").write_text(page)
     return folder / "lab.html", report

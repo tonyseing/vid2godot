@@ -31,12 +31,13 @@ def draw_overlays(work, poses, projection_npz, masks_npz, out_dir):
     return paths
 
 
-def contact_timeline(poses, project, rest, facts=None):
+def contact_timeline(poses, project, rest, facts=None, tol=None):
     """Each paw's frames on the ground, as facts reads them (fix round 1, ruling 8: the lab and facts agree). With
     facts.json: its declared contacts (near the ground AND world-still) at each frame's phase of the cycle (a loop:
     frame f at ((f - start) / period) mod 1) or a one-shot's contact windows. Before facts: facts' rule on the frames,
     each paw's height measured from its rest-pose tail height `rest[chain]` (facts.rest_heights) against the one
-    shared ground, and its world stillness against the ground speed."""
+    shared ground, and its world stillness against the ground speed, with the body's tolerances `tol`
+    (facts.tolerances of the contract's rig; round 4)."""
     frames = poses["frames"]
     indices = [int(f.get("index", i)) for i, f in enumerate(frames)]
     entry = (facts or {}).get("entry") or {}
@@ -58,7 +59,7 @@ def contact_timeline(poses, project, rest, facts=None):
     heights = {chain: np.array([f["paws"][chain][1] for f in frames]) - rest[chain] for chain in project["paws"]}
     vx = {chain: np.gradient(np.array([f["paws"][chain][0] for f in frames], float)) * fps
           for chain in project["paws"]}
-    masks = motion_contacts(heights, vx)[3]
+    masks = motion_contacts(heights, vx, tol=tol)[3]
     return {bone: masks[chain].tolist() for chain, bone in project["paws"].items()}
 
 
