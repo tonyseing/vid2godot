@@ -1182,7 +1182,14 @@ class FixRoundOneFactsTests(unittest.TestCase):
             paws["front_L"] = paws["front_L"].copy()
             paws["front_L"][k] += [0.05, 0.0]
             return keys, paws, report
-        with mock.patch.object(facts.motion, "plan_keys", side_effect=jumpy):
+
+        def passing(keys, planar, names, project, *args, **kw):
+            return {bone: 1.0 for bone in project["paws"].values()}
+        # Changed with vole round 7: the toy's keys fail the bar's contact height (0.89-0.92) before its edges are
+        # settled, and settling them re-reads the paws from the keys, which drops the jump injected here; the bar's
+        # agreement is held passing so the jump reaches the edge gate.
+        with mock.patch.object(facts.motion, "plan_keys", side_effect=jumpy), \
+                mock.patch.object(facts, "bar_agreement", side_effect=passing):
             with self.assertRaisesRegex(facts.FactsError, r"paw_fl.*liftoff.*m/s.*swing.*median"):
                 self.facts()
 
@@ -1659,3 +1666,104 @@ class PlayedCycleTests(unittest.TestCase):
         for entry in bake["ik"].values():
             self.assertNotIn("clearanceLiftMaxM", entry)
             self.assertNotIn("settledKeys", entry)
+
+
+# ------------------------------------------------- vole round 7: the bar's contact height (chase3d #174, criterion 5)
+BAR_CONTACT_M = 0.02     # chase3d tools/anim_compare.py PRIMARY_THR: a paw under 2 cm (x body scale) is in contact
+
+
+def bar_contacts(entry, subsamples=25):
+    """chase3d tools/anim_compare.py's criterion 5, written out again here (not facts.bar_agreement): the closed keys
+    played linearly at 600 samples a 24-key cycle, each paw in contact while its tail is under 2 cm x body scale
+    above its rest height (height alone), against the declared windows. Returns ({chain: agreement}, heights,
+    phases, declared masks)."""
+    block, (n, keys, declared, bake, digest, tol) = entry
+    rig = motion.PlanarRig(block["rig"])
+    values, phases = motion.played(np.asarray(keys, float), subsamples)
+    heights, masks, agreement = {}, {}, {}
+    for chain, p in rig.paws(values, block["names"], block["project"]).items():
+        heights[chain] = p[:, 1] - float(block["rest"][chain])
+        masks[chain] = facts.in_window(phases, declared[chain])
+        agreement[chain] = float(np.mean(masks[chain] == (heights[chain] < BAR_CONTACT_M * tol.scale)))
+    return agreement, heights, phases, masks
+
+
+class BarContactTests(unittest.TestCase):
+    """Vole round 7 (chase3d ab38a6b3's body-scaled harness on the round-6 vole): criterion 5 counts a paw in contact
+    while it is under 2 cm x body scale above its rest height (1.27 mm at the vole), height alone; facts declared and
+    re-detected contacts at its own 2.5 cm (with stillness), and settled the keys at a contact's edges 2 x 1.59 mm
+    up. front_L agreed on 0.912: its played paw crossed 1.27 mm late at touchdown, and after liftoff the swing came
+    back down to 0.15 mm (keys 20-21) where the fit's paw drags; every vole paw did the same mid-swing (hind_L to
+    0.0 mm at key 8). Contacts are now settled and gated at the bar's height; the wolf lope keys exactly as before."""
+
+    @classmethod
+    def setUpClass(cls):
+        cls.vole = derived("voleR3Cycle"), derived_keys("voleR3Cycle", VOLE_RETIME)
+        cls.wolf = derived("wolfLopeCycle"), derived_keys("wolfLopeCycle", WOLF_RETIME)
+
+    def test_the_bar_contact_height_is_two_centimetres_at_the_wolf_scaled_with_the_body(self):
+        wolf_tol, vole_tol = self.wolf[1][5], self.vole[1][5]
+        self.assertEqual(facts.contact_height(wolf_tol), BAR_CONTACT_M)
+        self.assertAlmostEqual(facts.contact_height(vole_tol), BAR_CONTACT_M * vole_tol.scale)
+        self.assertLess(facts.contact_height(vole_tol), vole_tol.contact)    # 1.27 mm against facts' 1.59 mm
+
+    def test_the_vole_contacts_agree_with_the_bars_criterion_five(self):
+        agreement, *_ = bar_contacts(self.vole)
+        self.assertGreaterEqual(min(agreement.values()), facts.SETTLE_BELOW, agreement)
+
+    def test_every_declared_contact_key_of_the_vole_is_within_the_bars_contact_height(self):
+        block, (n, keys, declared, bake, digest, tol) = self.vole
+        rig = motion.PlanarRig(block["rig"])
+        paws = rig.paws(np.asarray(keys, float)[:n], block["names"], block["project"])
+        phases = np.arange(n) / n
+        for chain, window in declared.items():
+            inside = facts.in_window(phases, window)
+            h = paws[chain][inside, 1] - float(block["rest"][chain])
+            self.assertLess(float(h.max()), BAR_CONTACT_M * tol.scale, (chain, np.round(h * 1000, 3)))
+
+    def test_no_vole_swing_comes_down_into_contact(self):
+        """Outside its declared contact and the key interval at each of its edges, no played paw is under the bar's
+        contact height."""
+        block, (n, keys, declared, *_rest, tol) = self.vole
+        agreement, heights, phases, masks = bar_contacts(self.vole)
+        for chain, h in heights.items():
+            on, off = declared[chain]
+            edge = np.zeros(len(phases), bool)
+            for e in (on, off):
+                d = np.abs((phases - e + 0.5) % 1.0 - 0.5)
+                edge |= d <= 0.5 / n + 1e-9
+            swing = ~masks[chain] & ~edge
+            self.assertGreaterEqual(float(h[swing].min()), BAR_CONTACT_M * tol.scale,
+                                    (chain, float(h[swing].min()) * 1000))
+
+    def test_facts_reports_and_gates_the_bars_agreement(self):
+        block, (n, keys, declared, bake, digest, tol) = self.vole
+        check = bake["check"]
+        self.assertAlmostEqual(check["barContact"]["heightM"], round(BAR_CONTACT_M * tol.scale, 6))
+        self.assertEqual(check["barContact"]["gate"], facts.CONTACT_AGREEMENT)
+        agreement, *_ = bar_contacts(self.vole)
+        for chain, value in agreement.items():
+            self.assertAlmostEqual(check["barContact"]["agreement"][block["project"]["paws"][chain]], value,
+                                   places=3)
+
+    def test_a_clip_under_the_bars_agreement_is_refused(self):
+        block = derived("voleR3Cycle")
+        tol = facts.tolerances(block["rig"], block["project"])
+        contacts = cycle_contacts(block, tol=tol)
+        period_s = block["periodFrames"] / block["fps"]
+        with unittest.mock.patch.object(motion, "clear_swing", lambda rig, keys, *a, **k: (keys, {})):
+            with self.assertRaisesRegex(facts.FactsError, "the bar's contact height"):
+                facts.rig_keys(contacts, 24, block["names"], block["project"], block["rig"], block["rest"],
+                               period_s, VOLE_RETIME)
+
+    def test_the_wolf_passes_the_bars_agreement_untouched(self):
+        block, (n, keys, declared, bake, digest, tol) = self.wolf
+        self.assertEqual(digest, (WOLF_KEYS_SHA256, WOLF_PAWS_SHA256))
+        agreement, *_ = bar_contacts(self.wolf)
+        self.assertGreaterEqual(min(agreement.values()), facts.CONTACT_AGREEMENT, agreement)
+        for chain, value in agreement.items():
+            self.assertAlmostEqual(bake["check"]["barContact"]["agreement"][block["project"]["paws"][chain]], value,
+                                   places=3)
+        for entry in bake["ik"].values():
+            self.assertNotIn("settledKeys", entry)
+            self.assertNotIn("swingLiftMaxM", entry)

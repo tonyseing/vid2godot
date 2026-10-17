@@ -38,6 +38,10 @@ scaled to the body (`clear_ground`), a paw near its agreement gate is settled at
 (`settle_edges`), and the loop starts where the seam has no velocity jump (`seam_jumps`, `seam_shift`). Still
 none of it changes the wolf lope's keys.
 
+Vole round 7: a settled edge crosses the bar's contact height at the declared edge as played (`settle_edges`), and a
+settled paw's swing that comes back down into that height is lifted out of it (`clear_swing`). The wolf lope's keys
+are unchanged.
+
 numpy only."""
 from typing import NamedTuple
 
@@ -98,6 +102,8 @@ PENETRATION_M = 0.005    # vole round 6: at the wolf a played paw is at most thi
 #                          6's 5 mm), scaled with the body's leg length (facts' Tolerances.scale; the vole's 0.32 mm)
 CLEARANCE_SUBSAMPLES = 25   # samples per key interval the played paws are checked at (600 per 24-key cycle)
 CLEARANCE_ROUNDS = 8     # lift-and-solve passes at most
+SWING_CLEARANCE = 1.5    # vole round 7: a swing that comes down into contact is lifted to this many contact heights
+EDGE_SOLVE_ROUNDS = 8    # vole round 7: passes that put a settled edge's played crossing on the declared edge
 
 
 def rotate(phi, points):
@@ -982,15 +988,19 @@ def heglund_taylor_hz(mass_kg):
     return 4.44 * float(mass_kg) ** -0.156
 
 
-def settle_edges(rig, keys, names, project, chain, release, declared, n_keys, height):
+def settle_edges(rig, keys, names, project, chain, release, declared, n_keys, height, ground,
+                 rounds=EDGE_SOLVE_ROUNDS):
     """Vole round 6: one paw's keys at the edges of its declared contact (`declared`, the pinned window `release`
     widened), so that the played paw plants where facts declares it. The keys inside the declared contact that the
     pin does not hold take the pin (world-still on its ground: its line through the first or last two pinned keys),
-    and the key just outside takes the pin's line `height` above the ground: between it and the next key the played
-    paw comes straight down (or up) on its spot and crosses `height` / 2 (the contact tolerance) at the declared
-    edge. facts runs it only for a paw whose keys would otherwise fail its agreement gate (the vole's front_L
-    sliding back into its touchdown), never for one that passes (the wolf lope). `keys` (n_keys, open). Returns
-    (keys, the settled key indices)."""
+    and the key just outside takes the pin's line in x, up where the played paw crosses `height` over `ground` (the
+    bar's contact height, facts.contact_height) at the declared edge: between it and the inside key the paw comes
+    straight down (or up) on its spot. Vole round 7: that key's height is solved (`rounds` passes of the leg IK) for
+    the crossing as the clip plays it, from the inside key's own height (the pin need not lie on the ground) and the
+    leg's forward kinematics between the keys; round 6 put it 2 x facts' contact tolerance (2 x 1.59 mm at the vole)
+    over the pin, so the played paw crossed the bar's 1.27 mm a third of a key inside the touchdown. facts runs it
+    only for a paw whose keys would otherwise fail its agreement gates (the vole's front_L), never for one that
+    passes (the wolf lope). `keys` (n_keys, open). Returns (keys, the settled key indices)."""
     keys = np.array(keys, float, copy=True)
     pinned, _, _ = _pinned_mask(release, n_keys)
     if not pinned.any() or pinned.all():
@@ -1001,7 +1011,7 @@ def settle_edges(rig, keys, names, project, chain, release, declared, n_keys, he
     on, off = declared
     on = on - np.ceil(on - first / n_keys)               # in (first - n_keys, first] / n_keys
     off = off - np.floor(off - last / n_keys)            # in [last, last + n_keys) / n_keys
-    targets = {}
+    targets, edges = {}, []
     for edge, anchor, step in ((on, first, -1), (off, last, 1)):
         nxt = paws[(anchor - step) % n_keys]           # the pinned key beside the anchor, inside the stance
         dx = paws[anchor, 0] - nxt[0]                  # the pin line's x per key, outward
@@ -1014,16 +1024,82 @@ def settle_edges(rig, keys, names, project, chain, release, declared, n_keys, he
             if pinned[k] or k in targets:
                 break
             x = paws[anchor, 0] + dx * j
-            targets[k] = (x, z if inside else z + height)
-            if not inside:
-                break
-            j += 1
+            if inside:
+                targets[k] = (x, z)
+                j += 1
+                continue
+            # the inside key next to it, and where the declared edge falls between the two (0 at the inside key)
+            k_in = (k - step) % n_keys
+            w = abs(edge - (u - step / n_keys)) * n_keys
+            targets[k] = (x, max(2 * (ground + height) - z, ground + height))
+            edges.append((k, k_in, min(max(w, 0.0), 1.0)))
+            break
     if not targets:
         return keys, []
     index = np.array(sorted(targets))
     target = np.array([targets[k] for k in index], float)
-    keys[index], _ = solve_leg(rig, keys[index], names, project["chains"][chain], project["paws"][chain], target)
+    chain_bones, paw_bone = project["chains"][chain], project["paws"][chain]
+    keys[index], _ = solve_leg(rig, keys[index], names, chain_bones, paw_bone, target)
+    for k, k_in, w in edges:
+        x, z_out = targets[k]
+        for _ in range(rounds):
+            mid = (1 - w) * keys[k_in] + w * keys[k]
+            crossing = float(rig.paws(mid[None], names, project)[chain][0, 1]) - ground
+            error = height - crossing
+            if abs(error) < 1e-3 * height or w <= 1e-6:
+                break
+            z_out = max(z_out + error / w, ground + height)
+            keys[[k]], _ = solve_leg(rig, keys[[k]], names, chain_bones, paw_bone, np.array([[x, z_out]]))
     return keys, [int(k) for k in index]
+
+
+def clear_swing(rig, keys, names, project, swings, grounds, height, clearance=SWING_CLEARANCE,
+                rounds=CLEARANCE_ROUNDS, subsamples=CLEARANCE_SUBSAMPLES):
+    """Vole round 7: no swing comes down into contact. For each chain in `swings` ({chain: (declared window, the key
+    indices that must not move: the pinned and settled keys)}), wherever a key interval wholly outside its declared
+    contact plays the paw under `height` (the bar's contact height) over its ground (`grounds`), the interval's free
+    keys are lifted until its lowest played sample is `clearance` contact heights up, and the leg is solved again to
+    reach them (`solve_leg`), for at most `rounds` passes. The intervals across a declared edge are settle_edges'.
+    (The vole's fitted swings drag back down to 0.0-0.8 mm within a few keys of liftoff, under the bar's 1.27 mm.)
+    Returns (keys, {chain: the largest lift, m} for the chains it lifted)."""
+    keys = np.array(keys, float, copy=True)
+    n_keys = len(keys)
+    phases = np.arange(n_keys) / n_keys
+    lifted = {}
+    for _ in range(rounds):
+        heights = played_heights(rig, keys, names, project, {c: grounds[c] for c in swings}, subsamples)
+        moved = False
+        for chain, (window, fixed) in swings.items():
+            inside = _in_window(phases, window)
+            low = heights[chain].min(axis=1)
+            need = np.zeros(n_keys)
+            for k in range(n_keys):
+                k2 = (k + 1) % n_keys
+                if inside[k] or inside[k2] or low[k] >= height:
+                    continue
+                amount = clearance * height - low[k]
+                for key in (k, k2):
+                    if key not in fixed:
+                        need[key] = max(need[key], amount)
+            index = np.flatnonzero(need > 0)
+            if not len(index):
+                continue
+            paws = rig.paws(keys[index], names, project)[chain]
+            target = paws + np.stack([np.zeros(len(index)), need[index]], axis=1)
+            keys[index], _ = solve_leg(rig, keys[index], names, project["chains"][chain], project["paws"][chain],
+                                       target)
+            lifted[chain] = round(max(lifted.get(chain, 0.0), float(need.max())), 6)
+            moved = True
+        if not moved:
+            break
+    return keys, lifted
+
+
+def _in_window(phases, window):
+    on, off = window
+    if (on, off) == (0.0, 1.0):
+        return np.ones(len(phases), bool)
+    return (phases >= on) & (phases < off) if off > on else (phases >= on) | (phases < off)
 
 
 def seam_jumps(keys, rig, names, project, columns):

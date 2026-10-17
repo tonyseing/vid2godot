@@ -191,7 +191,14 @@ retime is 1 and nothing changes. Pick F so the band's centre gives at least 10 f
   (`ik.<paw>.clearanceLiftMaxM`). A paw whose agreement (below) is under 0.97 has its declared contact's edges
   settled: the unpinned keys inside it take the pin, the key just outside takes the pin's line two contact
   tolerances up, so the played paw comes down on its spot at the declared edge (`ik.<paw>.settledKeys`; the
-  round-5 vole slid back into its touchdowns at 0.953-0.969, the wolf passes at 0.974 and up).
+  round-5 vole slid back into its touchdowns at 0.953-0.969, the wolf passes at 0.974 and up). Vole round 7: the
+  key just outside is solved so the played paw crosses the bar's contact height (below) exactly at the declared
+  edge, from the inside key's own height and the leg's kinematics between the keys (round 6's two contact
+  tolerances, 2 x 1.59 mm at the vole, crossed the bar's 1.27 mm a third of a key late); a settled paw's swing that
+  comes back down under that height wholly outside its declared contact is lifted to 1.5 contact heights there
+  (`motion.clear_swing`, `ik.<paw>.swingLiftMaxM`: the round-6 vole's swings dragged back to 0.0-0.8 mm a few
+  keys after liftoff), and the edges are settled again. A clip that fails the bar's agreement settles every paw
+  under 0.97 on it; a clip that passes both readings (the wolf lope, 0.957 and up on the bar's) is untouched.
   Outside, the paw follows the free motion plus the correction where the pin lets go, faded out by a quintic over
   max(0.05, 0.125) of the stride (`PIN_RELEASE.span_stride`: round 4's 3 key intervals at the wolf's 24 keys, now a
   share of the stride so a short stride's stance is not eaten). The correction is set by `motion.PIN_RELEASE` (span, the derivatives
@@ -206,6 +213,10 @@ retime is 1 and nothing changes. Pick F so the band's centre gives at least 10 f
   rule, without the stance allowance (a pinned paw is on the ground) and with the body's scaled contact tolerance
   (`contactCheck.redetectionTolerance`). Under 0.95 agreement for any paw, `facts` refuses (`contactCheck`);
   `plantedStillShare` reports how much of each stance is under the body's still speed (0.10 m/s at the wolf).
+  Vole round 7: the bar's own reading too (`contactCheck.barContact`; chase3d `tools/anim_compare.py` criterion
+  5): the keys played at 600 samples a 24-key cycle, a paw in contact while under 2 cm times the body's leg-length
+  scale above its rest height (1.27 mm at the vole), height alone, against its declared contact. Under 0.95 for
+  any paw, `facts` refuses.
 - **Loop seam (vole round 6)**: per paw and trunk, neck and tail column, the velocity jump across the seam is at
   most the cycle's median per-key change (`contactCheck.loopSeam`). Where it is not, the loop starts at the
   nearest key with the most room outside the eases where it is (`loopSeam.movedFrom`: the round-5 vole started

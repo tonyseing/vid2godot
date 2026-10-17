@@ -38,7 +38,11 @@ backward slide is read as that slide (`read_cycle`, recorded as `contactReading`
 
 Vole round 6: the keys are held to the bar as played (motion.for_keys, `smooth.played`), cleared of the ground
 (`penetration`), settled at a paw's contact edges under SETTLE_BELOW agreement, and the loop starts where its seam
-has no velocity jump (`contactCheck.loopSeam`)."""
+has no velocity jump (`contactCheck.loopSeam`).
+
+Vole round 7: the keys are also read as the bar reads contacts (`bar_agreement`, `contact_height`: under 2 cm x leg
+scale, height alone; `contactCheck.barContact`), settled at that height, their swings lifted out of it, and gated on
+it."""
 import re
 from typing import NamedTuple, Optional
 
@@ -74,6 +78,10 @@ BRIDGE_PHASE = 0.05
 DENSE = 240                  # samples per cycle the rig's motion is read at
 CONTACT_AGREEMENT = 0.95     # declared contacts vs a re-detection from the baked keys, per paw
 SETTLE_BELOW = CONTACT_AGREEMENT + 0.02   # vole round 6: a paw under this agreement has its contact edges settled
+# Vole round 7: the bar's contact (chase3d tools/anim_compare.py criterion 5, PRIMARY_THR): a paw under 2 cm above its
+# rest height, height alone, at the wolf; scaled with leg length as the round-4 tolerances are (the vole's 1.27 mm).
+# Under CONTACT_TOLERANCE, so a key planted within this is within facts' own contact too.
+BAR_CONTACT = 0.02
 # Round 4 ruling: the edge gate (an edge's velocity change at most the paw's swing median per-key change) measured
 # across each pin's whole approach and release span, where the bar's harness finds the kink (motion.edge_jumps).
 # Measured, recorded and warned on every clip; it refuses only while EDGE_GATE_SPAN is True. It is False pending the
@@ -1239,6 +1247,26 @@ def penetration(tol):
     return float(motion.PENETRATION_M * tol.scale)
 
 
+def contact_height(tol):
+    """The bar's contact height for this body (vole round 7): BAR_CONTACT (2 cm at the wolf) times the body's leg
+    scale (the vole's 1.27 mm), the height under which chase3d's criterion 5 counts a paw in contact."""
+    return float(BAR_CONTACT * tol.scale)
+
+
+def bar_agreement(keys, planar, names, project, rest, declared, height, subsamples=motion.CLEARANCE_SUBSAMPLES):
+    """The bar's criterion 5 on the keys as the clip plays them (vole round 7): the closed keys linear at
+    `subsamples` per key interval (600 a 24-key cycle, the harness's samples), each paw in contact while its tail is
+    under `height` (contact_height) above its rest height, height alone, against its declared contact. Returns
+    {paw bone: agreement}."""
+    values, phases = motion.played(np.asarray(keys, float), subsamples)
+    out = {}
+    for chain, track in planar.paws(values, names, project).items():
+        h = track[:, 1] - float(rest[chain])
+        want = in_window(phases, declared[chain]) if chain in declared else np.zeros(len(phases), bool)
+        out[project["paws"][chain]] = round(float(np.mean(want == (h < height))), 4)
+    return out
+
+
 def ik_reach_tolerance(tol):
     """How near a pinned paw the leg IK must bring it (vole round 5): the body's contact tolerance (round 4's
     CONTACT_TOLERANCE scaled with leg length; exactly CONTACT_TOLERANCE at the wolf)."""
@@ -1330,23 +1358,41 @@ def rig_keys(contacts, n_keys, names, project, rig, rest, period_s, factor, star
     agreement, heights, vx, phases, again = redetect(keys, planar, names, project, rest, declared, speed, tol,
                                                      period_s)
     releases = motion.release_windows(pinned, n_keys, motion.PIN_RELEASE.inset_keys)
+    plant = contact_height(tol)
+    bar = bar_agreement(keys, planar, names, project, rest, declared, plant)
     low = [c for c in heights if c in declared and agreement[project["paws"][c]] < SETTLE_BELOW]
+    if min(bar.values(), default=1.0) < CONTACT_AGREEMENT:
+        # Vole round 7: a clip that fails the bar's criterion 5 also settles every paw under SETTLE_BELOW on it.
+        low = [c for c in heights if c in declared and (c in low or bar[project["paws"][c]] < SETTLE_BELOW)]
     if low:
         # Vole round 6: a paw whose keys fail the agreement gate or pass it by under SETTLE_BELOW has the keys at its
         # declared contact's edges settled onto its pin (motion.settle_edges), the ground cleared again, and is
-        # detected again (never the wolf lope's: 0.974 at least).
+        # detected again (never the wolf lope's: 0.974 at least, and 0.957 at least on the bar's rule). Vole round 7:
+        # settled at the bar's contact height (round 6 used 2 x facts' contact tolerance), its swing lifted out of
+        # contact (motion.clear_swing), and the edges settled again on the lifted swing.
         open_keys = np.asarray(keys, float)[:n_keys]
-        for chain in low:
-            open_keys, settled = motion.settle_edges(planar, open_keys, names, project, chain, releases[chain],
-                                                     declared[chain], n_keys, 2 * tol.contact)
-            if settled:
-                ik.setdefault(chain, {})["settledKeys"] = settled
         grounds = {c: float(rest[c]) for c in releases}
-        open_keys, _ = motion.clear_ground(planar, open_keys, names, project, grounds, penetration(tol))
+        for settle_pass in range(2):
+            settled = {}
+            for chain in low:
+                open_keys, settled[chain] = motion.settle_edges(planar, open_keys, names, project, chain,
+                                                                releases[chain], declared[chain], n_keys, plant,
+                                                                grounds[chain])
+            open_keys, _ = motion.clear_ground(planar, open_keys, names, project, grounds, penetration(tol))
+            if settle_pass == 0:
+                swings = {c: (declared[c], set(np.flatnonzero(motion._pinned_mask(releases[c], n_keys)[0]).tolist())
+                              | set(settled[c])) for c in low}
+                open_keys, swung = motion.clear_swing(planar, open_keys, names, project, swings, grounds, plant)
+        for chain in low:
+            if settled[chain]:
+                ik.setdefault(chain, {})["settledKeys"] = settled[chain]
+            if chain in swung:
+                ik.setdefault(chain, {})["swingLiftMaxM"] = swung[chain]
         keys = np.vstack([open_keys, open_keys[:1]])
         paws = planar.paws(keys, names, project)
         agreement, heights, vx, phases, again = redetect(keys, planar, names, project, rest, declared, speed, tol,
                                                          period_s)
+        bar = bar_agreement(keys, planar, names, project, rest, declared, plant)
     # Vole round 6: the loop seam joins with no velocity jump over the cycle's median per-key change, per paw and
     # trunk, neck and tail column (motion.seam_jumps); else the loop starts at the nearest key, with the most room
     # outside the pins' eases, where it does (the same motion rolled; the wolf lope's seam passes where it is).
@@ -1387,6 +1433,11 @@ def rig_keys(contacts, n_keys, names, project, rig, rest, period_s, factor, star
     pinned_over = {b: j for b, j in edge_jumps.items()
                    if max(j["touchdownPinnedMps"], j["liftoffPinnedMps"]) > j["swingMedianMps"]}
     check["edgeSpanGate"] = {"pass": not span_over, "enforced": EDGE_GATE_SPAN, "over": sorted(span_over)}
+    check["barContact"] = {"agreement": bar, "gate": CONTACT_AGREEMENT, "heightM": round(plant, 6),
+                           "pass": min(bar.values(), default=1.0) >= CONTACT_AGREEMENT,
+                           "rule": "chase3d tools/anim_compare.py criterion 5 on the keys as played (600 samples a "
+                                   "24-key cycle): a paw in contact while under BAR_CONTACT x body scale above its "
+                                   "rest height, height alone, against its declared contact"}
     check["loopSeam"] = {"pass": seam_pass, "worstRatio": round(max(seam.values(), default=0.0), 4),
                          "ratios": seam, "rule": "per paw and trunk, neck and tail column, the velocity jump across "
                                                  "the seam over the cycle's median per-key change, at most 1"}
@@ -1430,6 +1481,13 @@ def rig_keys(contacts, n_keys, names, project, rig, rest, period_s, factor, star
                          f"{', '.join(f'{b} {a:.2f}' for b, a in low.items())} of the played cycle, under the gate "
                          f"{CONTACT_AGREEMENT} (leg IK: {ik}). The keys do not plant those paws where facts "
                          f"declared them; check the leg chains, the fit's paws and the IK residuals")
+    under = {b: a for b, a in bar.items() if a < CONTACT_AGREEMENT}
+    if under:
+        raise FactsError(f"The declared contacts and the bar's contact height ({plant * 1000:.2f} mm, criterion 5: "
+                         f"height alone) disagree on the played keys: they agree on "
+                         f"{', '.join(f'{b} {a:.3f}' for b, a in under.items())} of the cycle, under the gate "
+                         f"{CONTACT_AGREEMENT} (leg IK: {ik}). A swing comes down into contact or a planted paw is "
+                         f"over that height; check the fit's paws and the settled edges")
     return keys.tolist(), declared, {"check": check, "ik": ik, "startKey": key0, "warnings": warnings,
                                      "played": played_report, "worldPitchKept": pitch,
                                      "paws": {project["paws"][c]: np.round(p, 6).tolist() for c, p in paws.items()}}
