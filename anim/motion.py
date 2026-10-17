@@ -1,5 +1,6 @@
 """The baked cycle's motion in numpy: the rig's side-plane forward kinematics, a smooth periodic fit of each joint's
-cycle, and two-bone leg IK that pins each planted paw for the 60 Hz keys facts hands to the bake.
+cycle, and two-bone leg IK that pins each planted paw for the keys (60 Hz, at least MIN_KEYS_PER_STRIDE per stride)
+facts hands to the bake.
 
 Every fitted joint turns about its bone's side axis, which is world +Y at rest (rigutil.side_axis_local), and so do
 its parents: a bone's posed transform is a rotation about world +Y and a shift in x/z, and the side view is exact in
@@ -18,18 +19,29 @@ reshapes them in stance anyway.
 
 The keys pin each planted paw world-still over its stance less `PIN_RELEASE.inset_keys` (half a key) at each end
 (`release_windows`); outside, the correction from the free paw to the pin fades to nothing over
-max(BLEND, PIN_RELEASE.span_keys / n_keys) of the cycle by a quintic. The correction matches the pin's derivatives up to
+max(BLEND, PIN_RELEASE.span_stride) of the cycle by a quintic. The correction matches the pin's derivatives up to
 `PIN_RELEASE`'s orders per axis and edge: by default position, velocity and acceleration in x and position and
 velocity in z at both edges, so the paw's position and velocity are continuous at liftoff and touchdown (Task 19
 round 3; `edge_jumps` measures the velocity change across each approach and release span, round 4). `start_key`
 picks the loop's first key outside every approach and release (round 4).
+
+Vole round 5 (a 5.3 Hz, 46 mm-leg body): every stride gets at least MIN_KEYS_PER_STRIDE keys (`key_count`; the key
+rate rises above KEY_RATE for a fast stride), the ease is a share of the stride (`PinRelease.span_stride`), an eased
+paw never goes below the ground it is pinned to, and where a pin lies beyond the leg's reach from the fit's pose the
+front leg's girdle (scapula) swings about its head (`solve_leg`) and, past the whole straight leg's reach, the body
+comes down by the least smooth amount that reaches (`reach_drop`). None of it changes the wolf lope's keys.
 
 numpy only."""
 from typing import NamedTuple
 
 import numpy as np
 
-KEY_RATE = 60.0          # the bake's key rate (Hz of the played clip)
+KEY_RATE = 60.0          # the bake's key rate (Hz of the played clip) ...
+# ... raised for a fast stride so every stride gets at least MIN_KEYS_PER_STRIDE keys (vole round 5: the 5.3 Hz vole
+# had 11 keys at 60 Hz). The floor is the wolf lope's own count (2.51 Hz at 60 Hz: 23.9, rounded to 24), so the wolf
+# keys exactly as before; the vole gets 24 keys per stride at 127 Hz. Godot plays any key rate.
+MIN_KEYS_PER_STRIDE = 24
+REFERENCE_KEYS = 24      # the wolf lope's keys per stride, at which the pin ease's span_stride is 3 key intervals
 RANGE_KEEP = 0.95        # a smoothed trunk, neck, tail or root column keeps this share of its sampled range
 JERK_MAX = 3.0           # ... with its jerk at most this many times a sine's of the same range (the bar's criterion 4)
 BLEND = 0.05             # least cycle fraction over which a paw eases from free to pinned before touchdown, and back
@@ -39,18 +51,20 @@ EDGE_SAMPLES = 3600      # samples per cycle the free paw's position, velocity a
 class PinRelease(NamedTuple):
     """How a pinned paw takes up its world-still line at touchdown and lets go of it at liftoff (Task 19 round 3).
 
-    span_keys: the key intervals the correction from the free paw to the pin fades over (and at least `min_span` of
-    the cycle). touchdown_orders, liftoff_orders: per axis (x, z), the derivatives of the pin the correction matches at
+    span_stride: the share of the stride the correction from the free paw to the pin fades over (and at least
+    `min_span` of it); vole round 5: a share of the stride, not a count of keys, so a short stride's stance is not
+    eaten by the eases. The default is the round-4 3 key intervals at the wolf lope's 24 keys per stride. touchdown_orders, liftoff_orders: per axis (x, z), the derivatives of the pin the correction matches at
     that edge: 0 position, 1 also velocity, 2 also acceleration. inset_keys: where the pin starts and ends, in key
     intervals inside the snapped contact window at each end (0 at its edge, negative outside it)."""
-    span_keys: float = 3.0
+    span_stride: float = 3.0 / REFERENCE_KEYS
     touchdown_orders: tuple = (2, 1)
     liftoff_orders: tuple = (2, 1)
     inset_keys: float = 0.5
     min_span: float = BLEND
 
-    def span(self, n_keys):
-        return max(self.min_span, self.span_keys / n_keys)
+    def span(self, n_keys=None):
+        """The ease as a share of the cycle (the same at every key count; `n_keys` is accepted and unused)."""
+        return max(self.min_span, self.span_stride)
 
     def edge_orders(self, touchdown):
         return np.asarray(self.touchdown_orders if touchdown else self.liftoff_orders)
@@ -64,6 +78,8 @@ class PinRelease(NamedTuple):
 # None passes the per-paw edge criterion 8 (every front lift-off is over 2.3 m/s against the old clip's 1.4) or the
 # span-wide edge gate (EDGE_GATE_SPAN in facts).
 PIN_RELEASE = PinRelease()
+REACH_MARGIN = 0.02        # a pinned paw lies within (1 - this) of its leg's whole straight reach (reach_drop)
+REACH_OVERSAMPLE = 16    # samples per key interval the body drop is smoothed at
 SUBSAMPLES = 8           # re-detection samples per key interval (the keys are interpolated linearly, as played)
 
 
@@ -305,7 +321,10 @@ def solve_leg(rig, values, names, chain, paw_bone, target, pivot=True):
     """Two-bone IK in the side plane: new values (S, V) with the chain's pair and first foot bone turned so the paw
     bone's tail reaches `target` (S, 2) while the foot keeps its world orientation and the knee bends the way it
     bent. Where the pair cannot reach, `pivot` turns the foot about the pinned toe (the heel lifts, as at the end of a
-    stance) by the least angle that brings the ankle within reach. Returns (values, reached paw positions)."""
+    stance) by the least angle that brings the ankle within reach, and first, where even the straight pair and foot
+    cannot reach from the shoulder, swings the chain's girdle bone (`girdle_bone`: a front leg's scapula) about its
+    head by the least angle that brings the shoulder within that reach (vole round 5); the foot keeps its world
+    orientation either way. Returns (values, reached paw positions)."""
     (upper, lower), foot = ik_bones(chain)
     index = {n: i for i, n in enumerate(names)}
     missing = [b for b in (upper, lower, foot[0]) if b not in index]
@@ -313,14 +332,29 @@ def solve_leg(rig, values, names, chain, paw_bone, target, pivot=True):
         raise ValueError(f"leg IK turns {missing}, which the fit did not solve")
     posed = rig.pose(values, names)
     phi, _ = posed
+    foot_phi = phi[foot[0]]                      # the foot keeps this world orientation (before any girdle swing)
+    offset = rig.point(posed, paw_bone) - rig.point(posed, foot[0], "head")
+    target = np.asarray(target, float)
+    l1 = float(np.linalg.norm(rig.head[lower] - rig.head[upper]))
+    l2 = float(np.linalg.norm(rig.head[foot[0]] - rig.head[lower]))
+    girdle = girdle_bone(rig, chain, upper)
+    swing = np.zeros(len(values))
+    if pivot and girdle is not None and girdle in index:
+        # Vole round 5: where the pair and a pivoting foot cannot reach the pin from the shoulder, the bone above
+        # the pair (the scapula) swings about its own head by the least angle that brings the shoulder within
+        # reach, as a quadruped's scapula does through a stride; elsewhere nothing changes.
+        hinge = rig.point(posed, girdle, "head")
+        reach = (l1 + l2 + np.linalg.norm(offset, axis=1)) * (1 - 1e-6)
+        swing = toe_pivot(target - hinge, rig.point(posed, upper, "head") - hinge, reach)
+        if np.any(swing):
+            values = np.array(values, float, copy=True)
+            values[:, index[girdle]] += swing
+            posed = rig.pose(values, names)
+            phi, _ = posed
     parent = rig.parent[upper]
     a = rig.point(posed, upper, "head")
     knee = rig.point(posed, lower, "head")
     end = rig.point(posed, foot[0], "head")
-    offset = rig.point(posed, paw_bone) - end
-    target = np.asarray(target, float)
-    l1 = float(np.linalg.norm(rig.head[lower] - rig.head[upper]))
-    l2 = float(np.linalg.norm(rig.head[foot[0]] - rig.head[lower]))
     turn = np.zeros(len(values))
     if pivot:
         turn = toe_pivot(target - a, offset, (l1 + l2) * (1 - 1e-6))
@@ -339,10 +373,19 @@ def solve_leg(rig, values, names, chain, paw_bone, target, pivot=True):
     p_phi = phi[parent] if parent else np.zeros(len(values))
     out = np.array(values, float, copy=True)
     for bone, angle in ((upper, phi_upper - p_phi), (lower, phi_lower - phi_upper),
-                        (foot[0], phi[foot[0]] + turn - phi_lower)):
+                        (foot[0], foot_phi + turn - phi_lower)):
         free = out[:, index[bone]]
         out[:, index[bone]] = free + wrap(angle - free)
     return out, new_end + offset
+
+
+def girdle_bone(rig, chain, upper):
+    """The leg chain's bone above its IK pair, when the pair hangs from it (a front leg's scapula): the bone the
+    shoulder swings about. None for a chain that starts at the pair (a hind leg from the hip)."""
+    i = chain.index(upper)
+    if i == 0 or rig.parent.get(upper) != chain[i - 1]:
+        return None
+    return chain[i - 1]
 
 
 def toe_pivot(toe, offset, length):
@@ -427,14 +470,17 @@ def quintic(s):
             0.5 * s ** 2 - 1.5 * s ** 3 + 1.5 * s ** 4 - 0.5 * s ** 5)
 
 
-def plan_keys(rig, smooth, names, project, windows, stride, rest, lift, n_keys, blend=None, release=None):
+def plan_keys(rig, smooth, names, project, windows, stride, rest, lift, n_keys, blend=None, release=None,
+              reach=True):
     """The bake's keys: n_keys + 1 value vectors at phases k / n_keys (the last repeats the first), the smooth cycle
     with its root lifted by `lift` and every planted paw pinned to its world-still line (`pin_lines`) over its
     contact window less `release.inset_keys` at each end (`release_windows`). Outside, the paw's target is the free
     paw plus the correction where the pin lets go (pin minus free in position, and in velocity and acceleration on the
     axes whose `release.edge_orders` at that edge reach them) faded to nothing by a quintic over `blend` (by default `release.span`:
-    max(BLEND, span_keys / n_keys) of the cycle). `release` is PIN_RELEASE unless given. Returns (keys, predicted
-    paws per key, IK report)."""
+    max(BLEND, span_stride) of the cycle). `release` is PIN_RELEASE unless given. An eased paw is kept on or above
+    its pin's ground. With `reach` (the default) the body comes down where a live target is beyond its leg's whole
+    reach (`reach_drop`) and the targets are planned again. Returns (keys, predicted paws per key, IK report; a
+    chain's report gains girdleSwingMaxDeg and bodyDropMaxM when they are not zero)."""
     release_setting = PIN_RELEASE if release is None else release
     span = release_setting.span(n_keys) if blend is None else blend
     phases = np.arange(n_keys) / n_keys
@@ -448,57 +494,135 @@ def plan_keys(rig, smooth, names, project, windows, stride, rest, lift, n_keys, 
     dense = smooth.at(grid)
     dense[:, names.index("dz")] += lift
     dense[:, names.index("dx")] -= shift
-    dense_paws = rig.paws(dense, names, project)
-    free_paws = rig.paws(keys, names, project)
-    report = {}
-    for chain in windows:
-        line, (on, off) = lines[chain], release[chain]
-        end = off if off >= on else off + 1.0
-        if (on, off) == (0.0, 1.0):
-            end = 1.0
+    def targets(keys, dense):
+        dense_paws = rig.paws(dense, names, project)
+        free_paws = rig.paws(keys, names, project)
+        out = {}
+        for chain in windows:
+            line, (on, off) = lines[chain], release[chain]
+            end = off if off >= on else off + 1.0
+            if (on, off) == (0.0, 1.0):
+                end = 1.0
 
-        def pin(u):
-            return np.stack([line["x"] - stride * (np.asarray(u, float) - line["mid"]),
-                             np.full(np.shape(u), line["z"])], axis=-1)
-        free = free_paws[chain]
-        target = free.copy()
-        pinned = np.zeros(n_keys, bool)
-        for shift_u in (-1.0, 0.0, 1.0):
-            u = phases + shift_u
-            inside = (u >= on - 1e-9) & (u <= end + 1e-9) & ~pinned
-            target[inside] = pin(u[inside])
-            pinned |= inside
-        eased = np.zeros(n_keys, bool)
-        if (on, off) != (0.0, 1.0):
-            p = dense_paws[chain]
-            velocity = (np.roll(p, -1, axis=0) - np.roll(p, 1, axis=0)) * EDGE_SAMPLES / 2
-            accel = (np.roll(p, -1, axis=0) - 2 * p + np.roll(p, 1, axis=0)) * EDGE_SAMPLES ** 2
-            for edge, sign in ((on, -1.0), (end, 1.0)):
-                order = release_setting.edge_orders(touchdown=sign < 0)
-                i = int(round((edge % 1.0) * EDGE_SAMPLES)) % EDGE_SAMPLES
-                value = pin(edge) - p[i]
-                slope = (np.array([-stride, 0.0]) - velocity[i]) * sign * span * (order >= 1)
-                curve = -accel[i] * span ** 2 * (order >= 2)
-                for shift_u in (-1.0, 0.0, 1.0):
-                    s = (phases + shift_u - edge) * sign / span
-                    near = (s > 0) & (s < 1) & ~pinned
-                    if near.any():
-                        h0, h1, h2 = quintic(s[near])
-                        target[near] += np.outer(h0, value) + np.outer(h1, slope) + np.outer(h2, curve)
-                        eased |= near
+            def pin(u):
+                return np.stack([line["x"] - stride * (np.asarray(u, float) - line["mid"]),
+                                 np.full(np.shape(u), line["z"])], axis=-1)
+            target = free_paws[chain].copy()
+            pinned = np.zeros(n_keys, bool)
+            for shift_u in (-1.0, 0.0, 1.0):
+                u = phases + shift_u
+                inside = (u >= on - 1e-9) & (u <= end + 1e-9) & ~pinned
+                target[inside] = pin(u[inside])
+                pinned |= inside
+            eased = np.zeros(n_keys, bool)
+            if (on, off) != (0.0, 1.0):
+                p = dense_paws[chain]
+                velocity = (np.roll(p, -1, axis=0) - np.roll(p, 1, axis=0)) * EDGE_SAMPLES / 2
+                accel = (np.roll(p, -1, axis=0) - 2 * p + np.roll(p, 1, axis=0)) * EDGE_SAMPLES ** 2
+                for edge, sign in ((on, -1.0), (end, 1.0)):
+                    order = release_setting.edge_orders(touchdown=sign < 0)
+                    i = int(round((edge % 1.0) * EDGE_SAMPLES)) % EDGE_SAMPLES
+                    value = pin(edge) - p[i]
+                    slope = (np.array([-stride, 0.0]) - velocity[i]) * sign * span * (order >= 1)
+                    curve = -accel[i] * span ** 2 * (order >= 2)
+                    for shift_u in (-1.0, 0.0, 1.0):
+                        s = (phases + shift_u - edge) * sign / span
+                        near = (s > 0) & (s < 1) & ~pinned
+                        if near.any():
+                            h0, h1, h2 = quintic(s[near])
+                            target[near] += np.outer(h0, value) + np.outer(h1, slope) + np.outer(h2, curve)
+                            eased |= near
+                # Vole round 5: an eased paw never goes below the ground it is pinned to (the quintic's matched
+                # velocity can carry a fast-descending paw through it; never at the wolf).
+                target[eased, 1] = np.maximum(target[eased, 1], line["z"])
+            # ... nor a swinging one (a noisy fit's mid-swing dip: the vole's hinds 3 mm into the ground): such a key
+            # is lifted to the ground and solved with the rest (the "eased" keys of the report count it).
+            under = ~pinned & ~eased & (target[:, 1] < line["z"] - 1e-9)
+            target[under, 1] = line["z"]
+            eased |= under
+            out[chain] = (target, pinned, eased, line)
+        return out
+
+    plan = targets(keys, dense)
+    drop = reach_drop(rig, keys, names, project, plan, span) if reach else np.zeros(n_keys)
+    if np.any(drop > 0):
+        # Vole round 5: where a pinned paw is out of the whole leg's reach (pair, pivoting foot and swinging
+        # girdle all straight), the body comes down by the least smooth amount that brings it within reach.
+        keys[:, names.index("dz")] -= drop
+        dense[:, names.index("dz")] -= np.interp(grid, np.append(phases, 1.0), np.append(drop, drop[0]))
+        plan = targets(keys, dense)
+    report = {}
+    for chain, (target, pinned, eased, line) in plan.items():
         live = pinned | eased
         if not live.any():
             continue
         paw_bone = project["paws"][chain]
-        solved, reached = solve_leg(rig, keys[live], names, project["chains"][chain], paw_bone, target[live])
+        chain_bones = project["chains"][chain]
+        girdle = girdle_bone(rig, chain_bones, ik_bones(chain_bones)[0][0])
+        before = keys[live, names.index(girdle)].copy() if girdle in names else None
+        solved, reached = solve_leg(rig, keys[live], names, chain_bones, paw_bone, target[live])
         keys[live] = solved
         residual = np.linalg.norm(reached - target[live], axis=1)
         report[chain] = {"pinnedKeys": int(np.count_nonzero(pinned)), "easedKeys": int(np.count_nonzero(eased)),
                          "edgeKeys": round(span * n_keys, 3), "maxResidualM": round(float(residual.max()), 5),
                          "pinX": round(line["x"], 4), "pinZ": round(line["z"], 4)}
+        if before is not None and np.any(solved[:, names.index(girdle)] != before):
+            swing = np.abs(wrap(solved[:, names.index(girdle)] - before))
+            report[chain]["girdleSwingMaxDeg"] = round(float(np.degrees(swing.max())), 3)
+        if np.any(drop > 0):
+            report[chain]["bodyDropMaxM"] = round(float(drop.max()), 6)
     keys = np.vstack([keys, keys[:1]])
     paws = rig.paws(keys, names, project)
     return keys, {c: p for c, p in paws.items()}, report
+
+
+def leg_reach(rig, chain, paw_bone):
+    """A leg chain's hinge (the girdle bone's head when the IK pair hangs from one, else the pair's own head) and its
+    whole reach from there with every bone straight: girdle, the pair, and the foot from its head to the paw tail."""
+    (upper, lower), foot = ik_bones(chain)
+    girdle = girdle_bone(rig, chain, upper)
+    length = float(np.linalg.norm(rig.head[lower] - rig.head[upper]) + np.linalg.norm(rig.head[foot[0]] - rig.head[lower])
+                   + np.linalg.norm(rig.tail[paw_bone] - rig.head[foot[0]]))
+    if girdle is not None:
+        length += float(np.linalg.norm(rig.head[upper] - rig.head[girdle]))
+    return (girdle or upper), length
+
+
+def reach_drop(rig, keys, names, project, plan, span, margin=REACH_MARGIN, oversample=REACH_OVERSAMPLE):
+    """Per key, how far the body must come down (m, >= 0) for every live paw target (pinned or eased) to lie within
+    (1 - margin) of its leg's whole reach (`leg_reach`) from the hinge, smoothed: the needed drop at each key,
+    max-filtered and then averaged by a Hann window over half the pin's ease `span` of the cycle, so it is at least
+    the need at every key and eases in and out. Zero for a body whose legs reach every pin (the wolf)."""
+    n_keys = len(keys)
+    need = np.zeros(n_keys)
+    posed = rig.pose(keys, names)
+    for chain, (target, pinned, eased, _) in plan.items():
+        live = pinned | eased
+        if not live.any():
+            continue
+        paw_bone = project["paws"][chain]
+        hinge_bone, length = leg_reach(rig, project["chains"][chain], paw_bone)
+        hinge = rig.point(posed, hinge_bone, "head")
+        r = length * (1 - margin)
+        dx = target[:, 0] - hinge[:, 0]
+        dz = hinge[:, 1] - target[:, 1]
+        far = live & (np.hypot(dx, dz) > r)
+        if far.any():
+            room = np.sqrt(np.maximum(r * r - dx[far] ** 2, 0.0))
+            need[far] = np.maximum(need[far], dz[far] - room)
+    need = np.maximum(need, 0.0)
+    if not need.any():
+        return need
+    count = n_keys * oversample
+    radius = max(1, int(round(0.5 * span * count)))
+    fine = np.zeros(count)
+    fine[::oversample] = need
+    idx = (np.arange(count)[:, None] + np.arange(-radius, radius + 1)[None, :]) % count
+    held = fine[idx].max(axis=1)
+    window = np.hanning(2 * radius + 3)[1:-1]
+    window /= window.sum()
+    smooth = (held[idx] * window[None, :]).sum(axis=1)
+    return np.maximum(smooth[::oversample], need)
 
 
 def _pinned_mask(release_window, n_keys):
@@ -607,8 +731,14 @@ def played(keys, subsamples=SUBSAMPLES):
     return (1 - w) * keys[lo] + w * keys[lo + 1], t / n
 
 
-def key_count(duration_s, rate=KEY_RATE):
-    return max(8, int(round(rate * duration_s)))
+def key_count(duration_s, rate=KEY_RATE, floor=MIN_KEYS_PER_STRIDE):
+    """Keys per stride: `rate` Hz over the stride's `duration_s`, at least `floor` (vole round 5)."""
+    return max(int(floor), int(round(rate * duration_s)))
+
+
+def key_rate(n_keys, duration_s):
+    """The played clip's key rate for n_keys over one stride (Hz): KEY_RATE, or more where the floor raised it."""
+    return n_keys / duration_s
 
 
 def heglund_taylor_hz(mass_kg):

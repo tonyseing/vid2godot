@@ -159,23 +159,34 @@ retime is 1 and nothing changes. Pick F so the band's centre gives at least 10 f
   `smooth.jerkRatio`, `smooth.keptRange`). Legs keep every harmonic. Each trunk and tail bone's world pitch range
   against the sampled cycle's is `smooth.worldPitchKept`; under 0.95 it is a warning (a joint's own range is kept,
   but a small world pitch that is a sum of differently-phased joints can shrink: the wolf's tail_03 at 0.46).
-- **60 Hz**: round(60 x duration) keys over one cycle; the last repeats the first (a closed seam), drift zero.
+- **60 Hz, at least 24 keys per stride**: max(24, round(60 x duration)) keys over one cycle; the last repeats the
+  first (a closed seam), drift zero. A fast stride's key rate rises above 60 Hz (the 5.31 Hz vole: 24 keys at
+  127 Hz, not 11); the floor is the wolf lope's own 24 (60 x 0.398 s = 23.9), so the wolf keys as before. Recorded
+  as `cycle.keysPerStride`, `cycle.minKeysPerStride` and `cycle.playedKeyRateHz`; Godot plays any key rate.
 - **Ground**: the root is lifted so the shared ground is the rig's rest ground (`cycle.groundLift`).
 - **Pins**: over each stance's keys less half a key at each end, two-bone IK (the two bones above the last two; the
   foot keeps its world orientation, the knee its bend; where the leg cannot reach, the foot turns about the pinned
   toe, the heel lifting) holds the paw on a world-still line: on the ground, sliding back one stride per cycle.
+  Where even the straight pair and foot cannot reach from the shoulder, a front leg's scapula (the chain bone the
+  pair hangs from) swings about its head by the least angle that reaches (`ik.<paw>.girdleSwingMaxDeg`); where the
+  whole straight leg cannot, the body comes down by the least smooth amount that reaches with 2 % to spare
+  (`ik.<paw>.bodyDropMaxM`). Vole round 5: the round-4 vole's fronts missed by 6.2 mm because the IK held the
+  scapula at the fit's angle while the fit's body rode 10 mm high; neither applies to the wolf. No eased or
+  swinging key goes below its paw's ground (a noisy fit's mid-swing dip is lifted onto it).
   Outside, the paw follows the free motion plus the correction where the pin lets go, faded out by a quintic over
-  max(0.05 of a cycle, 3 key intervals). The correction is set by `motion.PIN_RELEASE` (span, the derivatives
+  max(0.05, 0.125) of the stride (`PIN_RELEASE.span_stride`: round 4's 3 key intervals at the wolf's 24 keys, now a
+  share of the stride so a short stride's stance is not eaten). The correction is set by `motion.PIN_RELEASE` (span, the derivatives
   matched per axis at touchdown and at liftoff, and the inset; recorded as `contactCheck.pinRelease`). The default
   matches position, velocity and acceleration in x and position and velocity in z at both edges, so liftoff and
   touchdown have no velocity step. It came from a sweep on the wolf lope, measured with chase3d's
   `tools/anim_compare.py` (Task 19 rounds 3 and 4; 4 keys in fix round 1, 2.6 in round 3): of the settings that pass
   bar criteria 1-6 and facts' gates, 3 keys pops least at the contact edges. None passes the per-paw edge criterion
   (the front paws' lift-offs). `ik` reports each paw's pinned and eased keys and its largest residual (a leg that
-  cannot reach its pin leaves one).
+  cannot reach its pin leaves one). A residual over the body's contact tolerance refuses (`contactCheck.ikReach`).
 - **Check**: the keys are played as the clip plays them (linear between keys) and detected again with the same
-  rule, without the 0.06 m allowance (a pinned paw is on the ground). Under 0.95 agreement for any paw, `facts`
-  refuses (`contactCheck`); `plantedStillShare` reports how much of each stance is under 0.10 m/s.
+  rule, without the stance allowance (a pinned paw is on the ground) and with the body's scaled contact tolerance
+  (`contactCheck.redetectionTolerance`). Under 0.95 agreement for any paw, `facts` refuses (`contactCheck`);
+  `plantedStillShare` reports how much of each stance is under the body's still speed (0.10 m/s at the wolf).
 - **Edges**: `contactCheck.edgeJumps` is each paw's velocity change (x and z at the keys, m/s per key; in place
   equals world for a constant body speed, as chase3d's harness measures it) against its swing's median per-key
   change. `touchdownMps` and `liftoffMps` are the largest across the whole approach and release span, where the kink
@@ -187,8 +198,8 @@ retime is 1 and nothing changes. Pick F so the band's centre gives at least 10 f
 A one-shot (`"loop": false`) keys its fitted frames; with the rig, `facts` predicts each paw at every key as the
 bake plays it (dx less its mean), so `bake` checks a one-shot the same way.
 
-`bake` keys facts' cycle and reads every paw back from the re-imported GLB: more than 1 mm from facts' prediction
-refuses (the GLB's bones do not turn as `rig.json` says; rerun `contract`).
+`bake` keys facts' cycle and reads every paw back from the re-imported GLB: more than 1 mm (times the body's
+leg-length scale, 0.064 mm at the vole) from facts' prediction refuses (the GLB's bones do not turn as `rig.json` says; rerun `contract`).
 
 ## Verify shows the clip playing
 

@@ -190,3 +190,18 @@ class FactsCommandTests(unittest.TestCase):
         self.assertEqual(code, 0, err)
         volume.assert_called_once()
         self.assertEqual(clip.call_args.kwargs["mass"], {"kg": 85.0, "source": "rig volume"})
+
+
+class PawCheckScaleTests(unittest.TestCase):
+    """Vole round 5: the bake's baked-vs-predicted paw gate is PAW_CHECK_MM at the wolf and scales with leg length
+    (facts.tolerances' scale) as the contact tolerances do."""
+
+    def test_the_gate_scales_with_the_body(self):
+        from anim import pipeline
+        want = {"paw": [[0.0, 0.0], [0.001, 0.0]]}
+        off = {"paw": [[0.0, 0.0], [0.001 + 0.0005, 0.0]]}            # 0.5 mm away at one key
+        self.assertEqual(pipeline.paw_check(want, off), 0.5)
+        self.assertEqual(pipeline.paw_check(want, off, 1.0), 0.5)
+        with self.assertRaisesRegex(pipeline.StageError, "gate 0.0637 mm"):
+            pipeline.paw_check(want, off, 0.0637)
+        self.assertEqual(pipeline.paw_check(want, {"paw": [[0.0, 0.0], [0.001 + 0.00002, 0.0]]}, 0.0637), 0.02)

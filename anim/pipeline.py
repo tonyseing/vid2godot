@@ -309,8 +309,9 @@ def cmd_bake(a):
                                        "names": poses["names"], "paws": sorted(cycle["paws"])}, folder, a.blender)
     if ledger.clip not in result["actions"]:
         raise StageError(f"The re-imported GLB has no clip {ledger.clip!r}: {sorted(result['actions'])}")
-    paw_error = paw_check(cycle["paws"], result.get("paws") or {})
-    bounds = load_json(ledger.output("contract", "rig"))["bounds"]
+    rig = load_json(ledger.output("contract", "rig"))
+    paw_error = paw_check(cycle["paws"], result.get("paws") or {}, facts_mod.tolerances(rig, project).scale)
+    bounds = rig["bounds"]
     background = project["sheet"]["background"]
     camera = sheet_mod.game_camera(bounds, project["sheet"]["pxPerMetre"])
     n = len(cycle["frames"]) - 1
@@ -336,9 +337,11 @@ def cmd_bake(a):
 PAW_CHECK_MM = 1.0
 
 
-def paw_check(predicted, baked):
+def paw_check(predicted, baked, scale=1.0):
     """The largest distance (mm) between facts' predicted paw positions at every key and the re-imported GLB's;
-    refuses over PAW_CHECK_MM (the IK pins would not be what the GLB plays)."""
+    refuses over PAW_CHECK_MM times `scale`, the body's leg length over the wolf's (vole round 5: facts.tolerances'
+    scale, 1 at the wolf), so the IK pins are what the GLB plays."""
+    gate = PAW_CHECK_MM * float(scale)
     worst = 0.0
     for bone, track in predicted.items():
         got = np.asarray(baked.get(bone, []), float)
@@ -346,8 +349,8 @@ def paw_check(predicted, baked):
         if got.shape != want.shape:
             raise StageError(f"The baked GLB reports {len(got)} keys for paw {bone}; facts predicted {len(want)}")
         worst = max(worst, float(np.abs(got - want).max()) * 1000 if len(want) else 0.0)
-    if worst > PAW_CHECK_MM:
-        raise StageError(f"A baked paw is {worst:.2f} mm from where facts pinned it (gate {PAW_CHECK_MM} mm): the "
+    if worst > gate:
+        raise StageError(f"A baked paw is {worst:.4f} mm from where facts pinned it (gate {gate:.4f} mm): the "
                          f"GLB's bones do not turn as the contract's rig.json says; rerun `contract`")
     return round(worst, 4)
 

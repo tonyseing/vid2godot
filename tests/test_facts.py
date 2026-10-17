@@ -1070,7 +1070,9 @@ class RigFactsTests(unittest.TestCase):
         check = result["contactCheck"]
         self.assertGreaterEqual(min(check["agreement"].values()), facts.CONTACT_AGREEMENT)
         self.assertEqual(check["gate"], 0.95)
-        self.assertGreaterEqual(min(check["plantedStillShare"].values()), 0.9)
+        # Vole round 5: the ease is 0.125 of the stride, 6.25 of the toy's 50 keys (3 keys before), and its slower
+        # approach leaves front_R still over 0.898 of its declared stance (0.955 before).
+        self.assertGreaterEqual(min(check["plantedStillShare"].values()), 0.89)
         self.assertAlmostEqual(result["speedMps"], 1.0, delta=0.03)
         paws = np.array(cycle["paws"]["paw_fl"])
         self.assertEqual(paws.shape, (n + 1, 2))
@@ -1134,7 +1136,7 @@ class FixRoundOneFactsTests(unittest.TestCase):
         declared contacts at facts' own gate."""
         check = self.facts()["contactCheck"]
         n = check["keys"]
-        self.assertEqual(check["pinRelease"], {"span_keys": 3.0, "touchdown_orders": [2, 1],
+        self.assertEqual(check["pinRelease"], {"span_stride": 0.125, "touchdown_orders": [2, 1],
                                                "liftoff_orders": [2, 1], "inset_keys": 0.5,
                                                "min_span": motion.BLEND,
                                                "spanKeys": round(motion.PIN_RELEASE.span(n) * n, 3)})
@@ -1456,3 +1458,81 @@ class SmoothedStillnessTests(unittest.TestCase):
         planted = (u > 0.1) & (u < 0.4)
         self.assertGreater(np.max(np.abs(raw[planted] + speed)), speed)
         self.assertLess(np.max(np.abs(smooth[planted] + speed)), 0.3 * speed + 0.01)
+
+
+# ------------------------------------------------------------- vole round 5: the bake scaled to the body (vole)
+VOLE_RETIME = 13.296           # the round-4 accepted retime: 0.3994 Hz in the video to the 5.31 Hz trot band
+WOLF_RETIME = 1.580815         # the wolf lope's retime (its facts.json cycle.retime)
+# The wolf lope's keys and paws from the derived cycle with vid2godot d913e39c (anim-pipeline-2026-10-17), before
+# vole round 5: sha256 of the float64 key table's bytes and of the predicted paws' JSON.
+WOLF_KEYS_SHA256 = "06c12a3d22e417315d2508a9482826046bbf5fc886ab19aa02e78f3fccb3486c"
+WOLF_PAWS_SHA256 = "6e3995a52ee09ccb78c11b7e334637e85ad99fad3dfd4322e488708c64458cc8"
+WOLF_AGREEMENT = {"paw_hind_L": 0.9948, "paw_front_L": 0.9792, "paw_hind_R": 0.974, "paw_front_R": 0.9792}
+
+
+def derived_keys(name, retime, n_keys=None):
+    import hashlib
+    block = derived(name)
+    tol = facts.tolerances(block["rig"], block["project"])
+    contacts = cycle_contacts(block, tol=tol)
+    period_s = block["periodFrames"] / block["fps"]
+    n = motion.key_count(period_s / retime) if n_keys is None else n_keys
+    keys, declared, bake = facts.rig_keys(contacts, n, block["names"], block["project"], block["rig"], block["rest"],
+                                          period_s, retime)
+    import json
+    digest = (hashlib.sha256(np.asarray(keys, float).tobytes()).hexdigest(),
+              hashlib.sha256(json.dumps(bake["paws"]).encode()).hexdigest())
+    return n, keys, declared, bake, digest, tol
+
+
+class BakeScaleTests(unittest.TestCase):
+    """Vole round 5: at the vole's 5.31 Hz a 60 Hz stride had 11 keys, the pin eases (3 keys each) ate its stance and
+    the front IK missed its pins by 6.2 mm (contact tolerance 1.6 mm): the re-detection agreed on 0.53-0.76 of the
+    cycle. Every stride now gets at least 24 keys, the ease is a share of the stride, and the leg reaches its pins
+    (scapula swing, body drop); the wolf lope's keys are unchanged to the bit."""
+
+    def test_the_round_four_vole_failure_is_reproduced_at_eleven_keys(self):
+        with self.assertRaises(facts.FactsError):
+            derived_keys("voleR3Cycle", VOLE_RETIME, n_keys=11)
+
+    def test_the_vole_keys_agree_with_its_declared_contacts(self):
+        n, keys, declared, bake, _, tol = derived_keys("voleR3Cycle", VOLE_RETIME)
+        self.assertEqual(n, motion.MIN_KEYS_PER_STRIDE)
+        check = bake["check"]
+        self.assertGreaterEqual(min(check["agreement"].values()), facts.CONTACT_AGREEMENT, check["agreement"])
+        self.assertTrue(check["ikReach"]["pass"], check["ikReach"])
+        self.assertAlmostEqual(check["ikReach"]["toleranceM"], tol.contact, places=6)
+        self.assertLess(max(check["ikReach"]["maxResidualM"].values()), tol.contact)
+        self.assertAlmostEqual(check["redetectionTolerance"]["contactToleranceM"], tol.contact, places=6)
+        self.assertEqual(check["pinRelease"]["spanKeys"], 3.0)
+        for chain in ("front_L", "front_R"):
+            self.assertIn("girdleSwingMaxDeg", bake["ik"][chain])
+
+    def test_the_wolf_lope_keys_exactly_as_before(self):
+        n, keys, declared, bake, digest, tol = derived_keys("wolfLopeCycle", WOLF_RETIME)
+        self.assertEqual(n, 24)
+        self.assertEqual(digest, (WOLF_KEYS_SHA256, WOLF_PAWS_SHA256))
+        self.assertEqual(bake["check"]["agreement"], WOLF_AGREEMENT)
+        self.assertEqual(bake["startKey"], 5)
+        self.assertEqual(declared, {"hind_L": (0.770833, 0.104167), "front_L": (0.145833, 0.4375),
+                                    "hind_R": (0.895833, 0.270833), "front_R": (0.270833, 0.604167)})
+        self.assertEqual(facts.ik_reach_tolerance(tol), facts.CONTACT_TOLERANCE)
+        for entry in bake["ik"].values():
+            self.assertEqual(entry["maxResidualM"], 0.0)
+            self.assertNotIn("bodyDropMaxM", entry)
+            self.assertNotIn("girdleSwingMaxDeg", entry)
+
+    def test_an_unreachable_pin_is_refused_with_the_reach(self):
+        block = derived("voleR3Cycle")
+        tol = facts.tolerances(block["rig"], block["project"])
+        contacts = cycle_contacts(block, tol=tol)
+        period_s = block["periodFrames"] / block["fps"]
+        real = motion.plan_keys
+
+        def no_reach(*a, **kw):
+            return real(*a, **{**kw, "reach": False})
+        with unittest.mock.patch.object(motion, "plan_keys", no_reach), \
+                unittest.mock.patch.object(motion, "girdle_bone", lambda *a: None):
+            with self.assertRaisesRegex(facts.FactsError, "cannot reach a pin within the body's contact tolerance"):
+                facts.rig_keys(contacts, 24, block["names"], block["project"], block["rig"], block["rest"],
+                               period_s, VOLE_RETIME)

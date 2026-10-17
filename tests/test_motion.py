@@ -244,7 +244,7 @@ class PlanKeysTests(unittest.TestCase):
         for chain, jump in jumps.items():
             self.assertLessEqual(max(jump["touchdownPinnedMps"], jump["liftoffPinnedMps"]), jump["swingMedianMps"],
                                  chain)
-            self.assertGreaterEqual(report[chain]["edgeKeys"], motion.PIN_RELEASE.span_keys - 1e-9)
+            self.assertGreaterEqual(report[chain]["edgeKeys"], motion.PIN_RELEASE.span(n) * n - 1e-9)
         old = self.old_blend(rig, smooth, poses["names"], windows, 20 / 24, n)
         jumped = motion.edge_jumps(old, windows, n, 0.02)                  # the old plan pinned the whole window
         self.assertTrue(any(max(j["touchdownPinnedMps"], j["liftoffPinnedMps"]) > j["swingMedianMps"]
@@ -314,6 +314,20 @@ class PlanKeysTests(unittest.TestCase):
         self.assertEqual(motion.key_count(0.4), 24)
         self.assertEqual(motion.key_count(0.6293), 38)
 
+    def test_a_fast_stride_gets_at_least_the_floor_of_keys(self):
+        """Vole round 5: the 5.31 Hz vole stride had round(60 / 5.31) = 11 keys at 60 Hz; every stride gets at least
+        MIN_KEYS_PER_STRIDE, the wolf lope's own count, so its key rate rises (Godot plays any key rate)."""
+        self.assertEqual(motion.MIN_KEYS_PER_STRIDE, 24)
+        self.assertEqual(motion.key_count(1 / 5.31), 24)
+        self.assertEqual(motion.key_count(0.05), 24)
+        self.assertAlmostEqual(motion.key_rate(24, 1 / 5.31), 24 * 5.31)
+        # The wolf lope (2.51 Hz after its retime): 60 Hz gives 23.9 keys, which round to the floor itself, so the
+        # floor changes neither its key count nor its keys.
+        wolf = 1 / 2.5118
+        self.assertEqual(int(round(motion.KEY_RATE * wolf)), 24)
+        self.assertEqual(motion.key_count(wolf), 24)
+        self.assertAlmostEqual(motion.key_rate(24, wolf), 60.28, places=2)
+
 
 # The old process's worst contact-edge velocity jump: chase3d tools/anim_compare.py criterion 8 on the shipped wolf
 # lope (game/assets/models/wolf.glb, its hind_R), m/s over adjacent 60 Hz keys (Task 19 round 3 baseline).
@@ -340,12 +354,19 @@ class PinReleaseTests(unittest.TestCase):
         return (p[1:n + 1] - p[:n]) / dt                     # v_k over key k -> k + 1
 
     def test_the_default_is_the_swept_setting(self):
-        self.assertEqual(motion.PIN_RELEASE, motion.PinRelease(span_keys=3.0, touchdown_orders=(2, 1),
+        self.assertEqual(motion.PIN_RELEASE, motion.PinRelease(span_stride=3.0 / 24, touchdown_orders=(2, 1),
                                                                liftoff_orders=(2, 1), inset_keys=0.5,
                                                                min_span=motion.BLEND))
-        self.assertAlmostEqual(motion.PIN_RELEASE.span(24), 3.0 / 24)
-        self.assertAlmostEqual(motion.PIN_RELEASE.span(12), 3.0 / 12)
-        self.assertAlmostEqual(motion.PIN_RELEASE.span(200), motion.BLEND)   # a slow gait: at least BLEND of a cycle
+        self.assertEqual(motion.PIN_RELEASE.span(24), 3.0 / 24)          # the round-4 3 keys at the wolf's 24
+        self.assertEqual(motion.PIN_RELEASE.span_stride, 0.125)
+        self.assertEqual(motion.PinRelease(span_stride=0.01).span(200), motion.BLEND)   # at least BLEND of a cycle
+
+    def test_the_ease_is_a_share_of_the_stride_not_a_count_of_keys(self):
+        """Vole round 5: at 11 keys per stride three key intervals were 0.27 of the stride on each side of a ~0.55
+        stance; the ease is now the same share of every stride."""
+        for n in (11, 24, 30, 48, 127):
+            self.assertEqual(motion.PIN_RELEASE.span(n), 0.125, n)
+            self.assertAlmostEqual(motion.PIN_RELEASE.span(n) * n, 3.0 * n / 24)
 
     def test_a_hard_release_breaks_the_edge_gate_and_the_default_does_not(self):
         """Round 4 ruling (the old test compared the toy with the wolf's 4.879 m/s, which no toy speed reaches, so it
@@ -362,7 +383,7 @@ class PinReleaseTests(unittest.TestCase):
         self.assertEqual(sorted(jumps), sorted(windows))
         for chain, j in jumps.items():
             self.assertLessEqual(max(j["touchdownPinnedMps"], j["liftoffPinnedMps"]), j["swingMedianMps"], chain)
-        hard = motion.PinRelease(span_keys=1.0, touchdown_orders=(0, 0), liftoff_orders=(0, 0), min_span=0.0)
+        hard = motion.PinRelease(span_stride=1.0 / n, touchdown_orders=(0, 0), liftoff_orders=(0, 0), min_span=0.0)
         _, _, hard_paws, _ = self.plan(hard, n)
         broken = motion.edge_jumps(hard_paws, release, n, dt, span=hard.span(n))
         self.assertTrue(any(max(j["touchdownPinnedMps"], j["liftoffPinnedMps"]) > j["swingMedianMps"]
@@ -401,7 +422,7 @@ class PinReleaseTests(unittest.TestCase):
         self.assertEqual(motion.release_windows({"a": (0.0, 0.25)}, 8, -0.5), {"a": (0.9375, 0.3125)})
         self.assertEqual(motion.release_windows({"a": (0.25, 0.5)}, 8), motion.release_windows({"a": (0.25, 0.5)}, 8,
                                                                                                0.5))
-        _, _, _, wide = self.plan(motion.PinRelease(span_keys=6.0))
+        _, _, _, wide = self.plan(motion.PinRelease(span_stride=6.0 / 24))
         _, _, _, deep = self.plan(motion.PinRelease(inset_keys=1.25))
         _, _, _, default = self.plan()
         for chain in wide:
@@ -416,7 +437,7 @@ class StartKeyTests(unittest.TestCase):
     spans), so the seam is not where a paw decelerates into its pin."""
 
     def test_ease_spans_are_the_approach_and_release_of_each_pin(self):
-        spans = motion.ease_spans({"a": (0.25, 0.5)}, 8, motion.PinRelease(span_keys=2.0, min_span=0.0))
+        spans = motion.ease_spans({"a": (0.25, 0.5)}, 8, motion.PinRelease(span_stride=2.0 / 8, min_span=0.0))
         np.testing.assert_allclose(spans["a"], [(0.0625, 0.3125), (0.4375, 0.6875)])
         self.assertEqual(motion.ease_spans({"a": (0.0, 1.0)}, 8), {"a": []})
 
@@ -440,3 +461,126 @@ class HeglundTaylorTests(unittest.TestCase):
     def test_preferred_gallop_stride_frequency(self):
         self.assertAlmostEqual(motion.heglund_taylor_hz(30), 2.61, places=2)
         self.assertAlmostEqual(motion.heglund_taylor_hz(50), 2.41, places=2)
+
+
+# ------------------------------------------------------------------ vole round 5: the bake scaled to the body
+def derived(name):
+    import json
+    from pathlib import Path
+    return json.loads((Path(__file__).resolve().parent / "fixtures" / "vole_scurry_derived.json").read_text())[name]
+
+
+class LegReachTests(unittest.TestCase):
+    """Vole round 5: the round-4 front-leg miss (6.2 mm against a 1.6 mm contact tolerance) was not the rig's chain
+    lengths (the vole's rest front leg reaches its toe from the withers with 14 % to spare, the wolf's with 21 %) nor
+    the toe pivot (at the missed keys the pair and foot were already straight): the IK held the scapula at the fit's
+    angle, and with the fit's body 10 mm up (its ground lift) the withers were up to 58 mm from a pin the straight leg
+    reaches at 53 mm. The scapula now swings, and past the whole leg's reach the body comes down."""
+
+    def setUp(self):
+        self.block = derived("voleR3Cycle")
+        self.rig = motion.PlanarRig(self.block["rig"])
+        self.project = self.block["project"]
+        self.names = self.block["names"]
+
+    def test_the_front_legs_hang_from_a_girdle_and_the_hinds_do_not(self):
+        for chain, bones in self.project["chains"].items():
+            if chain not in self.project["paws"]:
+                continue
+            (upper, _), _ = motion.ik_bones(bones)
+            want = bones[0] if chain.startswith("front") else None
+            self.assertEqual(motion.girdle_bone(self.rig, bones, upper), want, chain)
+
+    def test_the_rest_leg_reaches_its_own_paw(self):
+        rest = np.zeros((1, len(self.names)))
+        for chain in self.project["paws"]:
+            bones = self.project["chains"][chain]
+            hinge, length = motion.leg_reach(self.rig, bones, self.project["paws"][chain])
+            posed = self.rig.pose(rest, self.names)
+            gap = np.linalg.norm(self.rig.point(posed, self.project["paws"][chain]) - self.rig.point(posed, hinge, "head"))
+            self.assertLess(gap, 0.9 * length, chain)
+
+    def pose_and_target(self, reach_share):
+        """The rest pose with the front_L pin straight below the withers at `reach_share` of the whole leg's reach."""
+        values = np.zeros((1, len(self.names)))
+        bones = self.project["chains"]["front_L"]
+        hinge, length = motion.leg_reach(self.rig, bones, "paw_front_L")
+        posed = self.rig.pose(values, self.names)
+        top = self.rig.point(posed, hinge, "head")[0]
+        way = np.array([-0.25, -1.0]) / np.hypot(0.25, 1.0)            # down and back, away from the scapula's line
+        return values, bones, top + reach_share * length * way
+
+    def test_the_scapula_swings_to_reach_a_pin_the_pair_cannot(self):
+        values, bones, target = self.pose_and_target(0.98)
+        (upper, lower), foot = motion.ik_bones(bones)
+        posed = self.rig.pose(values, self.names)
+        pair = (np.linalg.norm(self.rig.head[lower] - self.rig.head[upper])
+                + np.linalg.norm(self.rig.head[foot[0]] - self.rig.head[lower])
+                + np.linalg.norm(self.rig.tail["paw_front_L"] - self.rig.head[foot[0]]))
+        self.assertGreater(np.linalg.norm(target - self.rig.point(posed, upper, "head")[0]), pair)
+        solved, reached = motion.solve_leg(self.rig, values, self.names, bones, "paw_front_L", target[None])
+        self.assertLess(float(np.linalg.norm(reached[0] - target)), 1e-6)
+        self.assertNotEqual(solved[0, self.names.index("scapula_L")], 0.0)
+        np.testing.assert_allclose(self.rig.paws(solved, self.names, self.project)["front_L"][0], target, atol=1e-6)
+
+    def test_a_reachable_pin_leaves_the_scapula_alone(self):
+        values, bones, target = self.pose_and_target(0.6)
+        solved, reached = motion.solve_leg(self.rig, values, self.names, bones, "paw_front_L", target[None])
+        self.assertEqual(solved[0, self.names.index("scapula_L")], 0.0)
+        self.assertLess(float(np.linalg.norm(reached[0] - target)), 1e-6)
+
+    def test_reach_drop_lowers_the_body_only_where_a_pin_is_out_of_reach(self):
+        n = 24
+        keys = np.zeros((n, len(self.names)))
+        values, bones, near = self.pose_and_target(0.6)
+        _, _, far = self.pose_and_target(1.1)
+        target = np.repeat(near[None], n, axis=0)
+        target[10] = far
+        live = np.zeros(n, bool)
+        live[8:13] = True
+        plan = {"front_L": (target, live, np.zeros(n, bool), None)}
+        drop = motion.reach_drop(self.rig, keys, self.names, self.project, plan, 0.125)
+        self.assertTrue(np.all(drop >= 0))
+        self.assertGreater(drop[10], 0.0)
+        lowered = keys.copy()
+        lowered[:, self.names.index("dz")] -= drop
+        hinge, length = motion.leg_reach(self.rig, bones, "paw_front_L")
+        top = self.rig.point(self.rig.pose(lowered, self.names), hinge, "head")
+        self.assertLessEqual(float(np.linalg.norm(target[10] - top[10])), length * (1 - motion.REACH_MARGIN) + 1e-9)
+        self.assertEqual(float(drop[0]), 0.0)                      # far from the out-of-reach key: untouched
+        self.assertTrue(np.all(np.diff(drop[:11]) >= -1e-12))       # it eases in
+        plan = {"front_L": (np.repeat(near[None], n, axis=0), live, np.zeros(n, bool), None)}
+        self.assertFalse(motion.reach_drop(self.rig, keys, self.names, self.project, plan, 0.125).any())
+
+
+class VoleKeysTests(unittest.TestCase):
+    """Vole round 5 on the derived vole cycle: the planned keys keep every eased paw on or above its ground and the
+    IK reaches every pin; the wolf lope's plan needs neither the girdle swing nor the drop."""
+
+    def plan(self, name, n=24):
+        from anim import facts
+        from tests.test_facts import cycle_contacts
+        block = derived(name)
+        tol = facts.tolerances(block["rig"], block["project"])
+        contacts = cycle_contacts(block, tol=tol)
+        windows = {c: facts.snapped(m, n) for c, m in contacts["masks"].items() if m.any()}
+        period_s = block["periodFrames"] / block["fps"]
+        return motion.plan_keys(contacts["planar"], contacts["smooth"], block["names"], block["project"], windows,
+                                contacts["speed"] * period_s, block["rest"], -contacts["groundHeight"], n), block
+
+    def test_the_vole_reaches_every_pin_and_no_eased_paw_goes_underground(self):
+        (keys, paws, report), block = self.plan("voleR3Cycle")
+        for chain, entry in report.items():
+            self.assertLess(entry["maxResidualM"], 1e-4, (chain, entry))
+            self.assertGreater(entry["bodyDropMaxM"], 0.0)
+            self.assertLess(entry["bodyDropMaxM"], 0.012)
+            self.assertGreaterEqual(float(np.min(paws[chain][:, 1])), entry["pinZ"] - 1e-4, chain)
+        self.assertIn("girdleSwingMaxDeg", report["front_L"])
+        self.assertNotIn("girdleSwingMaxDeg", report["hind_L"])
+
+    def test_the_wolf_needs_no_swing_and_no_drop(self):
+        (keys, paws, report), _ = self.plan("wolfLopeCycle")
+        for chain, entry in report.items():
+            self.assertNotIn("girdleSwingMaxDeg", entry, chain)
+            self.assertNotIn("bodyDropMaxM", entry, chain)
+            self.assertEqual(entry["maxResidualM"], 0.0)

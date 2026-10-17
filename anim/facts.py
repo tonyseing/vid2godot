@@ -1098,6 +1098,8 @@ def loop_rest(found, period, doubled, identity, poses, project, every, paws, cha
         cycle_out = {"frames": keys, "fps": n_keys / duration, "periodFrames": period, "start": start,
                      "startKey": bake["startKey"], "startPhase": shift, "originStart": contacts["start"],
                      "drift": {"dx": 0.0, "dz": 0.0}, "videoDrift": drift, "keyRate": motion.KEY_RATE,
+                     "keysPerStride": n_keys, "minKeysPerStride": motion.MIN_KEYS_PER_STRIDE,
+                     "playedKeyRateHz": round(motion.key_rate(n_keys, duration), 6),
                      "retime": factor, "groundLift": round(-contacts["groundHeight"], 6), "paws": bake["paws"]}
     entry = {"duration_s": duration, "loop": True,
              "authored_speed_mps": None if speed is None else round(speed * factor, 3),
@@ -1213,6 +1215,12 @@ def rig_contacts(avg, n, drift, names, project, rig, rest, chains, origin, fps, 
             "reading": chosen["report"], "tol": tol}
 
 
+def ik_reach_tolerance(tol):
+    """How near a pinned paw the leg IK must bring it (vole round 5): the body's contact tolerance (round 4's
+    CONTACT_TOLERANCE scaled with leg length; exactly CONTACT_TOLERANCE at the wolf)."""
+    return float(tol.contact)
+
+
 def widened(window, n_keys):
     """A pinned window's declared contact: half a key interval wider at each end. Between the last key in the air
     and the first pinned key the paw comes down somewhere; the midpoint is the estimate (likewise at liftoff)."""
@@ -1294,6 +1302,8 @@ def rig_keys(contacts, n_keys, names, project, rig, rest, period_s, factor):
                             "touchdown_orders": list(motion.PIN_RELEASE.touchdown_orders),
                             "liftoff_orders": list(motion.PIN_RELEASE.liftoff_orders),
                             "spanKeys": round(motion.PIN_RELEASE.span(n_keys) * n_keys, 3)},
+             "redetectionTolerance": {"contactToleranceM": round(tol.contact, 6), "stillShareOfSpeed": SLIP_SHARE,
+                                      "scale": round(tol.scale, 6)},
              "edgeJumpRule": "an edge's velocity change at most the paw's swing median per-key change (x and z at "
                              "the 60 Hz keys; in place = world for a constant body speed): touchdownMps and "
                              "liftoffMps across the whole approach and release span (round 4), touchdownPinnedMps and "
@@ -1321,6 +1331,18 @@ def rig_keys(contacts, n_keys, names, project, rig, rest, period_s, factor):
                                      f"median of {j['swingMedianMps']:.2f} m/s per key" for b, j in jumpy.items())
                          + f" (leg IK: {ik}). The pins do not ease in and out; check the leg chains and the IK "
                            f"residuals")
+    # Vole round 5: the IK reaches every pin within the body's contact tolerance (scaled with leg length as the
+    # round-4 contact tolerances are; the wolf's 25 mm, the vole's 1.6 mm).
+    reach_tol = ik_reach_tolerance(tol)
+    worst = {project["paws"][c]: r["maxResidualM"] for c, r in ik.items()}
+    check["ikReach"] = {"toleranceM": round(reach_tol, 6), "maxResidualM": worst,
+                        "pass": all(v <= reach_tol for v in worst.values())}
+    if not check["ikReach"]["pass"]:
+        raise FactsError("The leg IK cannot reach a pin within the body's contact tolerance "
+                         f"({reach_tol * 1000:.2f} mm): " + ", ".join(f"{b} misses by {v * 1000:.2f} mm"
+                                                                      for b, v in worst.items() if v > reach_tol)
+                         + f" (leg IK: {ik}). The pinned paw lies beyond the whole leg's straight reach even with "
+                           f"the girdle swung and the body lowered; check the rig's leg chains and the fit's trunk")
     low = {b: a for b, a in agreement.items() if a < CONTACT_AGREEMENT}
     if low:
         raise FactsError(f"The declared contacts and a re-detection from the baked keys disagree: they agree on "
