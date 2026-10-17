@@ -34,7 +34,11 @@ under MIN_STRIDE_FRAMES video frames is refused: the video undersamples the step
 Round 4 (the field vole): the metre tolerances are the wolf's and scale with the rig's leg length (`tolerances`,
 recorded as `bodyScale`); stillness is read from the smooth cycle capped at VELOCITY_ORDER harmonics; the ground
 speed comes from stances only; and a stance the strict reading breaks into touchdowns that all lie inside the paw's
-backward slide is read as that slide (`read_cycle`, recorded as `contactReading`)."""
+backward slide is read as that slide (`read_cycle`, recorded as `contactReading`).
+
+Vole round 6: the keys are held to the bar as played (motion.for_keys, `smooth.played`), cleared of the ground
+(`penetration`), settled at a paw's contact edges under SETTLE_BELOW agreement, and the loop starts where its seam
+has no velocity jump (`contactCheck.loopSeam`)."""
 import re
 from typing import NamedTuple, Optional
 
@@ -69,6 +73,7 @@ STANCE_TOLERANCE = 0.06
 BRIDGE_PHASE = 0.05
 DENSE = 240                  # samples per cycle the rig's motion is read at
 CONTACT_AGREEMENT = 0.95     # declared contacts vs a re-detection from the baked keys, per paw
+SETTLE_BELOW = CONTACT_AGREEMENT + 0.02   # vole round 6: a paw under this agreement has its contact edges settled
 # Round 4 ruling: the edge gate (an edge's velocity change at most the paw's swing median per-key change) measured
 # across each pin's whole approach and release span, where the bar's harness finds the kink (motion.edge_jumps).
 # Measured, recorded and warned on every clip; it refuses only while EDGE_GATE_SPAN is True. It is False pending the
@@ -1090,7 +1095,9 @@ def loop_rest(found, period, doubled, identity, poses, project, every, paws, cha
     else:
         n_keys = motion.key_count(duration)
         keys, declared, bake = rig_keys(contacts, n_keys, names, project, rig, rest, period / fps, factor)
-        extra.update({"smooth": contacts["smoothReport"], "contactCheck": bake["check"], "ik": bake["ik"]})
+        extra.update({"smooth": {**contacts["smoothReport"], "seriesWorldPitchKept": contacts["smoothReport"][
+                          "worldPitchKept"], "worldPitchKept": bake["worldPitchKept"], "played": bake["played"]},
+                      "contactCheck": bake["check"], "ik": bake["ik"]})
         warnings += bake["warnings"]
         # Round 4: the clip starts startKey keys after the phase origin's touchdown.
         shift = bake["startKey"] / n_keys
@@ -1168,6 +1175,12 @@ def rig_contacts(avg, n, drift, names, project, rig, rest, chains, origin, fps, 
     table[:, 0] -= drift["dx"] * k
     table[:, 1] -= drift["dz"] * k
     smooth = motion.SmoothCycle(table, names, project)
+    # Vole round 6: the cycle with its closing sample (one cycle averaged need not end where it starts): the range
+    # the played keys are held to (motion.for_keys), as the bar's reference reads the video fit's.
+    closed = np.array(avg[:n + 1, :width], float) if len(avg) > n else table
+    k_closed = np.arange(len(closed)) / n
+    closed[:, 0] -= drift["dx"] * k_closed
+    closed[:, 1] -= drift["dz"] * k_closed
     planar = motion.PlanarRig(rig)
     grid = np.arange(DENSE) / DENSE
     gap = max(1, int(round(BRIDGE_PHASE * DENSE)))
@@ -1198,11 +1211,8 @@ def rig_contacts(avg, n, drift, names, project, rig, rest, chains, origin, fps, 
     trunk = [b for chain, bones in project["chains"].items() if chain not in cycle.leg_chains(project)
              for b in bones if b in names]
     pitch = motion.world_pitch_kept(planar, table, smooth, names, trunk)
-    short = {b: v for b, v in pitch.items() if v < motion.RANGE_KEEP}
-    warnings = [f"The smooth cycle keeps under {motion.RANGE_KEEP} of the video's world pitch range on "
-                f"{', '.join(f'{b} {v:.3f}' for b, v in short.items())} (each joint's own range is kept; a warning, "
-                f"not a refusal)"] if short else []
-    warnings += reading_warning(chosen["report"])
+    # Vole round 6: the world pitch warning is the baked keys' (rig_keys, after motion.for_keys), not this series'.
+    warnings = reading_warning(chosen["report"])
     report = {"orders": smooth.orders, "keptRange": smooth.kept_range(), "keep": motion.RANGE_KEEP,
               "worldPitchKept": pitch, "dominantHarmonic": {k: v for k, v in smooth.dominant.items() if v != 1},
               "overtoneTaper": {k: v for k, v in smooth.taper.items() if v != 1.0},
@@ -1212,7 +1222,21 @@ def rig_contacts(avg, n, drift, names, project, rig, rest, chains, origin, fps, 
             "smoothReport": report, "start": float(kept[0] + touchdown * period), "groundHeight": ground,
             "ground": ground_block(ground, "smooth cycle (forward kinematics of the rig), all paws", tol),
             "paws": paw_report(heights, masks, ground, project, rest), "planar": planar, "warnings": warnings,
-            "reading": chosen["report"], "tol": tol}
+            "reading": chosen["report"], "tol": tol, "table": table, "closed": closed, "trunk": trunk}
+
+
+def pitch_warning(pitch):
+    """The warning for trunk and tail bones whose world pitch range is kept under motion.RANGE_KEEP (ruling 7)."""
+    short = {b: v for b, v in pitch.items() if v < motion.RANGE_KEEP}
+    return [f"The smooth cycle keeps under {motion.RANGE_KEEP} of the video's world pitch range on "
+            f"{', '.join(f'{b} {v:.3f}' for b, v in short.items())} (each joint's own range is kept; a warning, "
+            f"not a refusal)"] if short else []
+
+
+def penetration(tol):
+    """How far under its ground a played paw may go (vole round 6): motion.PENETRATION_M (the bar's 5 mm at the
+    wolf) scaled with the body's leg length, as the round-4 contact tolerances are (the vole's 0.32 mm)."""
+    return float(motion.PENETRATION_M * tol.scale)
 
 
 def ik_reach_tolerance(tol):
@@ -1257,24 +1281,10 @@ def in_window(phases, window):
     return (phases >= on) & (phases < off) if off > on else (phases >= on) | (phases < off)
 
 
-def rig_keys(contacts, n_keys, names, project, rig, rest, period_s, factor):
-    """The bake's keys from the smooth cycle: every planted paw pinned (motion.plan_keys) over its detection on the
-    key grid, the declared contacts half a key wider at each end (`widened`), and the check: the keys played as the clip plays them (linear between
-    keys), their paws detected again with the same rule (near the ground within CONTACT_TOLERANCE and world-still;
-    no stance tolerance, which allows for the fit's height error), against the declared contacts. Refuses under
-    CONTACT_AGREEMENT for any paw. Returns (keys, declared windows, {"check", "ik", "paws"})."""
-    planar, speed, tol = contacts["planar"], contacts["speed"], contacts["tol"]
-    pinned = {c: snapped(m, n_keys) for c, m in contacts["masks"].items() if m.any()}
-    # Round 4: the loop starts at the key with the most room outside every pin's approach and release.
-    key0, start = motion.start_key(pinned, n_keys)
-    smooth = contacts["smooth"]
-    if key0:
-        pinned = {c: rolled(w, key0, n_keys) for c, w in pinned.items()}
-        smooth = smooth.roll(key0 / n_keys)
-    declared = {c: widened(w, n_keys) for c, w in pinned.items()}
-    lift = -contacts["groundHeight"]
-    stride = (speed or 0.0) * period_s
-    keys, paws, ik = motion.plan_keys(planar, smooth, names, project, pinned, stride, rest, lift, n_keys)
+def redetect(keys, planar, names, project, rest, declared, speed, tol, period_s):
+    """The keys played as the clip plays them (linear between keys), their paws detected again with the same rule
+    (near the ground within the body's contact tolerance and world-still; no stance tolerance) and compared with the
+    declared contacts. Returns (agreement per paw bone, heights, vx, phases, detected masks)."""
     played, phases = motion.played(keys)
     dt = period_s / len(played)
     heights, vx = {}, {}
@@ -1285,19 +1295,84 @@ def rig_keys(contacts, n_keys, names, project, rig, rest, period_s, factor):
     # ground. Round 4: the body's contact tolerance.
     again = stance_masks(heights, vx, 0.0, speed, circular=True, gap=max(1, int(round(BRIDGE_PHASE * len(played)))),
                          extent=tol.contact, tol=tol)
+    agreement = {}
+    for chain in heights:
+        want = in_window(phases, declared[chain]) if chain in declared else np.zeros(len(phases), bool)
+        agreement[project["paws"][chain]] = round(float(np.mean(want == again[chain])), 4)
+    return agreement, heights, vx, phases, again
+
+
+def rig_keys(contacts, n_keys, names, project, rig, rest, period_s, factor, start=None):
+    """The bake's keys from the smooth cycle: every planted paw pinned (motion.plan_keys) over its detection on the
+    key grid, the declared contacts half a key wider at each end (`widened`), and the check: the keys played as the clip plays them (linear between
+    keys), their paws detected again with the same rule (near the ground within CONTACT_TOLERANCE and world-still;
+    no stance tolerance, which allows for the fit's height error), against the declared contacts. Refuses under
+    CONTACT_AGREEMENT for any paw. Returns (keys, declared windows, {"check", "ik", "paws"})."""
+    planar, speed, tol = contacts["planar"], contacts["speed"], contacts["tol"]
+    pinned = {c: snapped(m, n_keys) for c, m in contacts["masks"].items() if m.any()}
+    # Round 4: the loop starts at the key with the most room outside every pin's approach and release.
+    key0, start_info = motion.start_key(pinned, n_keys, force=start)
+    smooth = contacts["smooth"]
+    if key0:
+        pinned = {c: rolled(w, key0, n_keys) for c, w in pinned.items()}
+        smooth = smooth.roll(key0 / n_keys)
+    declared = {c: widened(w, n_keys) for c, w in pinned.items()}
+    # Vole round 6: the trunk, neck and tail columns as the keys play them (motion.for_keys): within the bar's 60 Hz
+    # jerk and keeping their range and world pitch range at the keys. The wolf lope's columns are unchanged.
+    table, trunk = contacts.get("table"), contacts.get("trunk", [])
+    smooth, played_report = motion.for_keys(smooth, n_keys, period_s / factor, motion.leg_bones(project), planar,
+                                            contacts.get("closed", table), trunk)
+    pitch = motion.world_pitch_kept(planar, table, smooth, names, trunk) if table is not None else {}
+    lift = -contacts["groundHeight"]
+    stride = (speed or 0.0) * period_s
+    keys, paws, ik = motion.plan_keys(planar, smooth, names, project, pinned, stride, rest, lift, n_keys,
+                                      clearance=penetration(tol))
+    agreement, heights, vx, phases, again = redetect(keys, planar, names, project, rest, declared, speed, tol,
+                                                     period_s)
+    releases = motion.release_windows(pinned, n_keys, motion.PIN_RELEASE.inset_keys)
+    low = [c for c in heights if c in declared and agreement[project["paws"][c]] < SETTLE_BELOW]
+    if low:
+        # Vole round 6: a paw whose keys fail the agreement gate or pass it by under SETTLE_BELOW has the keys at its
+        # declared contact's edges settled onto its pin (motion.settle_edges), the ground cleared again, and is
+        # detected again (never the wolf lope's: 0.974 at least).
+        open_keys = np.asarray(keys, float)[:n_keys]
+        for chain in low:
+            open_keys, settled = motion.settle_edges(planar, open_keys, names, project, chain, releases[chain],
+                                                     declared[chain], n_keys, 2 * tol.contact)
+            if settled:
+                ik.setdefault(chain, {})["settledKeys"] = settled
+        grounds = {c: float(rest[c]) for c in releases}
+        open_keys, _ = motion.clear_ground(planar, open_keys, names, project, grounds, penetration(tol))
+        keys = np.vstack([open_keys, open_keys[:1]])
+        paws = planar.paws(keys, names, project)
+        agreement, heights, vx, phases, again = redetect(keys, planar, names, project, rest, declared, speed, tol,
+                                                         period_s)
+    # Vole round 6: the loop seam joins with no velocity jump over the cycle's median per-key change, per paw and
+    # trunk, neck and tail column (motion.seam_jumps); else the loop starts at the nearest key, with the most room
+    # outside the pins' eases, where it does (the same motion rolled; the wolf lope's seam passes where it is).
+    seam = motion.seam_jumps(keys, planar, names, project, motion.seam_columns(names, project))
+    seam_pass = max(seam.values(), default=0.0) <= 1.0
+    if not seam_pass and start is None:
+        spans = motion.ease_spans(pinned, n_keys)
+        room = [motion.ease_clearance(k / n_keys, spans) for k in range(n_keys)]
+        shift = motion.seam_shift(keys, planar, names, project, room)
+        if shift:
+            out = rig_keys(contacts, n_keys, names, project, rig, rest, period_s, factor,
+                           start=(key0 + shift) % n_keys)
+            out[2]["check"]["loopSeam"]["movedFrom"] = {"key": key0, "worstRatio": round(max(seam.values()), 4)}
+            return out
     jumps = motion.edge_jumps(paws, motion.release_windows(pinned, n_keys, motion.PIN_RELEASE.inset_keys), n_keys,
                               period_s / factor / n_keys, span=motion.PIN_RELEASE.span(n_keys))
     edge_jumps = {project["paws"][c]: j for c, j in jumps.items()}
-    agreement, still = {}, {}
+    still = {}
     for chain in heights:
         bone = project["paws"][chain]
         want = in_window(phases, declared[chain]) if chain in declared else np.zeros(len(phases), bool)
-        agreement[bone] = round(float(np.mean(want == again[chain])), 4)
         if want.any() and speed:
             world = np.abs(vx[chain] + speed) * factor
             still[bone] = round(float(np.mean(world[want] < tol.still_speed)), 4)
     check = {"agreement": agreement, "gate": CONTACT_AGREEMENT, "plantedStillShare": still,
-             "stillSpeedMps": round(tol.still_speed, 6), "samples": len(played), "keys": n_keys, "edgeJumps": edge_jumps,
+             "stillSpeedMps": round(tol.still_speed, 6), "samples": len(phases), "keys": n_keys, "edgeJumps": edge_jumps,
              "pinRelease": {**motion.PIN_RELEASE._asdict(),
                             "touchdown_orders": list(motion.PIN_RELEASE.touchdown_orders),
                             "liftoff_orders": list(motion.PIN_RELEASE.liftoff_orders),
@@ -1312,11 +1387,17 @@ def rig_keys(contacts, n_keys, names, project, rig, rest, period_s, factor):
     pinned_over = {b: j for b, j in edge_jumps.items()
                    if max(j["touchdownPinnedMps"], j["liftoffPinnedMps"]) > j["swingMedianMps"]}
     check["edgeSpanGate"] = {"pass": not span_over, "enforced": EDGE_GATE_SPAN, "over": sorted(span_over)}
-    check["cycleStart"] = {**start, "phase": key0 / n_keys, "originStart": contacts["start"],
+    check["loopSeam"] = {"pass": seam_pass, "worstRatio": round(max(seam.values(), default=0.0), 4),
+                         "ratios": seam, "rule": "per paw and trunk, neck and tail column, the velocity jump across "
+                                                 "the seam over the cycle's median per-key change, at most 1"}
+    check["cycleStart"] = {**start_info, "phase": key0 / n_keys, "originStart": contacts["start"],
                            "origin": contacts["origin"],
                            "rule": "the key with the most room outside every paw's pin approach and release span "
                                    "(motion.start_key); footfall phases stay the phase origin's"}
-    warnings = []
+    warnings = pitch_warning(pitch)
+    if not seam_pass:
+        warnings.append("The loop seam's velocity jumps over the cycle's median per-key change at every start key: "
+                        + ", ".join(f"{k} {v:.2f}" for k, v in seam.items() if v > 1.0) + " (a warning)")
     if span_over and not EDGE_GATE_SPAN:
         warnings.append("Across the pins' approach and release spans the paw velocity changes more than the swing's "
                         "median per-key change (round 4 edge gate, measured, not enforced): " + "; ".join(
@@ -1350,6 +1431,7 @@ def rig_keys(contacts, n_keys, names, project, rig, rest, period_s, factor):
                          f"{CONTACT_AGREEMENT} (leg IK: {ik}). The keys do not plant those paws where facts "
                          f"declared them; check the leg chains, the fit's paws and the IK residuals")
     return keys.tolist(), declared, {"check": check, "ik": ik, "startKey": key0, "warnings": warnings,
+                                     "played": played_report, "worldPitchKept": pitch,
                                      "paws": {project["paws"][c]: np.round(p, 6).tolist() for c, p in paws.items()}}
 
 

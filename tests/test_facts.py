@@ -1536,3 +1536,126 @@ class BakeScaleTests(unittest.TestCase):
             with self.assertRaisesRegex(facts.FactsError, "cannot reach a pin within the body's contact tolerance"):
                 facts.rig_keys(contacts, 24, block["names"], block["project"], block["rig"], block["rest"],
                                period_s, VOLE_RETIME)
+
+
+# ------------------------------------------------------------ vole round 6: the cycle as the clip plays it (vole)
+TRUNK_SAG = ["spine_01", "spine_02", "chest", "neck_01", "neck_02", "head",
+             "tail_01", "tail_02", "tail_03", "tail_04", "tail_05", "tail_06"]   # the bar's criterion-4 joints
+
+
+def harness_jerk(column, duration_s, dense=600, rate=60.0):
+    """chase3d tools/anim_compare.py's criterion 4 for one hinge column of closed keys, written out again here (not
+    motion.played_jerk): the keys linear at 600 samples, three cyclic differences over the 1/60 s sample step, the
+    largest jerk over a sine's of the same range (every 5th sample's peak-to-peak) at the stride rate."""
+    keys = np.asarray(column, float)
+    n = len(keys) - 1
+    t = np.arange(dense) / dense * n
+    lo = np.floor(t).astype(int)
+    x = (1 - (t - lo)) * keys[lo] + (t - lo) * keys[lo + 1]
+    dt = duration_s / dense
+    step = max(1, round((1 / rate) / dt))
+    h = step * dt
+    rom = float(np.ptp(x[::max(1, dense // 120)]))
+    v = (np.roll(x, -step) - x) / h
+    a = (np.roll(v, -step) - v) / h
+    j = (np.roll(a, -step) - a) / h
+    return float(np.abs(j).max() / max(1e-9, rom / 2 * (2 * math.pi / duration_s) ** 3)), rom
+
+
+class PlayedCycleTests(unittest.TestCase):
+    """Vole round 6 (chase3d 16631701's harness on the round-5 vole): the bar measures the played clip at 60 Hz
+    against a sine at the stride rate, and the round-5 smoothing bounded each trunk column's jerk at 3 d^3 for its
+    dominant harmonic d of the series: tail_03 21.55, tail_04 16.25, tail_05 11.62, neck_02 9.24 against 3; tail_02's
+    keys missed its peak (0.917 of the reference range); spine_01 kept 0.689 of its world pitch range; front_L's
+    elbow flipped between keys and the played paw dipped 6.9 mm into the ground; and the loop started mid-swing of
+    front_L, its velocity jump at the seam the cycle's largest. The wolf lope keys exactly as before."""
+
+    @classmethod
+    def setUpClass(cls):
+        cls.vole = derived("voleR3Cycle"), derived_keys("voleR3Cycle", VOLE_RETIME)
+        cls.wolf = derived("wolfLopeCycle"), derived_keys("wolfLopeCycle", WOLF_RETIME)
+
+    @staticmethod
+    def duration(block, retime):
+        return block["periodFrames"] / block["fps"] / retime
+
+    def test_the_vole_trunk_neck_and_tail_are_within_the_bars_jerk_at_60_hz(self):
+        block, (n, keys, *_rest) = self.vole
+        keys = np.asarray(keys, float)
+        for bone in TRUNK_SAG:
+            jerk, _ = harness_jerk(keys[:, block["names"].index(bone)], self.duration(block, VOLE_RETIME))
+            self.assertLessEqual(jerk, motion.JERK_MAX, bone)
+
+    def test_the_vole_trunk_neck_and_tail_keep_their_range_at_the_keys(self):
+        block, (n, keys, *_rest) = self.vole
+        keys, samples = np.asarray(keys, float), np.asarray(block["samples"], float)
+        for bone in TRUNK_SAG:
+            i = block["names"].index(bone)
+            _, rom = harness_jerk(keys[:, i], self.duration(block, VOLE_RETIME))
+            self.assertGreaterEqual(rom, motion.RANGE_KEEP * float(np.ptp(np.unwrap(samples[:, i]))), bone)
+
+    def test_the_vole_keeps_its_world_pitch_range_and_warns_of_none(self):
+        block, (n, keys, declared, bake, *_rest) = self.vole
+        self.assertTrue(all(v >= motion.RANGE_KEEP for v in bake["worldPitchKept"].values()), bake["worldPitchKept"])
+        self.assertGreaterEqual(bake["worldPitchKept"]["spine_01"], motion.RANGE_KEEP)
+        self.assertFalse(any("world pitch" in w for w in bake["warnings"]), bake["warnings"])
+        self.assertIn("spine_02", bake["played"]["columns"])
+
+    def played_heights(self, entry):
+        block, (n, keys, declared, bake, digest, tol) = entry
+        rig = motion.PlanarRig(block["rig"])
+        values, _ = motion.played(np.asarray(keys, float), 25)
+        return {c: p[:, 1] - float(block["rest"][c])
+                for c, p in rig.paws(values, block["names"], block["project"]).items()}, tol
+
+    def test_no_vole_paw_goes_under_its_ground_anywhere_in_the_played_cycle(self):
+        heights, tol = self.played_heights(self.vole)
+        self.assertAlmostEqual(facts.penetration(tol), 0.005 * tol.scale)
+        for chain, h in heights.items():
+            self.assertGreaterEqual(float(h.min()), -facts.penetration(tol), chain)
+
+    def test_the_wolf_paws_stay_within_its_tolerance_as_before(self):
+        heights, tol = self.played_heights(self.wolf)
+        self.assertEqual(facts.penetration(tol), motion.PENETRATION_M)
+        for chain, h in heights.items():
+            self.assertGreaterEqual(float(h.min()), -facts.penetration(tol), chain)
+
+    def seam(self, entry):
+        """Per paw and trunk column, the seam's velocity jump over the cycle's median per-key change (written out)."""
+        block, (n, keys, declared, bake, digest, tol) = entry
+        keys = np.asarray(keys, float)
+        np.testing.assert_array_equal(keys[0], keys[-1])
+        rig = motion.PlanarRig(block["rig"])
+        series = dict(rig.paws(keys, block["names"], block["project"]))
+        series.update({b: keys[:, [block["names"].index(b)]] for b in ["pelvis"] + TRUNK_SAG})
+        out = {}
+        for name, x in series.items():
+            v = x[1:] - x[:-1]
+            out[name] = float(np.linalg.norm(v[0] - v[-1]) / np.median(np.linalg.norm(v, axis=1)))
+        return out, bake
+
+    def test_the_vole_loop_seam_has_no_velocity_jump(self):
+        ratios, bake = self.seam(self.vole)
+        self.assertLessEqual(max(ratios.values()), 1.0, ratios)
+        self.assertTrue(bake["check"]["loopSeam"]["pass"])
+        self.assertEqual(bake["check"]["loopSeam"]["movedFrom"]["key"], 7)        # round 5's mid-swing start
+        self.assertGreater(bake["check"]["loopSeam"]["movedFrom"]["worstRatio"], 6.0)
+
+    def test_the_wolf_loop_seam_passes_where_it_was(self):
+        ratios, bake = self.seam(self.wolf)
+        self.assertLessEqual(max(ratios.values()), 1.0, ratios)
+        self.assertNotIn("movedFrom", bake["check"]["loopSeam"])
+        self.assertEqual(bake["startKey"], 5)
+
+    def test_the_vole_contacts_agree_with_room(self):
+        block, (n, keys, declared, bake, *_rest) = self.vole
+        self.assertGreaterEqual(min(bake["check"]["agreement"].values()), facts.SETTLE_BELOW, bake["check"])
+
+    def test_the_wolf_needs_none_of_it(self):
+        block, (n, keys, declared, bake, digest, tol) = self.wolf
+        self.assertEqual(digest, (WOLF_KEYS_SHA256, WOLF_PAWS_SHA256))
+        self.assertEqual(bake["played"]["columns"], {})
+        self.assertEqual(bake["played"]["worldPitch"], {})
+        for entry in bake["ik"].values():
+            self.assertNotIn("clearanceLiftMaxM", entry)
+            self.assertNotIn("settledKeys", entry)

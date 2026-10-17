@@ -31,6 +31,13 @@ paw never goes below the ground it is pinned to, and where a pin lies beyond the
 front leg's girdle (scapula) swings about its head (`solve_leg`) and, past the whole straight leg's reach, the body
 comes down by the least smooth amount that reaches (`reach_drop`). None of it changes the wolf lope's keys.
 
+Vole round 6: the trunk, neck and tail are held to the bar as the keys play them (`for_keys`: no harmonic above the
+keys', the 60 Hz played jerk under JERK_MAX, the range and a changed column's world pitch range kept at the keys);
+the knee bends to the rig's rest side (`solve_leg`); no played paw goes under its ground by more than PENETRATION_M
+scaled to the body (`clear_ground`), a paw near its agreement gate is settled at its contact edges
+(`settle_edges`), and the loop starts where the seam has no velocity jump (`seam_jumps`, `seam_shift`). Still
+none of it changes the wolf lope's keys.
+
 numpy only."""
 from typing import NamedTuple
 
@@ -81,6 +88,16 @@ PIN_RELEASE = PinRelease()
 REACH_MARGIN = 0.02        # a pinned paw lies within (1 - this) of its leg's whole straight reach (reach_drop)
 REACH_OVERSAMPLE = 16    # samples per key interval the body drop is smoothed at
 SUBSAMPLES = 8           # re-detection samples per key interval (the keys are interpolated linearly, as played)
+PLAYBACK_HZ = 60.0       # vole round 6: the bar's criterion 4 differentiates the played clip at the game's 60 Hz
+PLAYED_DENSE = 600       # ... over this many samples of the played cycle (chase3d tools/anim_compare.py SAMPLES)
+JERK_TARGET = 0.95       # a column the played-jerk limit low-passes ends under this share of JERK_MAX (float32 keys)
+LOWPASS_STEP = 0.97      # the low-pass width shrinks by this factor per step until the played jerk is within the bar
+PITCH_GAIN_STEP = 0.01   # a trunk bone's column is scaled up in these steps until its world pitch range is kept ...
+PITCH_GAIN_MAX = 3.0     # ... at most this far
+PENETRATION_M = 0.005    # vole round 6: at the wolf a played paw is at most this far under its ground (bar criterion
+#                          6's 5 mm), scaled with the body's leg length (facts' Tolerances.scale; the vole's 0.32 mm)
+CLEARANCE_SUBSAMPLES = 25   # samples per key interval the played paws are checked at (600 per 24-key cycle)
+CLEARANCE_ROUNDS = 8     # lift-and-solve passes at most
 
 
 def rotate(phi, points):
@@ -289,6 +306,163 @@ class SmoothCycle:
         return {n: (round(float(np.ptp(values[:, i]) / self.ranges[n]), 4) if self.ranges[n] > 1e-12 else 1.0)
                 for i, n in enumerate(self.names)}
 
+    def effective(self, name):
+        """The column's series as plain coefficients (gain, taper and the truncation folded in): evaluate(out,
+        phases, self.orders[name]) is at(phases)'s column."""
+        i = self.names.index(name)
+        coeffs = np.array(self.coeffs[i], complex, copy=True)
+        order, keep = self.orders[name], self.dominant[name]
+        k = np.arange(len(coeffs))
+        weight = np.where(k <= keep, self.gain[name], self.gain[name] * self.taper[name])
+        weight[0] = 1.0
+        weight[k > order] = 0.0
+        return coeffs * weight
+
+    def with_columns(self, columns):
+        """A copy with `columns` ({name: (coefficients, order)}, plain: no gain or taper) replaced."""
+        out = SmoothCycle.__new__(SmoothCycle)
+        out.names, out.n, out.ranges = self.names, self.n, self.ranges
+        out.coeffs = list(self.coeffs)
+        out.orders, out.taper, out.gain = dict(self.orders), dict(self.taper), dict(self.gain)
+        out.dominant = dict(self.dominant)
+        for name, (coeffs, order) in columns.items():
+            out.coeffs[self.names.index(name)] = coeffs
+            out.orders[name], out.taper[name], out.gain[name] = int(order), 1.0, 1.0
+        return out
+
+
+# ------------------------------------------------------------------------- vole round 6: the cycle as played
+def keyed(coeffs, order, n_keys):
+    """A plain series' values at the n_keys key phases k / n_keys, the first repeated last (n_keys + 1)."""
+    values = evaluate(coeffs, np.arange(n_keys) / n_keys, order)
+    return np.append(values, values[0])
+
+
+def played_jerk(column, duration_s, rate=PLAYBACK_HZ, dense=PLAYED_DENSE):
+    """One joint column's keys (n_keys + 1, the last the first) as the bar's harness measures them (chase3d
+    tools/anim_compare.py, criterion 4): the keys interpolated linearly at `dense` samples of the `duration_s` cycle,
+    differenced cyclically three times over the sample step nearest 1 / `rate` s, the largest jerk over a sine's of
+    the same range at the stride rate; the range is the peak-to-peak of every (dense // 120)th sample. Returns
+    (jerk ratio, range); a constant column is (0, 0)."""
+    keys = np.asarray(column, float)
+    n = len(keys) - 1
+    t = np.arange(dense) / dense * n
+    lo = np.floor(t).astype(int)
+    w = t - lo
+    x = (1 - w) * keys[lo] + w * keys[lo + 1]
+    dt = duration_s / dense
+    step = max(1, int(round((1.0 / rate) / dt)))
+    h = step * dt
+    span = float(np.ptp(x[::max(1, dense // 120)]))
+    v = (np.roll(x, -step) - x) / h
+    a = (np.roll(v, -step) - v) / h
+    j = (np.roll(a, -step) - a) / h
+    if span <= 1e-12:
+        return 0.0, 0.0
+    return float(np.abs(j).max() / (span / 2 * (2 * np.pi / duration_s) ** 3)), span
+
+
+def lowpass(coeffs, order, sigma):
+    """The series with harmonic k >= 2 weighted by exp(-((k - 1) / sigma)^2 / 2) (the fundamental and the mean
+    kept)."""
+    k = np.arange(len(coeffs))
+    weight = np.where(k <= 1, 1.0, np.exp(-0.5 * ((k - 1) / max(sigma, 1e-9)) ** 2))
+    weight[k > order] = 0.0
+    return np.asarray(coeffs, complex) * weight
+
+
+def scaled(coeffs, factor):
+    """The series scaled about its mean."""
+    out = np.array(coeffs, complex, copy=True)
+    out[1:] *= factor
+    return out
+
+
+def keys_world_pitch(rig, values, names, bones):
+    """Per bone, the peak-to-peak of its world pitch (its rotation about +Y with its parents') over value rows."""
+    phi, _ = rig.pose(np.asarray(values, float), names)
+    return {b: float(np.ptp(np.unwrap(phi[b]))) for b in bones}
+
+
+def for_keys(smooth, n_keys, duration_s, legs, rig=None, samples=None, trunk=(), keep=RANGE_KEEP,
+             jerk_max=JERK_MAX):
+    """Vole round 6: the smooth cycle as the n_keys keys of a `duration_s` clip play it (the bar measures the played
+    clip, not the series). Every column but the legs' (`legs`) and the root's:
+      1. holds no harmonic above the keys' own (max_order(n_keys)): above it the keys alias it into steps;
+      2. when its played jerk (`played_jerk`, at PLAYBACK_HZ) is over `jerk_max`, its overtones are low-passed
+         (`lowpass`, the width shrinking by LOWPASS_STEP) until the jerk is under JERK_TARGET of it. The bar's jerk is
+         against a sine at the stride rate, so a short stride (the vole's 5.3 Hz) needs a lower order than a long
+         one: at 60 Hz the wolf's 24 keys span 1.0 stride per 24 samples, the vole's 0.44;
+      3. when that changed it, or its keys' range is under `keep` of the sampled range (a peak between keys), it is
+         scaled about its mean back to the sampled range at the keys.
+    The sampled range is `samples`' (the averaged cycle's rows in `names` order, both ends: the bar's reference
+    range is the video fit's over the closed cycle), else the series' own. Then with `rig` and `samples`, each `trunk` bone in order that those
+    rules changed and whose world pitch range (as `world_pitch_kept` reads it) is under `keep` of the samples' is
+    scaled up (PITCH_GAIN_STEP, at most PITCH_GAIN_MAX) until it is kept: the video's back, neck and tail swing, not
+    only each joint's own (the vole's spine_01 kept 0.689 of its world pitch range). A column the rules leave alone
+    is unchanged to the bit and its world pitch only reported, as before (the wolf lope's every column; its tail_03
+    keeps 0.46 of its world pitch range, a ruling-7 warning since round 1). Returns (smooth cycle, report)."""
+    names = smooth.names
+    cap = max_order(n_keys)
+    columns, report = {}, {}
+    if samples is not None:
+        rows = np.asarray(samples, float)
+        ranges = {n: float(np.ptp(np.unwrap(rows[:, i]))) for i, n in enumerate(names)}
+    else:
+        ranges = smooth.ranges
+    for name in names:
+        if name in legs or name in ("dx", "dz"):
+            continue
+        coeffs, order = smooth.effective(name), smooth.orders[name]
+        span = ranges[name]
+        entry = {}
+        changed = False
+        if order > cap:
+            coeffs, order, changed = lowpass(coeffs, cap, np.inf), cap, True
+            entry["orderCapped"] = [smooth.orders[name], cap]
+        jerk, played_range = played_jerk(keyed(coeffs, order, n_keys), duration_s)
+        entry["playedJerkBefore"] = round(jerk, 4)
+        if jerk > jerk_max:
+            sigma, base = float(max(order, 1)), coeffs
+            while sigma > 1e-3:
+                coeffs = lowpass(base, order, sigma)
+                jerk, played_range = played_jerk(keyed(coeffs, order, n_keys), duration_s)
+                if jerk <= JERK_TARGET * jerk_max:
+                    break
+                sigma *= LOWPASS_STEP
+            entry["lowpassSigma"], changed = round(sigma, 4), True
+        if span > 1e-12 and (changed or played_range < keep * span) and played_range > 1e-12:
+            coeffs = scaled(coeffs, span / played_range)
+            jerk, played_range = played_jerk(keyed(coeffs, order, n_keys), duration_s)
+            entry["rangeGain"], changed = round(span / (played_range or span), 4), True
+        if changed:
+            columns[name] = (coeffs, order)
+            entry["playedJerk"] = round(jerk, 4)
+            entry["keptRangeAtKeys"] = round(played_range / span, 4) if span > 1e-12 else 1.0
+            report[name] = entry
+    out = smooth.with_columns(columns) if columns else smooth
+    pitch = {}
+    if rig is not None and samples is not None and len(trunk):
+        phases = np.arange(PLAYED_DENSE) / PLAYED_DENSE      # as world_pitch_kept reads it (ruling 7's warning)
+        sampled = keys_world_pitch(rig, samples, names, trunk)
+        for bone in trunk:
+            if bone not in columns or sampled[bone] <= 1e-9:
+                continue
+            kept = keys_world_pitch(rig, out.at(phases), names, [bone])[bone] / sampled[bone]
+            if kept >= keep:
+                continue
+            coeffs, order = out.effective(bone), out.orders[bone]
+            factor = 1.0
+            while kept < keep and factor < PITCH_GAIN_MAX:
+                factor = round(factor + PITCH_GAIN_STEP, 6)
+                trial = out.with_columns({bone: (scaled(coeffs, factor), order)})
+                kept = keys_world_pitch(rig, trial.at(phases), names, [bone])[bone] / sampled[bone]
+            out = trial
+            pitch[bone] = {"gain": factor, "kept": round(kept, 4)}
+            report.setdefault(bone, {})["worldPitchGain"] = factor
+    return out, {"columns": report, "worldPitch": pitch, "keyOrderCap": cap, "playbackHz": PLAYBACK_HZ,
+                 "jerkMax": jerk_max, "jerkTarget": round(JERK_TARGET * jerk_max, 4), "keep": keep}
+
 
 def world_pitch_kept(rig, samples, smooth, names, bones, dense=600):
     """Per bone, the smooth cycle's world pitch range (the bone's rotation about +Y with its parents') over the
@@ -364,6 +538,13 @@ def solve_leg(rig, values, names, chain, paw_bone, target, pivot=True):
     d = np.clip(np.linalg.norm(reach, axis=1), abs(l1 - l2) + 1e-9, l1 + l2 - 1e-9)
     beta = np.arccos(np.clip((l1 ** 2 + d ** 2 - l2 ** 2) / (2 * l1 * d), -1.0, 1.0))
     side = np.sign(cross(end - a, knee - a))
+    # Vole round 6: the knee bends to the rig's own rest side (the anatomical bend), not to whichever side a nearly
+    # straight fitted leg happens to lean at each key: the vole's straight front legs flipped their elbow between
+    # keys, and the played pose between two such keys swung the paw 6.9 mm into the ground. A rest leg with no bend
+    # keeps the per-key side (the wolf's legs bend to their rest side at every key: unchanged).
+    rest = np.sign(cross(rig.head[foot[0]] - rig.head[upper], rig.head[lower] - rig.head[upper]))
+    if rest != 0:
+        side = np.full(len(values), float(rest))
     side[side == 0] = 1.0
     toward = polar(reach)
     new_knee = a + l1 * np.stack([np.cos(toward + side * beta), np.sin(toward + side * beta)], axis=1)
@@ -471,7 +652,7 @@ def quintic(s):
 
 
 def plan_keys(rig, smooth, names, project, windows, stride, rest, lift, n_keys, blend=None, release=None,
-              reach=True):
+              reach=True, clearance=None):
     """The bake's keys: n_keys + 1 value vectors at phases k / n_keys (the last repeats the first), the smooth cycle
     with its root lifted by `lift` and every planted paw pinned to its world-still line (`pin_lines`) over its
     contact window less `release.inset_keys` at each end (`release_windows`). Outside, the paw's target is the free
@@ -571,9 +752,60 @@ def plan_keys(rig, smooth, names, project, windows, stride, rest, lift, n_keys, 
             report[chain]["girdleSwingMaxDeg"] = round(float(np.degrees(swing.max())), 3)
         if np.any(drop > 0):
             report[chain]["bodyDropMaxM"] = round(float(drop.max()), 6)
+    if clearance is not None:
+        grounds = {chain: line["z"] for chain, (_, _, _, line) in plan.items()}
+        keys, lifted = clear_ground(rig, keys, names, project, grounds, clearance)
+        for chain, amount in lifted.items():
+            report.setdefault(chain, {})["clearanceLiftMaxM"] = amount
     keys = np.vstack([keys, keys[:1]])
     paws = rig.paws(keys, names, project)
     return keys, {c: p for c, p in paws.items()}, report
+
+
+def played_heights(rig, keys, names, project, grounds, subsamples=CLEARANCE_SUBSAMPLES):
+    """Per paw, its height over its pin's ground through the keys (n_keys, the cycle open) as the clip plays them
+    (every column linear between keys, the paw by forward kinematics): (n_keys, subsamples), row k from key k toward
+    key k + 1."""
+    closed = np.vstack([keys, keys[:1]])
+    values, _ = played(closed, subsamples)
+    paws = rig.paws(values, names, project)
+    return {chain: (paws[chain][:, 1] - z).reshape(len(keys), subsamples) for chain, z in grounds.items()}
+
+
+def clear_ground(rig, keys, names, project, grounds, tolerance, rounds=CLEARANCE_ROUNDS,
+                 subsamples=CLEARANCE_SUBSAMPLES):
+    """Vole round 6: no paw more than `tolerance` under its ground (`grounds`: per chain, its pin's z) anywhere in
+    the played cycle, between the keys too (the keys themselves are on or above it). Where a key interval dips deeper,
+    both its keys' paws are lifted by the dip and half the tolerance and the leg is solved again to reach them (`solve_leg`: the knee, the pivoting foot and the girdle, with
+    the body already lowered where a pin was out of reach), for at most `rounds` passes. A body whose played paws
+    stay within the tolerance is unchanged (the wolf lope: 5 mm at its leg length, deepest 4.996 mm). Returns (keys,
+    {chain: the largest lift, m} for the chains it lifted)."""
+    keys = np.array(keys, float, copy=True)
+    n_keys = len(keys)
+    lifted = {}
+    for _ in range(rounds):
+        heights = played_heights(rig, keys, names, project, grounds, subsamples)
+        moved = False
+        for chain, h in heights.items():
+            dip = -h.min(axis=1)
+            bad = dip > tolerance
+            if not bad.any():
+                continue
+            need = np.zeros(n_keys)
+            for k in np.flatnonzero(bad):
+                amount = dip[k] + 0.5 * tolerance
+                need[k] = max(need[k], amount)
+                need[(k + 1) % n_keys] = max(need[(k + 1) % n_keys], amount)
+            index = np.flatnonzero(need > 0)
+            paws = rig.paws(keys[index], names, project)[chain]
+            target = paws + np.stack([np.zeros(len(index)), need[index]], axis=1)
+            keys[index], _ = solve_leg(rig, keys[index], names, project["chains"][chain], project["paws"][chain],
+                                       target)
+            lifted[chain] = round(max(lifted.get(chain, 0.0), float(need.max())), 6)
+            moved = True
+        if not moved:
+            break
+    return keys, lifted
 
 
 def leg_reach(rig, chain, paw_bone):
@@ -705,17 +937,20 @@ def ease_clearance(u, spans):
     return float(best)
 
 
-def start_key(windows, n_keys, release=None):
+def start_key(windows, n_keys, release=None, force=None):
     """The loop's first key (round 4 ruling): of the n_keys keys of a cycle that starts at the phase origin's
     touchdown, the one with the most room outside every paw's contact ease (`ease_spans`), the nearest to the
-    origin on a tie. A cyclic clip is the same motion from any key; this puts the seam where no paw eases into or out
+    origin on a tie (or `force`, vole round 6: the key a seam check moved it to). A cyclic clip is the same motion from any key; this puts the seam where no paw eases into or out
     of its pin (mid-suspension or a mid-stance key). Returns (key, {key, outsideEases, clearanceKeys,
     originClearanceKeys})."""
     spans = ease_spans(windows, n_keys, release)
     if not any(spans.values()):
-        return 0, {"key": 0, "outsideEases": True, "clearanceKeys": None, "originClearanceKeys": None}
+        key = 0 if force is None else int(force) % n_keys
+        return key, {"key": key, "outsideEases": True, "clearanceKeys": None, "originClearanceKeys": None}
     room = [ease_clearance(k / n_keys, spans) for k in range(n_keys)]
     best = max(range(n_keys), key=lambda k: (round(room[k] * n_keys, 9), -min(k, n_keys - k)))
+    if force is not None:
+        best = int(force) % n_keys
     return best, {"key": int(best), "outsideEases": bool(room[best] > 1e-9),
                   "clearanceKeys": round(room[best] * n_keys, 4), "originClearanceKeys": round(room[0] * n_keys, 4)}
 
@@ -746,3 +981,89 @@ def heglund_taylor_hz(mass_kg):
     138:301-318)."""
     return 4.44 * float(mass_kg) ** -0.156
 
+
+def settle_edges(rig, keys, names, project, chain, release, declared, n_keys, height):
+    """Vole round 6: one paw's keys at the edges of its declared contact (`declared`, the pinned window `release`
+    widened), so that the played paw plants where facts declares it. The keys inside the declared contact that the
+    pin does not hold take the pin (world-still on its ground: its line through the first or last two pinned keys),
+    and the key just outside takes the pin's line `height` above the ground: between it and the next key the played
+    paw comes straight down (or up) on its spot and crosses `height` / 2 (the contact tolerance) at the declared
+    edge. facts runs it only for a paw whose keys would otherwise fail its agreement gate (the vole's front_L
+    sliding back into its touchdown), never for one that passes (the wolf lope). `keys` (n_keys, open). Returns
+    (keys, the settled key indices)."""
+    keys = np.array(keys, float, copy=True)
+    pinned, _, _ = _pinned_mask(release, n_keys)
+    if not pinned.any() or pinned.all():
+        return keys, []
+    paws = rig.paws(keys, names, project)[chain]
+    first = next(k for k in range(n_keys) if pinned[k] and not pinned[k - 1])
+    last = next(k for k in range(n_keys) if pinned[k] and not pinned[(k + 1) % n_keys])
+    on, off = declared
+    on = on - np.ceil(on - first / n_keys)               # in (first - n_keys, first] / n_keys
+    off = off - np.floor(off - last / n_keys)            # in [last, last + n_keys) / n_keys
+    targets = {}
+    for edge, anchor, step in ((on, first, -1), (off, last, 1)):
+        nxt = paws[(anchor - step) % n_keys]           # the pinned key beside the anchor, inside the stance
+        dx = paws[anchor, 0] - nxt[0]                  # the pin line's x per key, outward
+        z = paws[anchor, 1]
+        j = 1
+        while True:
+            k = (anchor + step * j) % n_keys
+            u = anchor / n_keys + step * j / n_keys
+            inside = (u >= edge - 1e-9) if step < 0 else (u <= edge + 1e-9)
+            if pinned[k] or k in targets:
+                break
+            x = paws[anchor, 0] + dx * j
+            targets[k] = (x, z if inside else z + height)
+            if not inside:
+                break
+            j += 1
+    if not targets:
+        return keys, []
+    index = np.array(sorted(targets))
+    target = np.array([targets[k] for k in index], float)
+    keys[index], _ = solve_leg(rig, keys[index], names, project["chains"][chain], project["paws"][chain], target)
+    return keys, [int(k) for k in index]
+
+
+def seam_jumps(keys, rig, names, project, columns):
+    """Vole round 6: the loop seam of the closed keys (n_keys + 1, the last the first): per paw (its x/z in place,
+    which is the world's up to the body's constant speed) and per joint column in `columns`, the velocity jump
+    across the seam |(k1 - k0) - (k0 - k(n-1))| over the cycle's median per-key change |k(i+1) - k(i)| (the clip
+    played as a loop has no velocity jump above it). Returns {series: ratio}; a still series is 0."""
+    keys = np.asarray(keys, float)
+    series = {f"paw:{chain}": p for chain, p in rig.paws(keys, names, project).items()}
+    series.update({name: keys[:, [names.index(name)]] for name in columns if name in names})
+    out = {}
+    for name, x in series.items():
+        v = x[1:] - x[:-1]
+        jump = float(np.linalg.norm(v[0] - v[-1]))
+        median = float(np.median(np.linalg.norm(v, axis=1)))
+        out[name] = round(jump / median, 4) if median > 1e-12 else (0.0 if jump <= 1e-12 else float("inf"))
+    return out
+
+
+def seam_columns(names, project):
+    """The joint columns the seam is judged on: the trunk, neck and tail (every column but the legs' and the root's;
+    the legs are judged by their paws)."""
+    legs = leg_bones(project)
+    return [n for n in names if n not in legs and n not in ("dx", "dz")]
+
+
+def seam_shift(keys, rig, names, project, room=None):
+    """The least whole-key shift of the loop's start (the keys rolled: the same motion) at which no seam series jumps
+    over 1 (`seam_jumps`), preferring the most `room` (per shift, larger is better; start_key's ease clearance), then
+    the nearest; None when no shift does. `keys` closed (n_keys + 1)."""
+    keys = np.asarray(keys, float)
+    open_keys = keys[:-1]
+    n_keys = len(open_keys)
+    columns = seam_columns(names, project)
+    passing = []
+    for shift in range(n_keys):
+        rolled = np.roll(open_keys, -shift, axis=0)
+        worst = max(seam_jumps(np.vstack([rolled, rolled[:1]]), rig, names, project, columns).values(), default=0.0)
+        if worst <= 1.0:
+            passing.append(shift)
+    if not passing:
+        return None
+    return max(passing, key=lambda k: ((room[k] if room is not None else 0.0), -min(k, n_keys - k)))

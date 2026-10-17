@@ -163,6 +163,17 @@ retime is 1 and nothing changes. Pick F so the band's centre gives at least 10 f
   first (a closed seam), drift zero. A fast stride's key rate rises above 60 Hz (the 5.31 Hz vole: 24 keys at
   127 Hz, not 11); the floor is the wolf lope's own 24 (60 x 0.398 s = 23.9), so the wolf keys as before. Recorded
   as `cycle.keysPerStride`, `cycle.minKeysPerStride` and `cycle.playedKeyRateHz`; Godot plays any key rate.
+- **As played (vole round 6)**: the bar measures the played clip (keys linear between, differenced at 60 Hz)
+  against a sine at the stride rate, so round 5's bound of 3 d^3 at the series' dominant harmonic d let the
+  vole's tail through at 21.55 (`motion.for_keys`, `smooth.played`). Every trunk, neck and tail column holds no
+  harmonic above the keys' own (11 at 24 keys: above it they alias into steps); a column whose played jerk is over
+  3 has its overtones low-passed (a Gaussian whose width shrinks) until it is under 2.85, then is scaled back to
+  the sampled range of the closed cycle at the keys (a peak between keys: the vole's tail_02 at 0.917); a column so
+  changed whose world pitch range is under 0.95 is scaled up until kept (the vole's spine_01 at 0.689). A column
+  whose range is a second harmonic cannot be under 3 and keep its range: it nods once per stride. A short stride
+  needs a lower order: at 60 Hz the vole's stride spans 11 samples, the wolf's 24. Columns these rules leave alone
+  are unchanged (the wolf lope's every column; its tail_03 world pitch warning stands). `smooth.worldPitchKept` is
+  the baked cycle's, `smooth.seriesWorldPitchKept` the series'.
 - **Ground**: the root is lifted so the shared ground is the rig's rest ground (`cycle.groundLift`).
 - **Pins**: over each stance's keys less half a key at each end, two-bone IK (the two bones above the last two; the
   foot keeps its world orientation, the knee its bend; where the leg cannot reach, the foot turns about the pinned
@@ -172,7 +183,15 @@ retime is 1 and nothing changes. Pick F so the band's centre gives at least 10 f
   whole straight leg cannot, the body comes down by the least smooth amount that reaches with 2 % to spare
   (`ik.<paw>.bodyDropMaxM`). Vole round 5: the round-4 vole's fronts missed by 6.2 mm because the IK held the
   scapula at the fit's angle while the fit's body rode 10 mm high; neither applies to the wolf. No eased or
-  swinging key goes below its paw's ground (a noisy fit's mid-swing dip is lifted onto it).
+  swinging key goes below its paw's ground (a noisy fit's mid-swing dip is lifted onto it). Vole round 6: the knee
+  bends to the rig's rest side at every key (round 5's nearly straight vole elbows flipped between keys and the
+  played paw swung 6.9 mm into the ground), and no paw goes more than 5 mm times the body's leg-length scale
+  (0.32 mm at the vole) under its ground anywhere in the played cycle, between keys too: an interval that dips
+  deeper has both keys' paws lifted by the dip and half that tolerance and the legs solved again
+  (`ik.<paw>.clearanceLiftMaxM`). A paw whose agreement (below) is under 0.97 has its declared contact's edges
+  settled: the unpinned keys inside it take the pin, the key just outside takes the pin's line two contact
+  tolerances up, so the played paw comes down on its spot at the declared edge (`ik.<paw>.settledKeys`; the
+  round-5 vole slid back into its touchdowns at 0.953-0.969, the wolf passes at 0.974 and up).
   Outside, the paw follows the free motion plus the correction where the pin lets go, faded out by a quintic over
   max(0.05, 0.125) of the stride (`PIN_RELEASE.span_stride`: round 4's 3 key intervals at the wolf's 24 keys, now a
   share of the stride so a short stride's stance is not eaten). The correction is set by `motion.PIN_RELEASE` (span, the derivatives
@@ -187,6 +206,10 @@ retime is 1 and nothing changes. Pick F so the band's centre gives at least 10 f
   rule, without the stance allowance (a pinned paw is on the ground) and with the body's scaled contact tolerance
   (`contactCheck.redetectionTolerance`). Under 0.95 agreement for any paw, `facts` refuses (`contactCheck`);
   `plantedStillShare` reports how much of each stance is under the body's still speed (0.10 m/s at the wolf).
+- **Loop seam (vole round 6)**: per paw and trunk, neck and tail column, the velocity jump across the seam is at
+  most the cycle's median per-key change (`contactCheck.loopSeam`). Where it is not, the loop starts at the
+  nearest key with the most room outside the eases where it is (`loopSeam.movedFrom`: the round-5 vole started
+  mid-swing of front_L, jump 6.1 times the median); where no key does, a warning. The wolf passes where it starts.
 - **Edges**: `contactCheck.edgeJumps` is each paw's velocity change (x and z at the keys, m/s per key; in place
   equals world for a constant body speed, as chase3d's harness measures it) against its swing's median per-key
   change. `touchdownMps` and `liftoffMps` are the largest across the whole approach and release span, where the kink

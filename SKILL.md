@@ -32,13 +32,13 @@ From the project root: `python3 <skill>/anim/pipeline.py <command> --work asset-
 | `generate --model-id <id> [--max-cost USD]` | Two candidates |
 | `accept --candidate N --checks <json>` | After opening both strips and full frames (`reference/prompting.md`) |
 | `ingest` | Drops pulldown repeats; read `flags`, `warnings` |
-| `fit` | Clip-wide camera scale and leg identity; restarts, leg swaps and a periodic second pass. Prints `lowFrames` |
+| `fit` | Clip-wide camera scale and leg identity; restarts, swaps, a periodic second pass. Prints `lowFrames` |
 | `lab` | Open `review/lab.html`, every low frame's overlay |
 | `gridframe --frame N`; `fit --marks <json> --span A:B` | Fix flips (below) |
-| `facts [--mass-kg KG] [--accept-gait REASON] [--accept-retime REASON]` | Period and averaged cycle from the video (refused under 0.85 IoU); contacts from the motion (grounded, world-still, leg-scaled). Refuses footfalls unlike the brief's `gait` unless accepted; refuses a stride under 10 frames (`slowMotion`); retimes a slow video to the gait's body-size cadence band (brief `massKg` or `--mass-kg`); keys (24+ per stride) pin planted paws, rechecked. `reference/motion.md` |
+| `facts [--mass-kg KG] [--accept-gait REASON] [--accept-retime REASON]` | Period and averaged cycle from the video (refused under 0.85 IoU); contacts from the motion (grounded, world-still, leg-scaled). Refuses footfalls unlike the brief's `gait` unless accepted; refuses a stride under 10 frames (`slowMotion`); retimes a slow video to the gait's body-size cadence band (brief `massKg` or `--mass-kg`); keys (24+ per stride) pin planted paws above ground, trunk within 60 Hz jerk; rechecked. `reference/motion.md` |
 | `bake` | Keys facts' cycle; refuses if a paw misses facts' pin. Open `bake/sheet.png`, `bake/closeup.png` |
 | `review --template`; `review --file <json>` | Fill it from what you saw; explain or refit low frames |
-| `verify --godot47 <bin> --godot45 <bin> --launcher <launcher>` | Phone/tablet captures of the clip playing (phases 0, 1/3, 2/3) on both engines via game-asset-3d-pipeline's `verify.py`. Open every capture |
+| `verify --godot47 <bin> --godot45 <bin> --launcher <launcher>` | Phone/tablet captures of the clip playing on both engines via game-asset-3d-pipeline's `verify.py`. Open every capture |
 | `export --destination asset-work/<area>/<slug>/evaluation/<clip>` | The owner's bundle |
 
 ## Leg identity

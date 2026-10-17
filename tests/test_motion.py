@@ -584,3 +584,113 @@ class VoleKeysTests(unittest.TestCase):
             self.assertNotIn("girdleSwingMaxDeg", entry, chain)
             self.assertNotIn("bodyDropMaxM", entry, chain)
             self.assertEqual(entry["maxResidualM"], 0.0)
+
+
+# ------------------------------------------------------------- vole round 6: the cycle as the clip plays it
+VOLE_S = 60.09637720555386 / 24.0 / 13.296      # the vole's played stride, s
+
+
+class PlayedJerkTests(unittest.TestCase):
+    """The bar's criterion 4 on the played keys: a sine at the stride rate scores about 1 (the 60 Hz difference
+    shrinks it a little), the same range at twice the rate about 8 times that: no smoothing of a column whose range
+    is a second harmonic keeps it under 3."""
+
+    def keys(self, harmonic, n=24):
+        u = np.arange(n + 1) / n
+        return np.sin(2 * np.pi * harmonic * u)
+
+    def test_a_sine_at_the_stride_rate(self):
+        jerk, span = motion.played_jerk(self.keys(1), VOLE_S)
+        self.assertAlmostEqual(jerk, 0.99, delta=0.05)
+        self.assertAlmostEqual(span, 2.0, delta=0.02)
+
+    def test_the_same_range_at_twice_the_rate(self):
+        jerk, _ = motion.played_jerk(self.keys(2), VOLE_S)
+        self.assertGreater(jerk, 6.0)
+
+    def test_a_constant_column(self):
+        self.assertEqual(motion.played_jerk(np.ones(25), VOLE_S), (0.0, 0.0))
+
+
+class ForKeysTests(unittest.TestCase):
+    def cycle(self, name):
+        from anim import facts
+        from tests.test_facts import cycle_contacts
+        block = derived(name)
+        contacts = cycle_contacts(block, tol=facts.tolerances(block["rig"], block["project"]))
+        return block, contacts
+
+    def test_the_wolf_cycle_is_returned_untouched(self):
+        block, contacts = self.cycle("wolfLopeCycle")
+        smooth = contacts["smooth"]
+        out, report = motion.for_keys(smooth, 24, 15.104269770324972 / 24.0 / 1.580815,
+                                      motion.leg_bones(block["project"]), contacts["planar"], contacts["closed"],
+                                      contacts["trunk"])
+        self.assertIs(out, smooth)
+        self.assertEqual((report["columns"], report["worldPitch"]), ({}, {}))
+
+    def test_the_vole_columns_are_capped_low_passed_and_scaled_back(self):
+        block, contacts = self.cycle("voleR3Cycle")
+        smooth = contacts["smooth"]
+        out, report = motion.for_keys(smooth, 24, VOLE_S, motion.leg_bones(block["project"]), contacts["planar"],
+                                      contacts["closed"], contacts["trunk"])
+        columns = report["columns"]
+        self.assertEqual(columns["chest"]["orderCapped"], [25, 11])           # 24 keys hold 11 harmonics
+        self.assertGreater(columns["tail_03"]["playedJerkBefore"], 20.0)
+        for name, entry in columns.items():
+            self.assertLessEqual(entry["playedJerk"], motion.JERK_TARGET * motion.JERK_MAX + 1e-9, name)
+            self.assertGreaterEqual(entry["keptRangeAtKeys"], motion.RANGE_KEEP, name)
+        for leg in motion.leg_bones(block["project"]):
+            self.assertNotIn(leg, columns)
+            i = smooth.names.index(leg)
+            self.assertIs(out.coeffs[i], smooth.coeffs[i])
+
+    def test_effective_coefficients_reproduce_the_series(self):
+        _, contacts = self.cycle("voleR3Cycle")
+        smooth = contacts["smooth"]
+        u = np.arange(97) / 97
+        for name in ("neck_02", "tail_03", "pelvis", "thigh_L"):
+            np.testing.assert_allclose(motion.evaluate(smooth.effective(name), u, smooth.orders[name]),
+                                       smooth.at(u)[:, smooth.names.index(name)], atol=1e-12)
+
+
+class KneeSideTests(unittest.TestCase):
+    """Round 5's vole front legs stood nearly straight and the IK took each key's lean as the elbow's side: it flipped
+    between keys (forearm -121 to +52 degrees) and the played paw swung 6.9 mm into the ground. The knee bends to
+    the rest pose's side."""
+
+    def test_a_nearly_straight_leg_bends_to_its_rest_side_at_every_key(self):
+        block = derived("voleR3Cycle")
+        rig, names, project = motion.PlanarRig(block["rig"]), block["names"], block["project"]
+        bones = project["chains"]["front_L"]
+        (upper, lower), foot = motion.ik_bones(bones)
+        rest_side = np.sign(motion.cross(rig.head[foot[0]] - rig.head[upper], rig.head[lower] - rig.head[upper]))
+        values = np.zeros((2, len(names)))
+        values[0, names.index(lower)] = np.radians(-40.0)      # past straight: the elbow leans the other way
+        values[1, names.index(lower)] = np.radians(10.0)
+        posed = rig.pose(values, names)
+        reach = rig.point(posed, "paw_front_L")
+        top = rig.point(posed, upper, "head")
+        target = top + 0.97 * (reach - top)
+        solved, _ = motion.solve_leg(rig, values, names, bones, "paw_front_L", target)
+        posed = rig.pose(solved, names)
+        a, k, e = (rig.point(posed, b, "head") for b in (upper, lower, foot[0]))
+        np.testing.assert_array_equal(np.sign(motion.cross(e - a, k - a)), [rest_side, rest_side])
+
+
+class SeamTests(unittest.TestCase):
+    def test_a_smooth_loop_has_no_seam_jump_and_a_kink_does(self):
+        rig = motion.PlanarRig(one_bone_rig())
+        names, project = ["dx", "dz", "arm"], {"paws": {}, "chains": {}, "legPairs": []}
+        u = np.arange(25) / 24
+        keys = np.zeros((25, 3))
+        keys[:, 2] = np.sin(2 * np.pi * u)
+        self.assertLess(motion.seam_jumps(keys, rig, names, project, ["arm"])["arm"], 1.0)
+        kinked = keys.copy()
+        kinked[:, 2] = np.abs(np.sin(np.pi * u))                # a cusp at the seam
+        self.assertGreater(motion.seam_jumps(kinked, rig, names, project, ["arm"])["arm"], 1.0)
+        shift = motion.seam_shift(kinked, rig, names, project)
+        self.assertIsNotNone(shift)
+        rolled = np.roll(kinked[:-1], -shift, axis=0)
+        self.assertLessEqual(motion.seam_jumps(np.vstack([rolled, rolled[:1]]), rig, names, project, ["arm"])["arm"],
+                             1.0)
