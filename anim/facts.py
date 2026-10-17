@@ -104,6 +104,10 @@ class FactsError(StageError):
     pass
 
 
+class TouchdownError(FactsError):
+    """A paw touches down more than once in one cycle (vole round 3: facts then resolves leg identity and retries)."""
+
+
 def period_search(values, fps, min_s=0.25, max_s=2.5):
     """The fundamental period in frames, at sub-frame precision, and its score: {"period": P or None, "score": s}.
 
@@ -395,13 +399,15 @@ def cadence_band(kg, gait):
     return [stride_hz(high, gait), stride_hz(low, gait)]
 
 
-def cadence_check(period, fps, gait_name, mass, periods, accept_retime=None, slow_motion=None):
+def cadence_check(period, fps, gait_name, mass, periods, accept_retime=None, slow_motion=None, stride=None):
     """The stride frequency against the gait's body-size band (Task 20: every gait in GAIT_LAW): the block for
     facts.json and the warnings. A video under the band whose steady cycles share one period (each within
     CADENCE_CONSISTENCY of the clip's) is retimed to the band centre; the factor scales the clip's speed.
     Fix round 1: a mass from an open mesh's volume (`openEdges` > 0) is checked against but never retimes; a factor
     outside RETIME_BOUND refuses unless `accept_retime` records why. Task 20: `slow_motion` (the brief's slowMotion)
-    is the expected retime: recorded beside the measured one, and the bound is on measured / expected."""
+    is the expected retime: recorded beside the measured one, and the bound is on measured / expected. Vole round 3:
+    `stride` is the leg evidence for the measured stride (the masks' period, whether it was doubled, leg identity
+    resolved, touchdowns per paw), recorded as `strideEvidence` and named in a refusal; the bound is never widened."""
     hz = fps / period
     expected = float(slow_motion) if slow_motion else 1.0
     law = GAIT_LAW.get(gait_name)
@@ -409,6 +415,8 @@ def cadence_check(period, fps, gait_name, mass, periods, accept_retime=None, slo
            "centreHz": None, "checked": False, "consistent": None, "cyclePeriods": [round(p, 3) for p in periods],
            "retime": 1.0, "expectedRetime": slow_motion if slow_motion else 1.0, "hz": round(hz, 4),
            "law": CADENCE_LAWS[law][2] if law else None}
+    if stride is not None:
+        out["strideEvidence"] = stride
     warnings = []
     asked = f"slowMotion {slow_motion:g}" if slow_motion else None
     open_edges = (mass or {}).get("openEdges") or 0
@@ -450,9 +458,16 @@ def cadence_check(period, fps, gait_name, mass, periods, accept_retime=None, slo
                 against = (f" against the brief's {asked} (the measured over the expected retime is {ratio:.2f})"
                            if slow_motion else "")
                 far = "from the slow motion asked for" if slow_motion else "slower than the body size says"
+                evidence = ""
+                if stride:
+                    half = (f": the masks repeat every {stride['maskPeriodFrames']:.2f} frames, half of it (each leg "
+                            f"matches its partner there, not itself)") if stride.get("doubled") else ""
+                    resolved = "; leg identity resolved across the clip" if stride.get("identityResolved") else ""
+                    evidence = (f" The leg evidence gives a stride of {stride['strideFrames']:.1f} frames{half}, and "
+                                f"each paw touches down once in it{resolved}.")
                 raise FactsError(f"The cadence retime {factor:.2f} (the video's {hz:.2f} Hz to {centre:.2f} Hz, the "
                                  f"{where}){against} is outside {low}-{high}: the video is far {far} or the mass is "
-                                 f"wrong. Check the mass (the brief's massKg or `facts --mass-kg`), or "
+                                 f"wrong.{evidence} Check the mass (the brief's massKg or `facts --mass-kg`), or "
                                  f"record why this retime stands with `facts --accept-retime <reason>`")
             out["retimeAccepted"] = accept_retime
             accepted = f"; outside {low}-{high}, accepted: {accept_retime}"
@@ -484,7 +499,7 @@ def contact_window(mask):
         return [0.0, 1.0], 1.0
     starts = [i for i in range(length) if mask[i] and not mask[i - 1]]
     if len(starts) != 1:
-        raise FactsError(f"A paw touches down {len(starts)} times in one cycle; check leg identity and marks")
+        raise TouchdownError(f"A paw touches down {len(starts)} times in one cycle; check leg identity and marks")
     end = starts[0]
     while mask[end % length]:
         end += 1
@@ -652,17 +667,147 @@ def slow_motion_advice(brief, mass=None, fps=24.0):
     return (f"Regenerate with the brief's slowMotion set so a stride spans at least {MIN_STRIDE_FRAMES} frames{hint}")
 
 
+# ------------------------------------------------------------------------------------------------- leg identity
+def named_pairs(names, project):
+    """The project's leg pairs with their value columns: [(chain a, chain b, columns a, columns b)]."""
+    out = []
+    for a, b in project.get("legPairs", []):
+        ia = [names.index(x) for x in project["chains"].get(a, []) if x in names]
+        ib = [names.index(x) for x in project["chains"].get(b, []) if x in names]
+        if ia and len(ia) == len(ib):
+            out.append((a, b, ia, ib))
+    return out
+
+
+def orient_pairs(x, pairs, origin, gait):
+    """A side silhouette cannot tell a pair's near leg from its far one, so after resolving identity each other pair
+    is labelled the way the brief's two-beat gait names: for a trot the phase origin moves with its diagonal partner,
+    for a pace with its lateral one. x: chain -> in-place paw x. Returns the "a/b" keys of the pairs to exchange
+    over the whole clip (none for any other gait, or when the origin's partner already moves with it)."""
+    if gait not in ("trot", "pace") or origin not in x:
+        return []
+    home = np.gradient(np.asarray(x[origin], float))
+    out = []
+    for a, b in pairs:
+        if origin in (a, b) or a not in x or b not in x:
+            continue
+        same = a if _side(a) == _side(origin) else b if _side(b) == _side(origin) else None
+        if same is None:
+            continue
+        other = b if same == a else a
+        partner, rival = (same, other) if gait == "pace" else (other, same)
+
+        def corr(chain):
+            v = np.gradient(np.asarray(x[chain], float))
+            return float(np.corrcoef(home, v)[0, 1]) if np.std(v) > 0 and np.std(home) > 0 else 0.0
+        if corr(rival) > corr(partner):
+            out.append(f"{a}/{b}")
+    return out
+
+
+def exchange(paws, a, b, flip):
+    """The paw tracks with chains a and b exchanged on the flipped frames."""
+    out = dict(paws)
+    pa, pb = np.array(paws[a], float), np.array(paws[b], float)
+    out[a], out[b] = np.where(flip[:, None], pb, pa), np.where(flip[:, None], pa, pb)
+    return out
+
+
+def leg_identity(every, paws, names, project, period, brief, force=False):
+    """Vole round 3: leg identity across the clip before the stride is decided. Each pair's half-period test
+    (`cycle.pair_verdicts` on its paw tracks, the leg evidence) says whether the video's period is half the stride
+    (the pair matches its partner a period on) or the whole of it. When every pair says the same, nothing changes (the
+    clean wolf lope). When a pair's test is mixed or the pairs disagree (or `force`: a paw touched down twice in one
+    cycle), each pair is relabelled where its paws meet (`cycle.resolve_identity`, the paw tracks' continuity), the
+    other pairs oriented to the brief's trot or pace (`orient_pairs`), and the tests read again: a relabelling that
+    leaves every pair saying the same is used; otherwise the clip stays as fitted, decided by the summed test
+    (`cycle.half_period`).
+
+    Returns (values, paws, report, doubled)."""
+    named = named_pairs(names, project)
+    cols = [(ia, ib) for _, _, ia, ib in named]
+    keys = [f"{a}/{b}" for a, b, _, _ in named]
+    on_paws = all(a in paws and b in paws for a, b, _, _ in named)
+
+    def verdicts_of(values, tracks):
+        """Each pair's half-period test on its paw tracks (x, height: the leg evidence), or on its value columns
+        when a pair has no paws."""
+        if not on_paws:
+            return cycle.pair_verdicts(values, cols, period)
+        table = np.concatenate([np.asarray(tracks[c], float)[:, :2] for a, b, _, _ in named for c in (a, b)], axis=1)
+        return cycle.pair_verdicts(table, [([4 * i, 4 * i + 1], [4 * i + 2, 4 * i + 3]) for i in range(len(named))],
+                                   period)
+    before = verdicts_of(every, paws)
+    report = {"resolved": False, "before": {k: v["verdict"] for k, v in zip(keys, before)}, "after": None,
+              "pairs": {}, "oriented": [], "trigger": None, "testedOn": "paw tracks" if on_paws else "leg values"}
+    legacy = bool(cycle.half_period(every, cycle.leg_pairs(names, project), period))
+    verdicts = {v["verdict"] for v in before}
+    if not named or (not force and "mixed" not in verdicts and len(verdicts) == 1):
+        return every, paws, report, legacy
+    report["trigger"] = ("a paw touched down more than once in one cycle" if force else
+                         "the leg pairs' half-period tests are mixed or disagree")
+    values, tracks, flips = np.array(every, float), dict(paws), []
+    for (a, b, _, _), key in zip(named, keys):
+        if a in paws and b in paws:
+            found = cycle.resolve_identity(paws[a][:, 0], paws[b][:, 0])
+        else:
+            found = {"flip": np.zeros(len(every), bool), "boundaries": [], "meetings": []}
+        flips.append(found["flip"])
+        report["pairs"][key] = {"boundaries": found["boundaries"],
+                                "meetings": [{"frame": m["frame"], "swap": m["swap"],
+                                              "exchangedOverKept": round(m["exchanged"] / max(m["kept"], 1e-12), 4)}
+                                             for m in found["meetings"]]}
+        if a in paws and b in paws:
+            tracks = exchange(tracks, a, b, found["flip"])
+    values = cycle.relabel(values, cols, flips)
+    gait = expected_gait(brief.get("gait"))
+    oriented = orient_pairs({c: tracks[c][:, 0] for c in tracks}, [[a, b] for a, b, _, _ in named],
+                            project.get("phaseOrigin"), gait)
+    for (a, b, ia, ib), key in zip(named, keys):
+        if key in oriented:
+            whole = np.ones(len(every), bool)
+            values = cycle.relabel(values, [(ia, ib)], [whole])
+            tracks = exchange(tracks, a, b, whole)
+    report["oriented"] = [f"{k} (labelled for the brief's {gait}: a side view cannot tell near from far)"
+                          for k in oriented]
+    after = verdicts_of(values, tracks)
+    report["after"] = {k: v["verdict"] for k, v in zip(keys, after)}
+    changed = any(f.any() for f in flips) or bool(oriented)
+    agreed = {v["verdict"] for v in after}
+    if changed and "mixed" not in agreed and len(agreed) == 1:
+        report["resolved"] = True
+        return values, tracks, report, agreed == {"half"}
+    report["reason"] = ("no pair's paws meet where exchanging them keeps their velocities" if not changed else
+                        f"relabelled, the pairs' half-period tests read {report['after']}: not one stride")
+    return every, paws, report, legacy
+
+
+def describe_identity(report):
+    if not report:
+        return "not tried"
+    parts = []
+    for key, pair in (report.get("pairs") or {}).items():
+        swaps = pair["boundaries"]
+        parts.append(f"{key} {report['before'].get(key)} -> {(report.get('after') or {}).get(key)}"
+                     f"{', exchanged from frames ' + ', '.join(map(str, swaps)) if swaps else ', kept'}")
+    text = "; ".join(parts) or "no leg pairs"
+    if report.get("reason"):
+        text += f"; {report['reason']}"
+    return text
+
+
 def loop_cycle(poses, project, every, paws, chains, masks, render, rest, rig=None, brief=None, mass=None,
                accept_gait=None, accept_retime=None):
     """The loop's cycle from the video: period, steady cycles, phase average, the averaged cycle's check against the
     masks, the contacts, the gait and cadence checks, and (with `rig`) the 60 Hz keys. Returns (start, period, entry,
-    cycle block, extra facts)."""
+    cycle block, extra facts).
+
+    Vole round 3: when a paw touches down more than once in the cycle, leg identity is resolved across the clip
+    (`leg_identity` with force) and the cycle measured again; facts refuses only when that leaves none consistent."""
     if masks is None or render is None:
         raise FactsError("facts finds a loop's period in the video: it needs the ingest masks and the rig's renderer")
     brief = brief or {}
     fps = float(poses["fps"])
-    names = poses["names"]
-    count = len(every)
     found = cycle.mask_period(masks, fps)
     if found["period"] is None:
         best = found.get("fundamentalLag")
@@ -671,9 +816,46 @@ def loop_cycle(poses, project, every, paws, chains, masks, render, rest, rig=Non
             best < MIN_STRIDE_FRAMES else ""
         raise FactsError(f"no full cycle found in the video between 0.25 s and 2.5 s: {found['reason']}; the clip "
                          f"must hold at least two cycles{short}")
+    try:
+        return loop_from_period(found, poses, project, every, paws, chains, masks, render, rest, rig, brief, mass,
+                                accept_gait, accept_retime, force=False)
+    except TouchdownError as error:
+        first = getattr(error, "identity", None) or {}
+        if not first.get("resolved"):
+            try:
+                return loop_from_period(found, poses, project, every, paws, chains, masks, render, rest, rig, brief,
+                                        mass, accept_gait, accept_retime, force=True)
+            except TouchdownError as again:
+                error, first = again, getattr(again, "identity", None) or {}
+        raise FactsError(f"{error}: resolving leg identity across the clip from the paw tracks "
+                         f"({describe_identity(first)}) leaves no consistent leg identity assignment with one "
+                         f"touchdown per paw per stride. Mark the legs and refit the span (gridframe marks, "
+                         f"`fit --marks --span`), or regenerate") from error
+
+
+def loop_from_period(found, poses, project, every, paws, chains, masks, render, rest, rig, brief, mass, accept_gait,
+                     accept_retime, force=False):
+    """`loop_cycle` from the video's period on: leg identity (`leg_identity`; with `force` resolved even when the
+    half-period test is decisive), the stride, the steady cycles, the average and the contacts."""
+    fps = float(poses["fps"])
+    names = poses["names"]
+    count = len(every)
     period = found["period"]
+    every, paws, identity, doubled = leg_identity(every, paws, names, project, period, brief, force)
     pairs = cycle.leg_pairs(names, project)
-    doubled = cycle.half_period(every, pairs, period)
+    try:
+        return loop_rest(found, period, doubled, identity, poses, project, every, paws, chains, masks, render, rest,
+                         rig, brief, mass, accept_gait, accept_retime, fps, names, count, pairs)
+    except TouchdownError as error:
+        error.identity = identity
+        raise
+
+
+def loop_rest(found, period, doubled, identity, poses, project, every, paws, chains, masks, render, rest, rig, brief,
+              mass, accept_gait, accept_retime, fps, names, count, pairs):
+    """The stride (the video's period, doubled when the masks show half of it), its steady cycles, their average, the
+    contacts, gait, cadence and keys, from leg-identity-resolved values and paws."""
+    mask_frames = period
     if doubled:
         period *= 2
     if period < MIN_STRIDE_FRAMES:
@@ -725,9 +907,11 @@ def loop_cycle(poses, project, every, paws, chains, masks, render, rest, rig=Non
     gait = {"plantedPaws": list(touchdowns), "neverPlants": [c for c in chains if c not in touchdowns],
             "phaseOrigin": contacts["origin"], **gait_pattern(masks_of, touchdowns, project, len(masks_of[chains[0]]))}
     gate, warnings = gait_check(gait, brief, accept_gait)
+    stride = {"maskPeriodFrames": round(mask_frames, 3), "strideFrames": round(period, 3), "doubled": bool(doubled),
+              "identityResolved": bool(identity["resolved"]), "touchdownsPerPaw": {c: 1 for c in touchdowns}}
     cadence, more = cadence_check(period, fps, gate["expected"] or next(iter(gate["measured"]["reads"]), None),
                                   mass, cycle.cycle_periods(masks, kept, period), accept_retime,
-                                  brief.get("slowMotion"))
+                                  brief.get("slowMotion"), stride=stride)
     warnings += more + contacts.get("warnings", [])
     factor = cadence["retime"]
     speed = contacts["speed"]
@@ -736,7 +920,8 @@ def loop_cycle(poses, project, every, paws, chains, masks, render, rest, rig=Non
              "legPeriod": leg_period(every, names, project, fps, period),
              "cycleStarts": [round(s, 4) for s in kept], "cyclesAveraged": len(kept),
              "cycleScores": {f"{s:.4f}": round(v, 4) for s, v in steady["scores"].items()},
-             "identityExchanged": exchanged, "averagedCycleIoU": check["meanIoU"], "cycleCheck": check,
+             "identityExchanged": exchanged, "identity": identity, "averagedCycleIoU": check["meanIoU"],
+             "cycleCheck": check,
              "ground": contacts["ground"], "paws": contacts["paws"], "gait": gait, "gaitCheck": gate,
              "cadence": cadence, "warnings": warnings}
     if speed is None:

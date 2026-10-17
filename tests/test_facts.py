@@ -912,6 +912,122 @@ class CadenceTests(unittest.TestCase):
         self.assertNotIn("slowMotion", str(caught.exception))
 
 
+def mixed_identity(period=24, frames=120, bounce=True, gait_phases=None):
+    """Vole round 3: a gait whose leg pairs sit at one hip each, half a cycle apart, so the silhouette repeats every
+    half period. Each paw sweeps back on the ground at a constant speed and swings forward in the air (in-place
+    x a triangle wave; the pair's paws meet mid-stance and mid-swing). With `bounce` the fit mixes the hind pair's
+    identity: at every meeting the paws bounce back instead of crossing (their values and paws exchanged from one frame
+    after each meeting on)."""
+    phases = gait_phases or {"hind_L": 0.0, "front_L": 0.25, "hind_R": 0.5, "front_R": 0.75}
+    columns = {"hind_L": "a", "front_L": "b", "hind_R": "c", "front_R": "d"}
+    names = ["dx", "dz", "a", "b", "c", "d"]
+    entries = []
+    for f in range(frames):
+        values = [0.0, 0.0] + [0.0] * 4
+        paws = {}
+        for chain, p in phases.items():
+            u = (f / period - p) % 1.0
+            values[names.index(columns[chain])] = math.sin(2 * math.pi * u)
+            # Stance over u in [0.25, 0.75): back at a constant speed on the ground; swing: forward in the air.
+            if 0.25 <= u < 0.75:
+                paws[chain] = [0.03 * (1 - 4 * (u - 0.25)), 0.0]
+            else:
+                w = (u - 0.75) % 1.0
+                paws[chain] = [0.03 * (-1 + 4 * w), 0.05 * math.sin(2 * math.pi * w)]
+        entries.append({"index": f, "values": values, "paws": paws, "flags": []})
+    flipped = []
+    if bounce:
+        half = period / 2
+        first = phases["hind_L"] * period % half
+        meetings = [first + k * half for k in range(int(frames / half) + 1) if 0 < first + k * half < frames - 1]
+        flip = np.zeros(frames, bool)
+        for m in meetings:
+            flip[int(math.floor(m)) + 1:] = ~flip[int(math.floor(m)) + 1:]
+        for f, entry in enumerate(entries):
+            if flip[f]:
+                v = entry["values"]
+                v[2], v[4] = v[4], v[2]
+                entry["paws"]["hind_L"], entry["paws"]["hind_R"] = entry["paws"]["hind_R"], entry["paws"]["hind_L"]
+        flipped = [int(b) for b in np.nonzero(np.diff(flip.astype(int)))[0] + 1]
+    return {"fps": 24.0, "names": names, "frames": entries}, flipped
+
+
+class LegIdentityFactsTests(unittest.TestCase):
+    """Vole round 3: when the half-period test cannot say whether the masks show a whole stride or half of one (a
+    leg pair's identity is mixed), or a paw touches down twice in one cycle, facts resolves leg identity across the
+    clip from the paw tracks' continuity before it decides the stride, and refuses only when no consistent assignment
+    exists. A clip whose identity is clean is left untouched."""
+    HIPS = (30, 70, 30, 70)
+
+    def test_a_clean_symmetric_clip_needs_no_resolution(self):
+        poses, _ = mixed_identity(bounce=False)
+        result = run(poses, hips=self.HIPS)
+        self.assertAlmostEqual(result["period"], 24, delta=0.3)
+        self.assertIs(result["identity"]["resolved"], False)
+
+    def test_mixed_identity_is_resolved_and_the_stride_is_one_touchdown_per_paw(self):
+        poses, flipped = mixed_identity()
+        self.assertGreaterEqual(len(flipped), 8)
+        result = run(poses, hips=self.HIPS)
+        self.assertAlmostEqual(result["maskPeriod"]["period"], 12, delta=0.15)
+        self.assertAlmostEqual(result["period"], 24, delta=0.3)
+        self.assertTrue(result["maskPeriod"]["doubled"])
+        identity = result["identity"]
+        self.assertIs(identity["resolved"], True)
+        self.assertEqual(identity["before"]["hind_L/hind_R"], "whole")
+        self.assertEqual(identity["after"], {"front_L/front_R": "half", "hind_L/hind_R": "half"})
+        hinds = identity["pairs"]["hind_L/hind_R"]["boundaries"]
+        self.assertEqual(len(hinds), len(flipped))
+        for got, want in zip(hinds, flipped):
+            self.assertLessEqual(abs(got - want), 1)
+        self.assertEqual(identity["pairs"]["front_L/front_R"]["boundaries"], [])
+        for bone, duty in result["entry"]["duty_factor"].items():
+            self.assertAlmostEqual(duty, 0.5, delta=0.15, msg=bone)
+
+    def test_a_paw_that_really_touches_down_twice_is_refused_after_trying_identity(self):
+        poses = synthetic(frames=120, period=24)
+        for entry in poses["frames"]:
+            entry["paws"]["hind_L"][1] = max(0.0, math.sin(4 * math.pi * entry["index"] / 24))
+        with self.assertRaisesRegex(facts.FactsError, r"touches down 2 times.*no consistent leg identity"):
+            run(poses)
+
+    def test_the_brief_gait_orients_the_pairs_a_side_view_cannot(self):
+        """Near and far legs look alike from the side: after resolving, the fore pair is labelled so the diagonal
+        (trot) or lateral (pace) partners the brief names move together; the choice is recorded."""
+        x = {"hind_L": np.sin(np.arange(80) / 5.0), "front_L": np.sin(np.arange(80) / 5.0),
+             "hind_R": -np.sin(np.arange(80) / 5.0), "front_R": -np.sin(np.arange(80) / 5.0)}
+        pairs = [["front_L", "front_R"], ["hind_L", "hind_R"]]
+        self.assertEqual(facts.orient_pairs(x, pairs, "hind_L", "trot"), ["front_L/front_R"])
+        self.assertEqual(facts.orient_pairs(x, pairs, "hind_L", "pace"), [])
+        self.assertEqual(facts.orient_pairs(x, pairs, "hind_L", "canter"), [])
+
+
+class SlowMotionStrideTests(unittest.TestCase):
+    """Vole round 3: with slowMotion asked for, the retime the measured stride implies is recorded with the leg
+    evidence for that stride; past the 0.5-2.0 bound on measured / expected the refusal names --accept-retime and
+    the numbers (no silent widening)."""
+    MASS = {"kg": 0.03, "source": "brief massKg"}
+    STRIDE = {"maskPeriodFrames": 30.05, "strideFrames": 60.1, "doubled": True, "identityResolved": True,
+              "touchdownsPerPaw": {"hind_L": 1, "hind_R": 1, "front_L": 1, "front_R": 1}}
+
+    def test_beyond_the_bound_the_refusal_names_the_stride_and_accept_retime(self):
+        with self.assertRaisesRegex(facts.FactsError, r"retime 13\.\d+.*slowMotion 3.*4\.4\d.*0\.5-2\.0.*stride of "
+                                                      r"60\.1 frames.*repeat every 30\.05.*once.*--accept-retime"):
+            facts.cadence_check(60.1, 24.0, "trot", self.MASS, [60.1], slow_motion=3, stride=self.STRIDE)
+
+    def test_accepted_the_retime_and_its_stride_evidence_are_recorded(self):
+        out, warnings = facts.cadence_check(60.1, 24.0, "trot", self.MASS, [60.1], accept_retime="owner: slow clip",
+                                            slow_motion=3, stride=self.STRIDE)
+        self.assertAlmostEqual(out["retime"], 13.3, delta=0.05)
+        self.assertEqual(out["strideEvidence"], self.STRIDE)
+        self.assertEqual(out["retimeAccepted"], "owner: slow clip")
+
+    def test_inside_the_bound_the_stride_evidence_is_recorded(self):
+        out, _ = facts.cadence_check(60.1, 24.0, "trot", self.MASS, [60.1], slow_motion=8, stride=self.STRIDE)
+        self.assertAlmostEqual(out["retimeVsExpected"], 13.3 / 8, delta=0.01)
+        self.assertEqual(out["strideEvidence"], self.STRIDE)
+
+
 class RigFactsTests(unittest.TestCase):
     """Task 19 steps 2 and 4 with the contract rig: contacts from the forward kinematics of the smooth cycle, the
     60 Hz keys with every planted paw pinned, and the re-detection from those keys gating the declared contacts."""

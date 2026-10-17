@@ -1,7 +1,9 @@
 """The video's cycle (anim/cycle.py): the period from the masks' own self-similarity, the steady cycles after the
 warm-up, the phase-aligned average and the helpers facts and the fitter's periodic pass share."""
+import json
 import math
 import unittest
+from pathlib import Path
 
 import numpy as np
 
@@ -186,6 +188,135 @@ class CyclePeriodTests(unittest.TestCase):
         self.assertLess(abs(periods[0] - 12.0), 0.6)
         self.assertLess(abs(periods[-1] - 16.0), 0.8)
         self.assertGreater(periods[-1] - periods[0], 3.0)
+
+
+# ------------------------------------------------------------------------- round 3: the vole's derived fixture
+FIXTURE = Path(__file__).resolve().parent / "fixtures" / "vole_scurry_derived.json"
+
+
+def derived():
+    return json.loads(FIXTURE.read_text())
+
+
+def curve(name):
+    block = derived()["lagScores"][name]
+    return {int(k): v for k, v in block["scores"].items()}, block["low"], block["high"]
+
+
+class PeriodFromScoresTests(unittest.TestCase):
+    """Vole round 3: the period is the dip that is clearly a minimum against its neighbourhood (prominence) and the
+    curve's typical level (margin), not the first dip under the gate. The field vole's low, rigid body changes its
+    outline by at most 17 %, so every lag scores under MASK_PERIOD_MAX and a 0.003-deep noise dip at 16 frames came
+    first; its silhouette repeats at 30 frames (0.025) and 60 (0.011)."""
+
+    def test_the_vole_period_is_the_deep_repeating_dip_not_the_first_dip_under_the_gate(self):
+        scores, low, high = curve("vole_scurry_r2")
+        found = cycle.period_from_scores(scores, low, high)
+        self.assertAlmostEqual(found["fundamentalLag"], 30.0, delta=0.3)
+        self.assertTrue(found["chosen"], found["reason"])
+        self.assertGreaterEqual(found["margin"], 10.0)
+        self.assertGreaterEqual(found["prominence"], cycle.MASK_PERIOD_PROMINENCE * found["level"])
+        noise = [c for c in found["candidates"] if abs(c["lag"] - 16.0) < 0.5]
+        self.assertEqual(len(noise), 1)
+        self.assertLess(noise[0]["prominence"], cycle.MASK_PERIOD_PROMINENCE * found["level"],
+                        "the 16-frame dip is noise: 0.003 deep against a curve at 0.14")
+
+    def test_the_wolf_lope_keeps_its_period(self):
+        scores, low, high = curve("wolf_lope")
+        found = cycle.period_from_scores(scores, low, high)
+        self.assertTrue(found["chosen"], found["reason"])
+        self.assertAlmostEqual(found["fundamentalLag"], 15.0918, delta=1e-3)
+        self.assertAlmostEqual(found["margin"], 2.66, delta=0.01)
+
+    def test_the_aperiodic_vole_round_one_is_still_refused(self):
+        """Round 1's stilt-legged shuffle (stride ~5-6 frames, undersampled): nothing repeats; its best dips (57
+        and 60 frames, 0.044 and 0.034) are rivals of each other, not a period and its multiples."""
+        scores, low, high = curve("vole_scurry_r1")
+        found = cycle.period_from_scores(scores, low, high)
+        self.assertFalse(found["chosen"])
+        self.assertIn("no lag is clearly the period", found["reason"])
+
+    def test_the_fundamental_is_preferred_when_its_multiple_dips_deeper(self):
+        lags = range(5, 62)
+        scores = {lag: 0.4 - 0.3 * max(0.0, 1 - abs(lag - 20) / 4) - 0.35 * max(0.0, 1 - abs(lag - 40) / 4)
+                  - 0.3 * max(0.0, 1 - abs(lag - 60) / 4) for lag in lags}
+        found = cycle.period_from_scores(scores, 6, 60)
+        self.assertTrue(found["chosen"], found["reason"])
+        self.assertAlmostEqual(found["fundamentalLag"], 20.0, delta=0.3)
+
+    def test_a_deep_dip_with_an_equally_deep_rival_is_not_a_period(self):
+        lags = range(5, 62)
+        scores = {lag: 0.4 - 0.3 * max(0.0, 1 - abs(lag - 23) / 3) - 0.3 * max(0.0, 1 - abs(lag - 37) / 3)
+                  for lag in lags}
+        found = cycle.period_from_scores(scores, 6, 60)
+        self.assertFalse(found["chosen"])
+
+    def test_mask_period_reports_the_new_numbers(self):
+        found = cycle.mask_period(masks_of(range(121), 15.2), 24.0)
+        for key in ("prominence", "level", "rival", "rivalGate", "prominenceGate"):
+            self.assertIn(key, found)
+
+
+def trot_tracks(period=40, frames=160, amplitude=0.02):
+    """In-place paw x of a leg pair half a cycle apart: each sweeps back (stance) and forward (swing). They meet
+    twice a cycle, crossing with opposite velocities."""
+    t = np.arange(frames)
+    return (amplitude * np.sin(2 * np.pi * t / period), amplitude * np.sin(2 * np.pi * t / period + np.pi))
+
+
+def bounced(xa, xb, boundaries):
+    """The pair as a fit that mixes identity at the given frames: from each boundary on the labels are exchanged."""
+    flip = np.zeros(len(xa), bool)
+    for b in boundaries:
+        flip[b:] = ~flip[b:]
+    return np.where(flip, xb, xa), np.where(flip, xa, xb), flip
+
+
+class LegIdentityTests(unittest.TestCase):
+    """Vole round 3: a side silhouette cannot tell near legs from far ones, and where a pair's paws meet the fit may
+    bounce them back instead of letting them cross. Identity is resolved across the clip from the paw tracks'
+    continuity: at each meeting the paws keep their velocities (one swinging forward, one sweeping back), so the
+    labelling whose velocities carry on through the meeting is the right one."""
+
+    def test_a_clean_crossing_pair_is_left_alone(self):
+        xa, xb = trot_tracks()
+        found = cycle.resolve_identity(xa, xb)
+        self.assertEqual(found["boundaries"], [])
+        self.assertFalse(found["flip"].any())
+        self.assertGreaterEqual(len(found["meetings"]), 6)
+
+    def test_bounces_are_undone(self):
+        xa, xb = trot_tracks()
+        # The paws meet at multiples of half a period (frames 20, 40, ...): bounce every other meeting.
+        fa, fb, truth = bounced(xa, xb, [41, 81, 121])
+        found = cycle.resolve_identity(fa, fb)
+        self.assertEqual(len(found["boundaries"]), 3, found["meetings"])
+        for got, want in zip(found["boundaries"], [41, 81, 121]):
+            self.assertLessEqual(abs(got - want), 1)
+        relabelled_a = np.where(found["flip"], fb, fa)
+        np.testing.assert_allclose(relabelled_a[45:], xa[45:], atol=1e-3)
+
+    def test_the_vole_fronts_are_relabelled_and_its_hinds_kept(self):
+        tracks = derived()["voleR2Paws"]["tracks"]
+        x = {c: np.array([p[0] for p in v]) for c, v in tracks.items()}
+        fronts = cycle.resolve_identity(x["front_L"], x["front_R"])
+        hinds = cycle.resolve_identity(x["hind_L"], x["hind_R"])
+        self.assertEqual(hinds["boundaries"], [], "the hind pair crosses cleanly at 32, 62 and 92")
+        self.assertEqual(len(fronts["boundaries"]), 2, fronts["meetings"])
+        for got, want in zip(fronts["boundaries"], [32, 92]):
+            self.assertLessEqual(abs(got - want), 1, "the fronts bounce at 31 and 91 and cross at 61")
+
+    def test_after_relabelling_both_vole_pairs_say_the_masks_show_half_a_stride(self):
+        tracks = derived()["voleR2Paws"]["tracks"]
+        chains = ["front_L", "front_R", "hind_L", "hind_R"]
+        x = np.stack([[p[0] for p in tracks[c]] for c in chains], axis=1)
+        pairs = [([0], [1]), ([2], [3])]
+        before = cycle.pair_verdicts(x, pairs, 30.05)
+        self.assertEqual(before[0]["verdict"], "mixed", before)
+        flips = [cycle.resolve_identity(x[:, a[0]], x[:, b[0]])["flip"] for a, b in pairs]
+        fixed = cycle.relabel(x, pairs, flips)
+        after = cycle.pair_verdicts(fixed, pairs, 30.05)
+        self.assertEqual([v["verdict"] for v in after], ["half", "half"], after)
 
 
 if __name__ == "__main__":

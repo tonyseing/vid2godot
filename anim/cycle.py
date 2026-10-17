@@ -18,12 +18,24 @@ import numpy as np
 # 2.9-4.4x; the 24-frame synthetic walk (S1-S3) scores ~0; a still clip has no margin, a one-shot no low lag.
 MASK_PERIOD_MAX = 0.25
 MASK_PERIOD_MARGIN = 2.0
+# Vole round 3: a candidate dips by at least MASK_PERIOD_PROMINENCE of the curve's median level (the vole's noise dip
+# at 16 frames: 0.003 against 0.14; its period at 30: 0.14; the wolf's at 15: 0.33 against 0.45), and no other dip
+# comes within MASK_PERIOD_RIVAL of the period's family score (the aperiodic round-1 vole: 0.044 at 57 against 0.034
+# at 60, 1.3x; the round-2 vole 16x; the wolf has no rival dip).
+MASK_PERIOD_PROMINENCE = 0.2
+MASK_PERIOD_RIVAL = 1.5
 # A cycle is steady when its mask score (the mean 1 - IoU of its frames against the same phase a period on) is
 # within STEADY_RATIO of the steadiest cycle's, or STEADY_SLACK of it (a clean clip scores ~0).
 STEADY_RATIO = 1.5
 STEADY_SLACK = 0.03
 # Leg identity exchanged between cycles only when exchanging is clearly closer; the half-period test likewise.
 HALF_PERIOD_RATIO = 0.5
+# Vole round 3: a pair's paws meet where their distance has a local minimum under MEET_SHARE of its 95th percentile;
+# the labels are exchanged there when the exchanged velocities (slopes over IDENTITY_WINDOW frames each side) change
+# under IDENTITY_RATIO as much as the kept ones (the vole's front bounces: 0.17 and 0.10; its crossings: 6.1 and more).
+MEET_SHARE = 0.25
+IDENTITY_WINDOW = 3
+IDENTITY_RATIO = 0.5
 # The periodic prior's per-joint weight: 0 at or below INCONSISTENT_LOW (the joint repeats: the silhouette pins it),
 # 1 at or above INCONSISTENT_HIGH (it varies from cycle to cycle about as much as over the whole clip).
 INCONSISTENT_LOW, INCONSISTENT_HIGH = 0.3, 0.8
@@ -101,50 +113,122 @@ def multiples(flat, area, period, high):
     return num / den if den else period
 
 
+def prominence(scores, lag):
+    """How far a whole-frame minimum dips below its neighbourhood: on each side, the highest score before the curve
+    first falls under it (or the scored range ends); the lower of the two sides, less the minimum's score."""
+    here = scores[lag]
+
+    def side(step):
+        peak, g = here, lag + step
+        while g in scores and scores[g] >= here:
+            peak = max(peak, scores[g])
+            g += step
+        return peak
+    return float(min(side(-1), side(1)) - here)
+
+
+def period_from_scores(scores, low, high):
+    """The fundamental lag from the lag scores (lag -> median aligned 1 - IoU, over [low - 1, high + 1]).
+
+    Vole round 3: every whole-frame local minimum in [low, high] is refined (`refine`) and given its prominence
+    (`prominence`). A candidate scores at most MASK_PERIOD_MAX and dips by at least MASK_PERIOD_PROMINENCE of the
+    curve's level (the median score in range): a low, rigid body (the field vole changes its outline by at most 17 %)
+    scores every lag under the gate, and a 0.003-deep noise dip must not pass as the period. A candidate is the period
+    when, against the median of the lags more than a frame from any multiple of it, the best score of it and its
+    multiples has a margin of MASK_PERIOD_MARGIN; every multiple in range also dips under that median (the gait
+    repeats there too); and no other minimum comes within MASK_PERIOD_RIVAL of that best score (a rival dip means no
+    lag is clearly the period). The first such candidate is chosen: the fundamental, when its multiples dip as well
+    (a fast gait between whole frames can score worse at its period than at twice it).
+
+    Returns {"chosen", "fundamentalLag", "score", "familyScore", "median", "margin", "prominence", "level", "rival"
+    (the deepest other minimum's score, None without one), "rivalRatio", "candidates" (every minimum: lag, score,
+    prominence), the gates, "reason"}; without a period the numbers are the best candidate's."""
+    minima = []
+    for lag in range(low, high + 1):
+        if scores[lag] <= scores.get(lag - 1, np.inf) and scores[lag] <= scores.get(lag + 1, np.inf):
+            refined, score = refine(scores, lag)
+            minima.append({"lag": refined, "score": score, "prominence": prominence(scores, lag)})
+    level = float(np.median([scores[g] for g in range(low, high + 1)]))
+    out = {"chosen": False, "fundamentalLag": None, "score": None, "familyScore": None, "median": None,
+           "margin": None, "prominence": None, "level": level, "rival": None, "rivalRatio": None,
+           "candidates": [{k: round(v, 4) for k, v in m.items()} for m in minima],
+           "gate": MASK_PERIOD_MAX, "marginGate": MASK_PERIOD_MARGIN, "prominenceGate": MASK_PERIOD_PROMINENCE,
+           "rivalGate": MASK_PERIOD_RIVAL, "reason": None}
+    if not minima:
+        out["reason"] = "the masks' self-similarity has no minimum in range"
+        return out
+
+    def judge(m):
+        lag = m["lag"]
+
+        def near(x):
+            return min(abs(x - k * lag) for k in range(1, int(high // max(lag, 1.0)) + 2)) <= 1.0
+        family = min(o["score"] for o in minima if near(o["lag"]))
+        others = [scores[g] for g in range(low, high + 1) if not near(g)]
+        median = float(np.median(others)) if others else 0.0
+        rivals = [o["score"] for o in minima if not near(o["lag"])]
+        rival = min(rivals) if rivals else None
+        grid = np.arange(low - 1, high + 2)
+        values = np.array([scores.get(int(g), np.nan) for g in grid])
+        repeats = all(float(np.interp(k * lag, grid, values)) < median
+                      for k in range(2, int(high // max(lag, 1.0)) + 1) if k * lag <= high)
+        verdict = {"fundamentalLag": lag, "score": m["score"], "familyScore": family, "median": median,
+                   "margin": median / max(family, 1e-6), "prominence": m["prominence"], "rival": rival,
+                   "rivalRatio": None if rival is None else rival / max(family, 1e-6), "repeats": repeats}
+        verdict["ok"] = (verdict["margin"] >= MASK_PERIOD_MARGIN and repeats
+                         and (rival is None or verdict["rivalRatio"] >= MASK_PERIOD_RIVAL))
+        return verdict
+    gated = [m for m in minima if m["score"] <= MASK_PERIOD_MAX and m["prominence"] >= MASK_PERIOD_PROMINENCE * level]
+    judged = [judge(m) for m in gated]
+    chosen = next((j for j in judged if j["ok"]), None)
+    if chosen is not None:
+        out.update({k: v for k, v in chosen.items() if k not in ("ok", "repeats")}, chosen=True)
+        return out
+    best = max(judged, key=lambda j: j["margin"]) if judged else judge(min(minima, key=lambda m: m["score"]))
+    out.update({k: v for k, v in best.items() if k not in ("ok", "repeats")})
+    why = []
+    if not judged:
+        why.append(f"no dip scores under {MASK_PERIOD_MAX} and dips by {MASK_PERIOD_PROMINENCE} of the curve's level "
+                   f"{level:.2f} (the best dips {best['prominence']:.3f})")
+    else:
+        if best["margin"] < MASK_PERIOD_MARGIN:
+            why.append(f"margin {best['margin']:.1f}x, needed {MASK_PERIOD_MARGIN}x")
+        if not best["repeats"]:
+            why.append("its multiples do not dip under that median")
+        if best["rival"] is not None and best["rivalRatio"] < MASK_PERIOD_RIVAL:
+            why.append(f"another dip scores {best['rival']:.3f} ({best['rivalRatio']:.2f}x, needed "
+                       f"{MASK_PERIOD_RIVAL}x)")
+    out["reason"] = (f"no lag is clearly the period: the best candidate, {best['fundamentalLag']:.2f} frames, scores "
+                     f"{best['score']:.2f} (gate {MASK_PERIOD_MAX}; {best['familyScore']:.2f} with its multiples) "
+                     f"against a median of {best['median']:.2f} elsewhere ({'; '.join(why)})")
+    return out
+
+
 def mask_period(masks, fps, min_s=0.25, max_s=2.5):
     """The video's fundamental period in frames, from the masks' self-similarity over lags in [min_s, max_s].
 
-    Each whole-frame lag scores the median aligned 1 - IoU between frames that far apart (`lag_score`); each local
-    minimum is refined to a sub-frame lag and its vertex score (`refine`). The fundamental is the first refined
-    minimum whose score is at most MASK_PERIOD_MAX (its multiples come later). It must be clearly the period: the
-    median of the other lags (every lag in range more than a frame from a multiple of it) is at least
-    MASK_PERIOD_MARGIN times the best score among it and its multiples. (A fast gait whose period falls between
-    whole frames scores worse at the period than at twice it; judging the margin on the fundamental alone would hand
-    the period to its double.) The period is then refined over its multiples (`multiples`).
+    Each whole-frame lag scores the median aligned 1 - IoU between frames that far apart (`lag_score`); the
+    fundamental is chosen from that curve's clear minima (`period_from_scores`) and refined over its multiples
+    (`multiples`).
 
-    Returns {"period" (None when nothing passes), "fundamentalLag" (the first minimum's refined lag), "score" (its
-    vertex score), "familyScore" (the best over it and its multiples), "median", "margin", "gate", "marginGate",
+    Returns {"period" (None when nothing passes), "fundamentalLag", "score" (its vertex score), "familyScore" (the
+    best over it and its multiples), "median", "margin", "prominence", "level", "rival", "rivalRatio", the gates,
     "reason"}; without a period, the numbers are the best candidate's."""
     count = len(masks)
     low, high = max(2, int(math.ceil(min_s * fps))), min(int(max_s * fps), count // 2)
     out = {"period": None, "fundamentalLag": None, "score": None, "familyScore": None, "median": None,
-           "margin": None, "gate": MASK_PERIOD_MAX, "marginGate": MASK_PERIOD_MARGIN, "reason": None}
+           "margin": None, "prominence": None, "level": None, "rival": None, "rivalRatio": None,
+           "gate": MASK_PERIOD_MAX, "marginGate": MASK_PERIOD_MARGIN, "prominenceGate": MASK_PERIOD_PROMINENCE,
+           "rivalGate": MASK_PERIOD_RIVAL, "reason": None}
     if high < low + 1:
         out["reason"] = f"the clip ({count} frames) is too short to hold two cycles"
         return out
     flat, area = aligned(masks)
     scores = {lag: lag_score(flat, area, lag) for lag in range(low - 1, high + 2) if 0 < lag < count}
-    minima = [refine(scores, lag) for lag in range(low, high + 1)
-              if scores[lag] <= scores.get(lag - 1, np.inf) and scores[lag] <= scores.get(lag + 1, np.inf)]
-    if not minima:
-        out["reason"] = "the masks' self-similarity has no minimum in range"
-        return out
-    passing = [m for m in minima if m[1] <= MASK_PERIOD_MAX]
-    lag, score = passing[0] if passing else min(minima, key=lambda m: m[1])
-
-    def near_multiple(x):
-        return min(abs(x - k * lag) for k in range(1, int(high // max(lag, 1.0)) + 2)) <= 1.0
-    family = min(m[1] for m in minima if near_multiple(m[0]))
-    others = [scores[g] for g in range(low, high + 1) if not near_multiple(g)]
-    median = float(np.median(others)) if others else 0.0
-    margin = median / max(family, 1e-6)
-    out.update({"fundamentalLag": lag, "score": score, "familyScore": family, "median": median, "margin": margin})
-    if passing and margin >= MASK_PERIOD_MARGIN:
-        out["period"] = multiples(flat, area, lag, high)
-        return out
-    out["reason"] = (f"no lag is clearly the period: the best candidate, {lag:.2f} frames, scores {score:.2f} "
-                     f"(gate {MASK_PERIOD_MAX}; {family:.2f} with its multiples) against a median of {median:.2f} "
-                     f"elsewhere (margin {margin:.1f}x, needed {MASK_PERIOD_MARGIN}x)")
+    found = period_from_scores(scores, low, high)
+    out.update({k: v for k, v in found.items() if k not in ("chosen", "candidates")})
+    if found["chosen"]:
+        out["period"] = multiples(flat, area, found["fundamentalLag"], high)
     return out
 
 
@@ -276,6 +360,90 @@ def half_period(values, pairs, period):
     crossed = sum(float(np.sum((now[:, a] - later[:, b]) ** 2) + np.sum((now[:, b] - later[:, a]) ** 2))
                   for a, b in pairs)
     return crossed < HALF_PERIOD_RATIO * direct
+
+
+def pair_verdicts(values, pairs, period):
+    """Per leg pair, the half-period test on its own (`half_period` sums the pairs): {"direct", "crossed",
+    "verdict"}, the verdict "half" when the pair matches its partner a period on (crossed under HALF_PERIOD_RATIO of
+    direct: the period is half the stride), "whole" when it matches itself (the reverse), else "mixed" (neither: the
+    pair's identity is mixed along the clip)."""
+    values = np.asarray(values, float)
+    times = np.arange(0, len(values) - 1 - period)
+    out = []
+    if not len(times):
+        return [{"direct": None, "crossed": None, "verdict": "mixed"} for _ in pairs]
+    now, later = values[times.astype(int)], resample(values, times + period)
+    for a, b in pairs:
+        direct = float(np.sum((now[:, a] - later[:, a]) ** 2) + np.sum((now[:, b] - later[:, b]) ** 2))
+        crossed = float(np.sum((now[:, a] - later[:, b]) ** 2) + np.sum((now[:, b] - later[:, a]) ** 2))
+        verdict = ("half" if crossed < HALF_PERIOD_RATIO * direct else
+                   "whole" if direct < HALF_PERIOD_RATIO * crossed else "mixed")
+        out.append({"direct": direct, "crossed": crossed, "verdict": verdict})
+    return out
+
+
+def _slope(x, lo, hi):
+    lo, hi = max(lo, 0), min(hi, len(x) - 1)
+    if hi - lo < 1:
+        return None
+    t = np.arange(lo, hi + 1)
+    return float(np.polyfit(t, x[lo:hi + 1], 1)[0])
+
+
+def resolve_identity(xa, xb, window=IDENTITY_WINDOW, gap=1):
+    """A leg pair's identity across the clip from its paws' in-place x tracks (vole round 3). Where the two paws meet
+    (a local minimum of their distance under MEET_SHARE of its 95th percentile), a side silhouette shows one leg and
+    the fit may bounce the paws back instead of letting them cross. The paws keep their velocities through a meeting
+    (one swings forward, the other sweeps back on the ground), so at each meeting, in order, the labels are exchanged
+    from the frame after it when the exchanged velocities (slopes over `window` frames each side, `gap` frames from
+    the meeting) carry on under IDENTITY_RATIO of the kept ones' squared change.
+
+    Returns {"flip" (per frame, the labels exchanged), "boundaries" (frames where the exchange starts or ends),
+    "meetings" ([{"frame", "distance", "kept", "exchanged", "swap"}])}."""
+    xa, xb = np.array(xa, float), np.array(xb, float)
+    count = len(xa)
+    flip = np.zeros(count, bool)
+    distance = np.abs(xa - xb)
+    scale = float(np.percentile(distance, 95)) if count else 0.0
+    meetings, last = [], -np.inf
+    if scale <= 1e-9:
+        return {"flip": flip, "boundaries": [], "meetings": []}
+    for m in range(1, count - 1):
+        if not (distance[m] <= distance[m - 1] and distance[m] <= distance[m + 1] and distance[m] < MEET_SHARE * scale):
+            continue
+        if m - last <= window:
+            continue
+        last = m
+        b = m + 1
+        before = (b - 1 - gap - window, b - 1 - gap)
+        after = (b + gap, b + gap + window)
+        va0, vb0, va1, vb1 = _slope(xa, *before), _slope(xb, *before), _slope(xa, *after), _slope(xb, *after)
+        if None in (va0, vb0, va1, vb1):
+            continue
+        kept = (va0 - va1) ** 2 + (vb0 - vb1) ** 2
+        exchanged = (va0 - vb1) ** 2 + (vb0 - va1) ** 2
+        swap = exchanged < IDENTITY_RATIO * kept
+        meetings.append({"frame": m, "distance": round(float(distance[m]), 6), "kept": kept, "exchanged": exchanged,
+                         "swap": bool(swap)})
+        if swap:
+            xa[b:], xb[b:] = xb[b:].copy(), xa[b:].copy()
+            flip[b:] = ~flip[b:]
+    boundaries = [int(f) for f in np.nonzero(np.diff(flip.astype(int)))[0] + 1]
+    if flip[0]:
+        boundaries.insert(0, 0)
+    return {"flip": flip, "boundaries": boundaries, "meetings": meetings}
+
+
+def relabel(values, pairs, flips):
+    """The values with each pair's columns exchanged on the frames its flip mask marks."""
+    out = np.array(values, float)
+    for (a, b), flip in zip(pairs, flips):
+        rows = np.nonzero(np.asarray(flip, bool))[0]
+        if len(rows):
+            x = out[np.ix_(rows, a)].copy()
+            out[np.ix_(rows, a)] = out[np.ix_(rows, b)]
+            out[np.ix_(rows, b)] = x
+    return out
 
 
 # --------------------------------------------------------------------------------------------- the phase average

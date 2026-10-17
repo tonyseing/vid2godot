@@ -3,6 +3,27 @@
 `facts` turns the fitted video into the clip the game plays: the contacts, a gait check, the cadence, and 60 Hz
 keys with the planted paws pinned. `bake` writes those keys; `verify` films them playing in Godot.
 
+## The period and the stride (vole round 3)
+
+The period comes from the masks' self-similarity (`maskPeriod`): per lag, the median aligned 1 - IoU of frame
+pairs that far apart. A lag is the period when its dip scores at most 0.25, dips by at least 0.2 of the curve's
+median level (`prominence`, `level`), its family (it and its multiples) beats the median of the other lags by 2x
+(`margin`), every multiple dips under that median, and no other dip comes within 1.5x (`rival`); the first such lag
+is chosen, so the fundamental wins when its multiples dip too. A low, rigid body (the field vole changes its outline
+by at most 17 %) scores every lag under 0.25; the old first-dip rule took a 0.003-deep noise dip at 16 frames where
+the vole repeats at 30 (0.025) and 60 (0.011).
+
+The stride is the period, or twice it when the masks show half a stride (near and far legs look alike). Each leg
+pair's half-period test is read on its paw tracks (`identity.before`): "half" (a paw matches its partner a period
+on), "whole", or "mixed". When a pair is mixed or the pairs disagree, or a paw touches down twice in the cycle,
+`facts` resolves identity: where a pair's paws meet, the fit may bounce them back instead of letting them cross; the
+paws keep their velocities through a meeting (one swings forward, one sweeps back), so the labels are exchanged
+there when that carries the velocities on (`identity.pairs`: meetings and boundaries). For a brief trot or pace the
+other pairs are then labelled so the origin's diagonal (trot) or lateral (pace) partner moves with it
+(`identity.oriented`; a side view cannot tell). The relabelling is used only when every pair's test then agrees
+(`identity.after`); otherwise the clip stays as fitted, and a paw that still touches down twice is refused. A clean
+clip (the wolf lope: both pairs "whole") is untouched. The stride's evidence is `cadence.strideEvidence`.
+
 ## Contacts from the motion
 
 The motion is the forward kinematics of the smooth cycle (below) on the contract's `rig.json`, read at 240 samples
@@ -89,7 +110,8 @@ is often slow motion) is **retimed** to the band centre, whatever the gait: the 
 factor and its speed multiplies by it; the stride stays. The factor is `cadence.retime` in `facts.json` (with
 `cadence.gait` and `cadence.law`), a warning and the lab's Motion section. Over the band, or with cycles that
 disagree, it warns and does not retime. A factor outside 0.5-2.0 of the expected retime (below) is refused (the
-mass is likely wrong) unless `facts --accept-retime "<why>"` records why (`cadence.retimeAccepted`, the ledger). A
+mass is likely wrong) unless `facts --accept-retime "<why>"` records why (`cadence.retimeAccepted`, the ledger); the
+refusal names the stride the leg evidence gives, and the bound is never widened for slow motion. A
 retimed speed can then be far from the brief's `targetSpeedMps` (the stride is the video's): read that warning.
 
 ### Small, fast animals: `slowMotion`
