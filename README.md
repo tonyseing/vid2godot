@@ -10,7 +10,7 @@ bundle for the owner to approve ([reference/motion.md](reference/motion.md)). It
 ## Install
 
 ```bash
-git clone --branch anim-pipeline-2026-10-17 https://github.com/tonyseing/vid2godot.git ~/.vid2godot/repo
+git clone --branch anim-pipeline-2026-10-17.1 https://github.com/tonyseing/vid2godot.git ~/.vid2godot/repo
 python3 ~/.vid2godot/repo/install.py
 ```
 
