@@ -26,6 +26,7 @@
 | A leg jumps to the other side partway through (`leg_crossing:` flag) | Left/right identity flipped at a crossing | `gridframe` on frames just after it, mark both paws, `fit --marks <file> --span A:B` |
 | Left and right are exchanged for the whole clip | A mirrored lead | Not a failure; the silhouette is the same |
 | Thin legs lose track in a gallop | Legs overlap for several frames | Mark every few frames through the overlap, then one `fit --span` over all of it |
+| Paws match but the elbow/wrist fold is wrong | Endpoint matches do not constrain the articulated joints | Inspect the registered source frame; add supported `jointFrames` bone-head landmarks, keep existing `frames` paw-tail marks, and `fit --marks <file> --span A:B`. See “Articulated landmarks” below, then rebuild downstream stages |
 | `facts`: "A paw touches down 2 times in one cycle ... leaves no consistent leg identity assignment" | Leg identity flipped inside the loop, and `facts`' own relabelling where the paws meet (`identity` in facts.json) could not make one stride with one touchdown per paw | Mark and refit the span, then `facts` again |
 | The same refusal with identity consistent (both pairs "half -> half, kept") | A touchdown lies outside its paw's backward slide, so the noisy-fit reading does not apply (`reference/motion.md`, Noisy fit); a small rig needs `bodyScale` from its `rig.json` | Check `bodyScale.legLengthM` (a leg chain's first bone missing from `rig.json` keeps the wolf's metres: rerun `contract`); open the lab on that paw's swing |
 | `facts` warns: "Contacts read for a noisy fit" | The strict reading broke stances into fragments inside each paw's backward slide; each stance is the slide (`contactReading`) | Expected on a slow-motion or small-animal fit; check the footfalls in the lab against the video |
@@ -48,6 +49,205 @@
 | `facts`: "no full cycle found in the video" | The masks do not repeat clearly within 0.25-2.5 s (a one-shot, a still clip, or a gait that changes): no dip is prominent, deep against the curve's level, repeated at its multiples and free of a rival dip (`maskPeriod` in the message) | For a loop, generate again; a one-shot needs `"loop": false` in the brief |
 | `facts`: "The averaged cycle ... does not match the video" | The fit chose different poses for repeating silhouettes (joints the outline barely constrains trade angle), so their average misses the masks | `fit` already runs a periodic pass; mark paws on a few frames per cycle and refit, then `facts` again |
 
+### Articulated landmarks
+
+`frames` keys are the contract's `paws` bones; each point targets the paw bone's **tail** (toe endpoint).
+When matching paws still leaves the wrong fold, inspect the source frame and add supported elbow/wrist
+landmarks in optional `jointFrames`, using the existing fitter rather than angle keyframes:
+
+```json
+{"frames": {"47": {"paw_fl": [612, 540]}}, "jointFrames": {"47": {"forearm_fl": [590, 490], "wrist_fl": [604, 525]}}}
+```
+
+`jointFrames` maps ingested frame numbers to **bone names in the brief's fitted chains**, excluding the root.
+Each point targets that bone's **head**: a forearm's head is the elbow; a wrist bone's head is the wrist.
+Use your rig's actual names, not the example names. All points are finite numeric `[imageX, imageY]` in the
+full-size registered image/grid (top-left origin, x right, y down), not source-video or working-mask pixels;
+the fitter applies `workScale` once. Mark only joints supported by the inspected source, not hidden anatomy
+inferred from a toe. Frame numbers are zero-based after ingest's pulldown removal.
+Padded frame keys such as `"00047"` target frame 47 in both fit and lab. Within either map, two keys
+resolving to the same frame are rejected rather than silently replacing observations; the original marks file
+remains unchanged and hash-bound.
+
+Paw and joint distances share the existing manual-mark mean and weight. Pair identity uses that pair's marked
+paw tails and bone heads; no joint-angle targets or new priors are added. Paw-only files remain supported.
+`--marks` replaces the complete file, so retain earlier observations in both maps; omitting it reuses the
+stored file. The lab lists each frame's manual landmarks, and review/export retain the hash-bound marks file.
+Refitting clears downstream facts/bake/review/verify stages: rebuild them after a landmark change.
+
+### Source articulation checkpoint
+
+For new animation work, select representative registered support/stance, push-off, fold/recovery,
+extension and crossing poses as applicable and run the checkpoint before a full fit. Record the observed
+phase explicitly; do not invent landmarks for phases/joints the source does not expose.
+The optional CLI argument exists for legacy compatibility, not as guidance to skip assessment on new work.
+Use actual contract bone names. The separate sidecar does not replace `frames` or `jointFrames` marks:
+
+```json
+{
+  "schemaVersion": 1,
+  "source": {"videoSha256": "<sha256 of ingested source video>", "coordinateSpace": "registered_source_px"},
+  "frames": {
+    "82": {"phase": "fold", "observations": [
+      {"id": "visible-elbow", "bone": "forearm_R", "end": "head", "point": [785, 410],
+       "uncertaintyPx": 12, "visibility": "visible", "correspondence": "tentative"},
+      {"id": "visible-toe", "bone": "paw_front_R", "end": "tail", "point": [728, 469],
+       "uncertaintyPx": 4, "visibility": "visible", "correspondence": "tentative"}
+    ]}
+  }
+}
+```
+
+The example preserves the retained wolf probe's tentative screen-side correspondence: it **cannot pass**.
+Do not relabel that correspondence as confirmed without source-grounded evidence. Coordinates are finite
+registered-image positions, not raw video pixels or working-mask pixels. Every visible position needs
+positive finite `uncertaintyPx`, a source-pixel radius. `head` supports fitted non-root chain bones;
+`tail` supports contract paws. IDs and targets are distinct within each frame. Unsupported/duplicate targets,
+invalid frames and source hash mismatches are rejected. `visibility` is `visible`, `occluded` or
+`out_of_frame`; `correspondence` is `confirmed`, `tentative` or `ambiguous`. Hidden points may omit
+coordinates and uncertainty; no hidden target is invented.
+
+Run `preflight --source-observations <file>` after ingest. It solves only the specified frames with the
+existing camera/search/objective and stores isolated poses, mesh projection, report, assessment and lab under
+`articulation/preflight/`; no full fit is required, and canonical fit files/ledger are untouched. Open its lab:
+source outline, projected mesh, actual rig skeleton, source uncertainty circles and projected-point residual
+lines are visible together. Per-point residuals are also reported numerically in source pixels and uncertainty
+units, separately from IoU and objective terms. Phase/frame coverage is explicit; a fold-only checkpoint
+does not claim full-motion recovery.
+
+Only visible, confirmed observations contribute a squared normalized residual to the existing objective.
+Independent assessment passes an observation only when its projected landmark is within the recorded
+uncertainty radius (boundary included). Missing projections and hidden/tentative/ambiguous observations
+remain unresolved, not zero-error passes. Neither silhouette score nor matching toes overrides a joint miss.
+No uncertainty-free acceptance, weight/limit relaxation or explanation override exists.
+
+For these usable source observations, the existing fitter also takes coupled numerical steps in
+its own root/camera/joint parameters. A numerical Cartesian landmark Jacobian and the curvature of
+distance to the original uncertainty disks guide bounded restoration; first-hit parameter bounds
+can be released when another coupled direction is available. No artificial interior point targets,
+new pose priors or expanded uncertainty disks define acceptance. Once feasible, refinement improves
+the unchanged silhouette/marks/prior objective while retaining feasibility. Current rig limits and
+fixed-camera passes remain binding.
+Before writing output, the fitter checks the actual Blender bone projections used for the saved
+landmarks. A small bounded correction can restore a NumPy/Blender boundary mismatch using that
+exact oracle, with the shared camera fixed and the original uncertainty disks unchanged. Failure
+remains unresolved; neither floating-point disagreement nor a nearly passing point expands acceptance.
+
+The output still uses one shared camera, not a separately chosen camera for each observed frame.
+With usable observations, the median is only a seed: camera scale and observed poses are restored
+jointly, and candidate selection judges all their source disks before the unchanged objective.
+Without usable observations, camera selection and search retain their legacy behavior. Frame and
+relabel candidate selection likewise prefer disk feasibility over lower soft-objective or identity
+cost; relabelling cannot trade away an established source disk.
+
+Per-frame `constraintSearch` diagnostics recompute final normalized error after the shared camera,
+relabelling and refinement. Its local passes include `initialRestoration`: bounded per-round errors,
+linearized singular values, bound-active outcomes, proposed steps, actual line-search merit and a
+stopping reason. The pass's `iterations` counts objective-refinement iterations, not restoration
+rounds: `iterations: 1` can mean restoration remained unresolved before objective refinement began.
+`unresolved` means this bounded search did not find feasibility, never that the rig/source is
+globally impossible. Numerical search diagnostics do not override independent landmark assessment.
+Passing every disk is still insufficient without the existing whole-body silhouette gate and visual
+review; a displaced torso or head remains unacceptable. Phase labels identify source evidence only:
+they do not manufacture pose priors or targets for unobserved joints.
+
+For a constructive diagnostic only, `preflight --witness <poses.json>` can project retained plausible or
+fixture poses using the current rig and registered camera, validate parameter names, finite values,
+current limits and camera scale, independently assess the witness observations, and compare both poses under
+the same full-resolution objective with no temporal/periodic prior. It does not seed the search, alter a fit
+or author shipping keys. A passing witness proves that recorded configuration feasible; a strictly better
+witness objective identifies a search miss, while a strictly preferred failed fit identifies objective
+rejection. Ties, invalid/nonpassing witnesses and unsuccessful searches without a witness remain unresolved.
+No finite failed search is reported as rig impossibility.
+Keep witnesses outside `articulation/preflight/`: paths resolving into the output folder (including symlinks)
+are rejected before any preflight write, so the hashed witness remains the exact input used in diagnosis.
+
+`fit --source-observations <file>` (or reuse stored observations) requires that same sidecar's current passing
+preflight, then automatically assesses the canonical fit. `assess` recomputes its assessment without solving.
+Evidence binds the observation file, source video and selected registered frames, model, rig/project
+contract, brief/limits, ingest metadata/camera/masks, pose/mesh projection and implementation hashes.
+Changing any binding invalidates acceptance. `facts`, `bake`, `review`, `verify` and `export` require the
+current canonical assessment to pass; changing marks/fit still invalidates the ordinary ledger stages.
+The review template binds both observations and assessment, and export includes them. Preflight records
+independent `articulation/enrollment.json` before solving; retained assessments also preserve the observation
+binding. A deleted recorded sidecar is missing evidence even before the first full fit, never a way to regain
+legacy status. Workspaces that never recorded observations retain their old workflow, with `not_assessed`
+explicitly shown in the lab.
+
+### Visible contour checkpoint (without invented joints)
+
+When a folded limb is visibly wrong but the elbow or wrist is hidden, record its visible silhouette,
+not a guessed anatomical landmark. `preflight --silhouette-regions <file>` works without
+`--source-observations`; both may also be supplied together. Use schema version 1:
+
+```json
+{
+  "schemaVersion": 1,
+  "source": {
+    "videoSha256": "<accepted source video SHA-256>",
+    "coordinateSpace": "registered_source_px"
+  },
+  "frames": {
+    "85": [{
+      "id": "folded-recovery",
+      "bounds": [730, 435, 820, 525],
+      "visibility": "visible",
+      "minIoU": 0.85,
+      "weight": 1.0
+    }]
+  }
+}
+```
+
+Bounds are registered-source pixels with exclusive right/bottom. The same crop applies to source
+and fitted masks: floor left/top and ceil right/bottom after multiplying by working scale.
+Each named region adds its weighted local `100 * (1 - IoU)` loss to the existing fitter objective;
+the whole-body silhouette, marks, source uncertainty disks, joint limits and priors are unchanged.
+`weight` balances recorded regions, never changes their individual acceptance threshold.
+Unknown, occluded, out-of-frame or empty-source regions cannot certify acceptance.
+
+On region-observed frames, candidate selection preserves the original source-disk priority, then
+whole-body feasibility, then local-region feasibility before comparing the augmented objective.
+An initially invalid body can improve its full-working-resolution overlap toward the unchanged
+threshold; there is no infinite rejection barrier trapping the initial pose. Once body-feasible,
+soft local gains cannot buy a body-gate failure. Grid/coordinate search, restart candidates,
+joint restoration proposals, relabels and shared-camera selection use this regional ordering.
+The shared camera also checks the full-fit mean, not only the region-observed frames.
+These decisions use the existing full-resolution sampled occupancy as a search surrogate, with
+bounded per-pose caching; only the independently rasterized final Blender geometry certifies a pass.
+Coarse pyramid crops zero-extend a twice-rounded missing edge identically in both masks, never
+inventing intersection or changing the source region. Final acceptance crops are not padded.
+
+`fit --silhouette-regions <file>` requires that exact sidecar's current passing preflight; subsequent
+fits reuse enrolled regions. The pipeline independently rasterizes the saved actual Blender mesh
+projection, rather than trusting sampled optimizer occupancy or a claimed pose metric. Every
+visible region must meet its `minIoU`; the unchanged brief `iouThreshold` must also pass for the
+whole-fit mean and every region-observed frame. A locally improved paw with a displaced body fails.
+The reports, box overlays, lab and review template expose both local and global results.
+An unsuccessful finite search is not proof of infeasibility; do not lower either bar or fabricate a pass.
+
+Region evidence reuses articulation's hash/current checks and binds source, selected registered frames,
+rig/project, limits/brief, masks/camera metadata, actual poses/projection and implementation. Enrollment
+is retained before Blender runs in `silhouette-regions/enrollment.json`; deleting a recorded sidecar
+does not restore legacy status. `assess` recomputes the region assessment, and `facts`, `bake`, `review`,
+`verify` and `export` require it to be current and passing. Review explanations cannot override it.
+Export includes both the recorded region sidecar and its independent assessment. Workspaces with no
+region enrollment retain their existing fitting and acceptance behavior.
+
+
+
+### Restart noise
+
+**Symptom:** a refit with more (correct, honoured) marks scores lower, swaps "move" to other frames, or a span refit
+looks stuck, and each next attempt seems to make things worse. **Cause:** `fit` uses random restarts (`RESTARTS` per
+chain per tracked frame) from one stream; the default seed is fixed, so identical inputs repeat exactly, but any input
+change reshuffles every later restart. A single before/after pair confounds the change with restart luck.
+**Fix:** treat each fit as one draw. Copy the work folder per run and fit each condition with `fit --seed N` for
+N = 1, 2, 3 (plus the seed-0 run you have), run `facts` on each, and compare distributions (facts averaged-cycle IoU,
+fit meanIoU, per-paw cross-cycle spread). Decide on the spread; never declare a block from one draw. The seed is in
+the ledger's fit facts and `poses.json` (`restartSeed`). Choosing the best seed to ship is allowed only by the same
+unchanged gates and review; it is not averaging and never lowers a threshold.
+
 ## Review, verify, export
 
 | Symptom | Cause | Fix |
@@ -67,3 +267,17 @@
 | `verify`: "not an activation-suppressed capture" or "lists no phone/tablet captures" | The run did not go through the launcher | Pass the project's activation-suppressed launcher; never run an engine in the foreground |
 | `verify`: "Expected Godot 4.7" or "4.5" | The wrong binary for that flag | Pass each engine to its own flag |
 | `export` refuses the destination | It is inside `game/assets`, or it exists | Export to a new folder under `asset-work`; shipping is the owner's decision |
+
+## Rationalizations (from agents without this skill)
+
+| Thought | Reality |
+|---|---|
+| "None of the scripts named below exist yet. I would write them" | They exist: the command table. |
+| "Timing and stride come from re-timing to 24 frames and from the paw-planting step" | `ingest` and `facts` measure them. |
+| "Replace only the `lope` samplers and accessors in the GLB with pygltflib" | `bake` writes an evaluation GLB. |
+| "Under the project's rule for image models, the harness or the owner picks the model" | That rule is for images. The owner names the video model, or a criterion. |
+| "The footfall phases … decide that" / "Hold the far legs to the near legs' phase offset" | Marks and `fit --span` decide identity. |
+| "Depth is not observed … It comes from priors" / "It mostly happens in the side plane" | Unseen depth is why you refuse. |
+| "Steps 1–8 are ordinary Blender and Python work" / "try `parent_set(type='ARMATURE_AUTO')` first" | Rigging is game-asset-3d-pipeline's. Hand it over. |
+| "If it passes: I'll replace only the `lope` animation in `wolf.glb`" / "Before overwriting, I'll keep a backup" | Your checks are not approval; a backup is not either. |
+| "Passing these checks isn't your artistic sign-off" (then planning the copy) | Approval precedes writing `game/assets`. Stop at `export`. |

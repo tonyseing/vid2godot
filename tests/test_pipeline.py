@@ -31,6 +31,32 @@ class PipelineTests(unittest.TestCase):
         code, data, _ = run("status", "--work", str(self.tmp / "w"))
         self.assertEqual((code, data["next"]), (0, "contract"))
 
+    def test_generate_no_audio_reaches_run_generate(self):
+        from unittest import mock
+        from anim import pipeline
+        from anim.ledger import Ledger
+        model, work = self.tmp / "m.glb", self.tmp / "w"
+        model.write_bytes(b"x")
+        run("init", "--work", str(work), "--model", str(model), "--clip", "lope")
+        ledger = Ledger(work)
+        (work / "brief.json").write_text(json.dumps({"clip": "lope"}))
+        (work / "meta.json").write_text(json.dumps({"background": "#c8c8c8"}))
+        (work / "ref.png").write_bytes(b"png")
+        ledger.record("contract", {}, {"contract": work / "brief.json"})
+        ledger.record("brief", {}, {"brief": work / "brief.json"})
+        ledger.record("reference", {}, {"image": work / "ref.png", "meta": work / "meta.json"})
+        def fake(client, folder, *args, **kwargs):
+            folder.mkdir(parents=True, exist_ok=True)
+            (folder / "record.json").write_text("{}")
+            return {"spentUsd": 0.0, "warnings": [], "candidates": []}
+
+        for extra, expected in (((), None), (("--no-audio",), False)):
+            with mock.patch.object(pipeline.generate_mod, "run_generate", side_effect=fake) as gen, \
+                    mock.patch.object(pipeline, "Client"):
+                code, _, err = run("generate", "--work", str(work), "--model-id", "m", *extra)
+            self.assertEqual(code, 0, err)
+            self.assertIs(gen.call_args.kwargs["audio"], expected)
+
     def test_status_without_ledger_is_an_error(self):
         code, _, err = run("status", "--work", str(self.tmp / "none"))
         self.assertEqual(code, 1)

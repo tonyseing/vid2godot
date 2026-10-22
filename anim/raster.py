@@ -1,7 +1,6 @@
 """Rasterise the fitted model's projected triangles, score them against the video mask, draw review overlays."""
 import numpy as np
 from PIL import Image, ImageDraw
-from scipy import ndimage
 
 LEFT, RIGHT = (255, 140, 0), (40, 120, 255)
 
@@ -20,6 +19,8 @@ def iou(a, b):
 
 
 def outline(mask):
+    from scipy import ndimage
+
     return mask & ~ndimage.binary_erosion(mask)
 
 
@@ -43,6 +44,8 @@ def score_fit(poses, projection_npz, masks_npz, threshold, ingest_flags):
         fitted = rasterize(uv[f], faces, masks.shape[2], masks.shape[1])
         flags = list(entry.get("flags", [])) + list(ingest_flags.get(str(f), []))
         frames.append({"index": f, "iou": round(iou(fitted, masks[f]), 4), "flags": flags})
+        if "objective" in entry:
+            frames[-1]["objective"] = entry["objective"]
     low = [item["index"] for item in frames if item["iou"] < threshold or item["flags"]]
     return {"frames": frames, "meanIoU": round(float(np.mean([item["iou"] for item in frames])), 4),
             "lowFrames": low}

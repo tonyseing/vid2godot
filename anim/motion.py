@@ -29,23 +29,29 @@ Vole round 5 (a 5.3 Hz, 46 mm-leg body): every stride gets at least MIN_KEYS_PER
 rate rises above KEY_RATE for a fast stride), the ease is a share of the stride (`PinRelease.span_stride`), an eased
 paw never goes below the ground it is pinned to, and where a pin lies beyond the leg's reach from the fit's pose the
 front leg's girdle (scapula) swings about its head (`solve_leg`) and, past the whole straight leg's reach, the body
-comes down by the least smooth amount that reaches (`reach_drop`). None of it changes the wolf lope's keys.
+comes down by the least smooth amount that reaches (`reach_drop`).
 
 Vole round 6: the trunk, neck and tail are held to the bar as the keys play them (`for_keys`: no harmonic above the
 keys', the 60 Hz played jerk under JERK_MAX, the range and a changed column's world pitch range kept at the keys);
 the knee bends to the rig's rest side (`solve_leg`); no played paw goes under its ground by more than PENETRATION_M
 scaled to the body (`clear_ground`), a paw near its agreement gate is settled at its contact edges
-(`settle_edges`), and the loop starts where the seam has no velocity jump (`seam_jumps`, `seam_shift`). Still
-none of it changes the wolf lope's keys.
+(`settle_edges`), and the loop starts where the seam has no velocity jump (`seam_jumps`, `seam_shift`).
 
 Vole round 7: a settled edge crosses the bar's contact height at the declared edge as played (`settle_edges`), and a
-settled paw's swing that comes back down into that height is lifted out of it (`clear_swing`). The wolf lope's keys
-are unchanged.
+settled paw's swing that comes back down into that height is lifted out of it (`clear_swing`).
+
+Girdled chains use their redundant angle before the analytic reach/toe-pivot fallback: original world foot frame
+preserved, endpoint and original fitter boxes constrained, uniform full-chain angle change minimized locally.
+All contact, clearance and edge/swing solves receive the brief's original fit-search limits for this new
+preservation candidate. If unresolved, the original analytic correction remains unchanged; existing downstream
+contact and motion gates still apply.
 
 numpy only."""
 from typing import NamedTuple
 
 import numpy as np
+
+from anim import fitconstraints
 
 KEY_RATE = 60.0          # the bake's key rate (Hz of the played clip) ...
 # ... raised for a fast stride so every stride gets at least MIN_KEYS_PER_STRIDE keys (vole round 5: the 5.3 Hz vole
@@ -104,6 +110,8 @@ CLEARANCE_SUBSAMPLES = 25   # samples per key interval the played paws are check
 CLEARANCE_ROUNDS = 8     # lift-and-solve passes at most
 SWING_CLEARANCE = 1.5    # vole round 7: a swing that comes down into contact is lifted to this many contact heights
 EDGE_SOLVE_ROUNDS = 8    # vole round 7: passes that put a settled edge's played crossing on the declared edge
+IK_ENDPOINT_M = 1e-6      # actual FK endpoint tolerance of a certified contact-IK candidate
+IK_GIRDLE_SAMPLE_DEG = 1.0  # bounded scalar branch seeds when refinement from the incoming pose is unresolved
 
 
 def rotate(phi, points):
@@ -497,7 +505,128 @@ def cross(a, b):
     return a[..., 0] * b[..., 1] - a[..., 1] * b[..., 0]
 
 
-def solve_leg(rig, values, names, chain, paw_bone, target, pivot=True):
+def solve_leg(rig, values, names, chain, paw_bone, target, pivot=True, limits_deg=None, preserve_source=True):
+    """Pin a paw, preserving its original world foot frame before considering toe pivot.
+
+    A fitted girdle supplies one redundant angle. The existing analytic pair reconstructs
+    the other angles; original joint boxes and the actual FK endpoint constrain the
+    existing fitter refinement, whose objective is uniform full-chain squared change.
+    This local search is not an infeasibility certificate. If unresolved or a frozen
+    input angle is outside its fit-search box, the original analytic reach/toe-pivot
+    correction is retained unchanged; these boxes are not new downstream acceptance
+    limits. The actual FK endpoint is returned for the existing contact gates.
+    Without a fitted girdle the original analytic behavior is unchanged. ``pivot=False``
+    disables pivoting in the analytic fallback, not fixed-foot redundancy.
+    ``limits_deg`` is the brief's original fit-search boxes, defaulting to [-60, 60].
+    Primary pins preserve a fitted source pose's articulation. Secondary corrections
+    use ``preserve_source=False``: keep already-corrected support when the fixed-foot
+    analytic pair reaches, and invoke redundant recovery only if that pair misses.
+    """
+    (upper, lower), foot = ik_bones(chain)
+    index = {n: i for i, n in enumerate(names)}
+    girdle = girdle_bone(rig, chain, upper)
+    if girdle is None or girdle not in index:
+        return _solve_leg_analytic(rig, values, names, chain, paw_bone, target, pivot=pivot)
+    missing = [b for b in (upper, lower, foot[0]) if b not in index]
+    if missing:
+        raise ValueError(f"leg IK turns {missing}, which the fit did not solve")
+    values = np.atleast_2d(np.asarray(values, float))
+    target = np.broadcast_to(np.asarray(target, float), (len(values), 2))
+    limits = {} if limits_deg is None else limits_deg
+    fitted = [b for b in chain if b in index]
+    columns = np.array([index[b] for b in fitted])
+    boxes = np.radians([limits.get(b, [-60, 60]) for b in fitted])
+    low, high = boxes[:, 0], boxes[:, 1]
+    if not np.isfinite(boxes).all() or np.any(low >= high):
+        raise ValueError("leg IK original limits must be finite [low, high] with low < high")
+    active = [index[b] for b in (girdle, upper, lower, foot[0])]
+    frozen = [b for b in fitted if index[b] not in active]
+    eligible = np.ones(len(values), bool)
+    for bone in frozen:
+        lo, hi = np.radians(limits.get(bone, [-60, 60]))
+        eligible &= (values[:, index[bone]] >= lo) & (values[:, index[bone]] <= hi)
+    out = np.array(values, float, copy=True)
+    g_column, wrist_column = index[girdle], index[foot[0]]
+    g_low, g_high = np.radians(limits.get(girdle, [-60, 60]))
+    midpoint, halfwidth = (low + high) / 2, (high - low) / 2
+    for row, (origin, goal) in enumerate(zip(values, target)):
+        if not preserve_source:
+            pair, _ = _solve_leg_analytic(rig, origin[None], names, chain, paw_bone, goal[None], pivot=False)
+            endpoint = rig.point(rig.pose(pair, names), paw_bone)[0]
+            if np.linalg.norm(endpoint - goal) <= IK_ENDPOINT_M:
+                out[row] = pair[0]
+                continue
+        def search():
+            def reconstruct(g):
+                supplied = origin.copy()
+                delta = g[0] - origin[g_column]
+                supplied[g_column] = g[0]
+                supplied[wrist_column] -= delta
+                solved, _ = _solve_leg_analytic(rig, supplied[None], names, chain, paw_bone, goal[None],
+                                                pivot=False)
+                return solved[0]
+
+            def objective(g):
+                change = (reconstruct(g)[columns] - origin[columns]) / np.radians(60.)
+                return float(change @ change)
+
+            def residuals(g):
+                candidate = reconstruct(g)
+                endpoint = rig.point(rig.pose(candidate[None], names), paw_bone)[0]
+                box_rows = np.column_stack(((candidate[columns] - midpoint) / halfwidth,
+                                            np.zeros(len(columns))))
+                return np.vstack(((endpoint - goal) / IK_ENDPOINT_M, box_rows))
+
+            def feasible(g):
+                norms = np.linalg.norm(residuals(g), axis=1)
+                return bool(np.isfinite(norms).all() and np.all(norms <= 1. + fitconstraints.TOL))
+
+            def clamp(g):
+                return np.clip(g, g_low, g_high)
+
+            def refine(seed):
+                return fitconstraints.refine(seed, objective, residuals, clamp, np.array([np.radians(8.)]))[0]
+
+            angle = refine(clamp(np.array([origin[g_column]])))
+            if feasible(angle):
+                return reconstruct(angle)
+            # Analytic derived angles can wrap or switch reach branches. Failure from
+            # one seed says nothing about other bounded scalar branches. Keep the best
+            # certified sample even if subsequent local refinement cannot improve it.
+            intervals = max(1, int(np.ceil(np.degrees(g_high - g_low) / IK_GIRDLE_SAMPLE_DEG)))
+            best, best_value, nearest, violation = None, np.inf, None, np.inf
+            for value in np.linspace(g_low, g_high, intervals + 1):
+                seed = np.array([value])
+                norms = np.linalg.norm(residuals(seed), axis=1)
+                if not np.isfinite(norms).all():
+                    continue
+                excess = np.maximum(norms - 1., 0.)
+                loss = float(excess @ excess)
+                if loss < violation:
+                    nearest, violation = seed, loss
+                if np.all(norms <= 1. + fitconstraints.TOL):
+                    value = objective(seed)
+                    if value < best_value:
+                        best, best_value = seed, value
+            seed = best if best is not None else nearest
+            if seed is not None:
+                refined = refine(seed)
+                if feasible(refined) and (best is None or objective(refined) < best_value):
+                    best = refined
+            return reconstruct(best) if best is not None else None
+
+        candidate = search() if eligible[row] else None
+        if candidate is not None:
+            out[row] = candidate
+        else:
+            candidate, _ = _solve_leg_analytic(rig, origin[None], names, chain, paw_bone, goal[None], pivot=pivot)
+            # Fit-search boxes constrain only the new preservation candidate. Keep
+            # the historically accepted analytic correction unchanged when unresolved.
+            out[row] = candidate[0]
+    return out, rig.point(rig.pose(out, names), paw_bone)
+
+
+def _solve_leg_analytic(rig, values, names, chain, paw_bone, target, pivot=True):
     """Two-bone IK in the side plane: new values (S, V) with the chain's pair and first foot bone turned so the paw
     bone's tail reaches `target` (S, 2) while the foot keeps its world orientation and the knee bends the way it
     bent. Where the pair cannot reach, `pivot` turns the foot about the pinned toe (the heel lifts, as at the end of a
@@ -658,7 +787,7 @@ def quintic(s):
 
 
 def plan_keys(rig, smooth, names, project, windows, stride, rest, lift, n_keys, blend=None, release=None,
-              reach=True, clearance=None):
+              reach=True, clearance=None, limits_deg=None):
     """The bake's keys: n_keys + 1 value vectors at phases k / n_keys (the last repeats the first), the smooth cycle
     with its root lifted by `lift` and every planted paw pinned to its world-still line (`pin_lines`) over its
     contact window less `release.inset_keys` at each end (`release_windows`). Outside, the paw's target is the free
@@ -738,7 +867,7 @@ def plan_keys(rig, smooth, names, project, windows, stride, rest, lift, n_keys, 
         keys[:, names.index("dz")] -= drop
         dense[:, names.index("dz")] -= np.interp(grid, np.append(phases, 1.0), np.append(drop, drop[0]))
         plan = targets(keys, dense)
-    report = {}
+    report, preservation = {}, {}
     for chain, (target, pinned, eased, line) in plan.items():
         live = pinned | eased
         if not live.any():
@@ -747,7 +876,11 @@ def plan_keys(rig, smooth, names, project, windows, stride, rest, lift, n_keys, 
         chain_bones = project["chains"][chain]
         girdle = girdle_bone(rig, chain_bones, ik_bones(chain_bones)[0][0])
         before = keys[live, names.index(girdle)].copy() if girdle in names else None
-        solved, reached = solve_leg(rig, keys[live], names, chain_bones, paw_bone, target[live])
+        source = keys[live]
+        if clearance is not None and girdle in names:
+            preservation[chain] = (source, live, chain_bones, paw_bone, target[live], girdle)
+        solved, reached = solve_leg(rig, source, names, chain_bones, paw_bone, target[live],
+                                    limits_deg=limits_deg)
         keys[live] = solved
         residual = np.linalg.norm(reached - target[live], axis=1)
         report[chain] = {"pinnedKeys": int(np.count_nonzero(pinned)), "easedKeys": int(np.count_nonzero(eased)),
@@ -760,7 +893,33 @@ def plan_keys(rig, smooth, names, project, windows, stride, rest, lift, n_keys, 
             report[chain]["bodyDropMaxM"] = round(float(drop.max()), 6)
     if clearance is not None:
         grounds = {chain: line["z"] for chain, (_, _, _, line) in plan.items()}
-        keys, lifted = clear_ground(rig, keys, names, project, grounds, clearance)
+        for chain, (source, live, bones, paw_bone, target, girdle) in preservation.items():
+            ground = {chain: grounds[chain]}
+            candidate_min = float(played_heights(rig, keys, names, project, ground)[chain].min())
+            if candidate_min >= -clearance:
+                continue
+            legacy, _ = _solve_leg_analytic(rig, source, names, bones, paw_bone, target)
+            reached = rig.point(rig.pose(legacy, names), paw_bone)
+            residual = np.linalg.norm(reached - target, axis=1)
+            if not np.all(residual <= IK_ENDPOINT_M):
+                continue
+            pair, foot = ik_bones(bones)
+            columns = [names.index(b) for b in (girdle, *pair, foot[0])]
+            trial = keys.copy()
+            trial[np.ix_(np.flatnonzero(live), columns)] = legacy[:, columns]
+            legacy_min = float(played_heights(rig, trial, names, project, ground)[chain].min())
+            # Compare complete played chains on identical body/targets. Do not accept
+            # source preservation that worsens an existing ground-clearance violation.
+            if legacy_min <= candidate_min:
+                continue
+            keys = trial
+            report[chain]["maxResidualM"] = round(float(residual.max()), 5)
+            swing = np.abs(wrap(legacy[:, names.index(girdle)] - source[:, names.index(girdle)]))
+            if np.any(swing):
+                report[chain]["girdleSwingMaxDeg"] = round(float(np.degrees(swing.max())), 3)
+            else:
+                report[chain].pop("girdleSwingMaxDeg", None)
+        keys, lifted = clear_ground(rig, keys, names, project, grounds, clearance, limits_deg=limits_deg)
         for chain, amount in lifted.items():
             report.setdefault(chain, {})["clearanceLiftMaxM"] = amount
     keys = np.vstack([keys, keys[:1]])
@@ -779,7 +938,7 @@ def played_heights(rig, keys, names, project, grounds, subsamples=CLEARANCE_SUBS
 
 
 def clear_ground(rig, keys, names, project, grounds, tolerance, rounds=CLEARANCE_ROUNDS,
-                 subsamples=CLEARANCE_SUBSAMPLES):
+                 subsamples=CLEARANCE_SUBSAMPLES, limits_deg=None):
     """Vole round 6: no paw more than `tolerance` under its ground (`grounds`: per chain, its pin's z) anywhere in
     the played cycle, between the keys too (the keys themselves are on or above it). Where a key interval dips deeper,
     both its keys' paws are lifted by the dip and half the tolerance and the leg is solved again to reach them (`solve_leg`: the knee, the pivoting foot and the girdle, with
@@ -806,7 +965,7 @@ def clear_ground(rig, keys, names, project, grounds, tolerance, rounds=CLEARANCE
             paws = rig.paws(keys[index], names, project)[chain]
             target = paws + np.stack([np.zeros(len(index)), need[index]], axis=1)
             keys[index], _ = solve_leg(rig, keys[index], names, project["chains"][chain], project["paws"][chain],
-                                       target)
+                                       target, limits_deg=limits_deg, preserve_source=False)
             lifted[chain] = round(max(lifted.get(chain, 0.0), float(need.max())), 6)
             moved = True
         if not moved:
@@ -989,7 +1148,7 @@ def heglund_taylor_hz(mass_kg):
 
 
 def settle_edges(rig, keys, names, project, chain, release, declared, n_keys, height, ground,
-                 rounds=EDGE_SOLVE_ROUNDS):
+                 rounds=EDGE_SOLVE_ROUNDS, limits_deg=None):
     """Vole round 6: one paw's keys at the edges of its declared contact (`declared`, the pinned window `release`
     widened), so that the played paw plants where facts declares it. The keys inside the declared contact that the
     pin does not hold take the pin (world-still on its ground: its line through the first or last two pinned keys),
@@ -1039,7 +1198,8 @@ def settle_edges(rig, keys, names, project, chain, release, declared, n_keys, he
     index = np.array(sorted(targets))
     target = np.array([targets[k] for k in index], float)
     chain_bones, paw_bone = project["chains"][chain], project["paws"][chain]
-    keys[index], _ = solve_leg(rig, keys[index], names, chain_bones, paw_bone, target)
+    keys[index], _ = solve_leg(rig, keys[index], names, chain_bones, paw_bone, target, limits_deg=limits_deg,
+                               preserve_source=False)
     for k, k_in, w in edges:
         x, z_out = targets[k]
         for _ in range(rounds):
@@ -1049,12 +1209,13 @@ def settle_edges(rig, keys, names, project, chain, release, declared, n_keys, he
             if abs(error) < 1e-3 * height or w <= 1e-6:
                 break
             z_out = max(z_out + error / w, ground + height)
-            keys[[k]], _ = solve_leg(rig, keys[[k]], names, chain_bones, paw_bone, np.array([[x, z_out]]))
+            keys[[k]], _ = solve_leg(rig, keys[[k]], names, chain_bones, paw_bone, np.array([[x, z_out]]),
+                                     limits_deg=limits_deg, preserve_source=False)
     return keys, [int(k) for k in index]
 
 
 def clear_swing(rig, keys, names, project, swings, grounds, height, clearance=SWING_CLEARANCE,
-                rounds=CLEARANCE_ROUNDS, subsamples=CLEARANCE_SUBSAMPLES):
+                rounds=CLEARANCE_ROUNDS, subsamples=CLEARANCE_SUBSAMPLES, limits_deg=None):
     """Vole round 7: no swing comes down into contact. For each chain in `swings` ({chain: (declared window, the key
     indices that must not move: the pinned and settled keys)}), wherever a key interval wholly outside its declared
     contact plays the paw under `height` (the bar's contact height) over its ground (`grounds`), the interval's free
@@ -1087,7 +1248,7 @@ def clear_swing(rig, keys, names, project, swings, grounds, height, clearance=SW
             paws = rig.paws(keys[index], names, project)[chain]
             target = paws + np.stack([np.zeros(len(index)), need[index]], axis=1)
             keys[index], _ = solve_leg(rig, keys[index], names, project["chains"][chain], project["paws"][chain],
-                                       target)
+                                       target, limits_deg=limits_deg, preserve_source=False)
             lifted[chain] = round(max(lifted.get(chain, 0.0), float(need.max())), 6)
             moved = True
         if not moved:

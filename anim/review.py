@@ -3,9 +3,10 @@ import json
 from pathlib import Path
 
 import numpy as np
-from PIL import Image
+from PIL import Image, ImageDraw
 
 from anim import raster
+from anim import marks as marks_mod
 from anim.facts import in_window, motion_contacts
 from anim.ledger import StageError, sha256_file
 
@@ -13,7 +14,8 @@ ARTISTIC_ROUNDS = 2
 TEMPLATE = (Path(__file__).resolve().parent / "lab_template.html").read_text()
 
 
-def draw_overlays(work, poses, projection_npz, masks_npz, out_dir):
+def draw_overlays(work, poses, projection_npz, masks_npz, out_dir, articulation_report=None, work_scale=1.0,
+                  region_report=None):
     projection, masks = np.load(projection_npz), np.load(masks_npz)["masks"]
     height, width = masks.shape[1:]
     out_dir = Path(out_dir)
@@ -26,7 +28,32 @@ def draw_overlays(work, poses, projection_npz, masks_npz, out_dir):
         skeleton = [(points, raster.LEFT if chain.endswith("_L") else raster.RIGHT if chain.endswith("_R")
                      else (255, 255, 255)) for chain, points in entry["joints"].items()]
         path = out_dir / f"{f:05d}.png"
-        raster.overlay(np.array(frame), fitted, masks[f], skeleton).save(path)
+        image = raster.overlay(np.array(frame), fitted, masks[f], skeleton)
+        draw = ImageDraw.Draw(image)
+        assessed = next((row for row in (articulation_report or {}).get("frames", []) if row["index"] == f), {})
+        for item in assessed.get("observations", []):
+            if item.get("point") is None:
+                continue
+            u, v = (float(p) * work_scale for p in item["point"])
+            radius = float(item["uncertaintyPx"]) * work_scale
+            colour = (20, 160, 40) if item["status"] == "pass" else (255, 170, 0)
+            draw.ellipse((u - radius, v - radius, u + radius, v + radius), outline=colour, width=2)
+            draw.text((u + radius + 2, v), item["id"], fill=colour)
+            if item.get("projected") is not None:
+                projected = tuple(float(p) * work_scale for p in item["projected"])
+                draw.line([(u, v), projected], fill=colour, width=2)
+                x, y = projected
+                draw.line([(x - 3, y - 3), (x + 3, y + 3)], fill=colour, width=2)
+                draw.line([(x - 3, y + 3), (x + 3, y - 3)], fill=colour, width=2)
+        local = next((row for row in (region_report or {}).get("frames", []) if row["index"] == f), {})
+        for item in local.get("regions", []):
+            left, top, right, bottom = item["workBounds"]
+            colour = (20, 160, 40) if item["status"] == "pass" else (255, 170, 0)
+            if right > left and bottom > top:
+                draw.rectangle((left, top, right - 1, bottom - 1), outline=colour, width=2)
+            value = f'{item["iou"]:.3f}' if item.get("iou") is not None else "unresolved"
+            draw.text((left, top), f'{item["id"]}: {value} / {item["minIoU"]:.3f}', fill=colour)
+        image.save(path)
         paths.append(path)
     return paths
 
@@ -73,10 +100,12 @@ def motion_summary(facts):
             "contacts": (facts.get("entry") or {}).get("contacts"), "warnings": facts.get("warnings") or []}
 
 
-def lab_page(clip, report, threshold, timeline, hashes, motion=None):
+def lab_page(clip, report, threshold, timeline, hashes, motion=None, marks=None):
     data = {"clip": clip, "report": report, "threshold": threshold, "timeline": timeline, "hashes": hashes}
     if motion is not None:
         data["motion"] = motion
+    if marks is not None:
+        data["marks"] = marks_mod.normalize(marks)
     # No "<" reaches the page, so a "</script>" or "<!--<script" in a clip name or flag cannot end the inline
     # script or start an HTML comment in it; JSON reads "\u003c" back as "<".
     return TEMPLATE.replace("__DATA__", json.dumps(data).replace("<", "\\u003c"))
@@ -84,12 +113,16 @@ def lab_page(clip, report, threshold, timeline, hashes, motion=None):
 
 def make_template(clip, bound, report, round_number):
     by_index = {f["index"]: f for f in report["frames"]}
-    return {"schemaVersion": 1, "clip": clip,
+    template = {"schemaVersion": 1, "clip": clip,
             "bound": {name: {"path": str(path), "sha256": sha256_file(path)} for name, path in bound.items()},
             "reviewer": "", "verdict": "", "inspectedReference": False, "inspectedOverlays": False,
             "inspectedSheet": False, "observations": "", "artisticRound": round_number,
+            "articulation": report.get("articulation", {"status": "not_assessed"}),
             "lowFrames": [{"frame": i, "iou": by_index[i]["iou"], "flags": by_index[i]["flags"], "action": "",
                            "note": ""} for i in report["lowFrames"]]}
+    if "silhouetteRegions" in report:
+        template["silhouetteRegions"] = report["silhouetteRegions"]
+    return template
 
 
 def _is_frame_item(item):
@@ -129,6 +162,10 @@ def validate(review, template):
     for name, item in template["bound"].items():
         if not Path(item["path"]).is_file() or sha256_file(item["path"]) != item["sha256"]:
             problems.append(f"{name} changed after the template was made; review the new output")
+    if review.get("verdict") == "pass" and template.get("articulation", {}).get("status") not in (None, "pass", "not_assessed"):
+        problems.append("Articulation is not passing; review explanations cannot override source observations")
+    if review.get("verdict") == "pass" and template.get("silhouetteRegions", {}).get("status") not in (None, "pass", "not_assessed"):
+        problems.append("Silhouette regions are not passing; explanations cannot override visible source contours or body gates")
     if not review.get("reviewer"):
         problems.append("reviewer is empty")
     if review.get("verdict") not in ("pass", "fail"):

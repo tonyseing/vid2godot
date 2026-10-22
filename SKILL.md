@@ -29,11 +29,13 @@ From the project root: `python3 <skill>/anim/pipeline.py <command> --work asset-
 | `contract --project-contract <json>` | Check the rig |
 | `brief --file <json>` | `clip subject motion gait loop planar videoSeconds`; a loop needs two cycles. Small fast animal: `slowMotion` |
 | `reference` | Open `reference/reference.png` |
-| `generate --model-id <id> [--max-cost USD]` | Two candidates |
+| `generate --model-id <id> [--max-cost USD] [--no-audio]` | Two candidates (`--no-audio` sends `generate_audio: false`) |
 | `accept --candidate N --checks <json>` | After opening both strips and full frames (`reference/prompting.md`) |
 | `ingest` | Drops pulldown repeats; read `flags`, `warnings` |
-| `fit` | Clip-wide camera scale and leg identity; restarts, swaps, a periodic second pass. Prints `lowFrames` |
+| `preflight --source-observations <json> [--witness <diagnostic-poses.json>]` | Independently solve representative source frames with the existing fitter before a full fit. Open `articulation/preflight/lab.html`; inspect source, projected mesh/skeleton, uncertainty and residuals. Never writes canonical fit or ledger stages |
+| `fit [--source-observations <json>] [--seed N]` | Clip-wide camera scale and leg identity; restarts, swaps, a periodic second pass. `--seed` picks the restart draw (recorded; omitted = seed 0). With observations, requires current passing preflight and writes independent articulation assessment in addition to `lowFrames` |
 | `lab` | Open `review/lab.html`, every low frame's overlay |
+| `assess` | Reassess current canonical fit against stored source observations; does not refit or waive failures |
 | `gridframe --frame N`; `fit --marks <json> --span A:B` | Fix flips (below) |
 | `facts [--mass-kg KG] [--accept-gait REASON] [--accept-retime REASON]` | Period and averaged cycle from the video (refused under 0.85 IoU); contacts from the motion (grounded, world-still, leg-scaled). Refuses footfalls unlike the brief's `gait` unless accepted; refuses a stride under 10 frames (`slowMotion`); retimes a slow video to the gait's body-size cadence band (brief `massKg` or `--mass-kg`); keys (24+ per stride) pin planted paws above ground, trunk within 60 Hz jerk; rechecked. `reference/motion.md` |
 | `bake` | Keys facts' cycle; refuses if a paw misses facts' pin. Open `bake/sheet.png`, `bake/closeup.png` |
@@ -52,7 +54,30 @@ add them to one marks file (`--marks` replaces the last), `fit --marks marks.jso
 {"frames": {"47": {"paw_fl": [612, 540], "paw_fr": [655, 538]}}}
 ```
 
-Keys are the contract's `paws` bones. More fixes: `reference/failures.md`.
+`frames` targets contract paw **tails**. If paws match but the fold is wrong, optional `jointFrames`
+(`frame → fitted non-root bone → [x,y]`) targets bone **heads**: forearm = elbow, wrist = wrist.
+Use visible, inspected source joints in registered-image pixels; never infer hidden anatomy from toes.
+Keep earlier marks when replacing the file. Schema, validation, provenance and refit instructions:
+`reference/failures.md`, “Articulated landmarks”.
+
+For new animation work, inspect representative source support/stance, push-off, fold/recovery,
+extension and crossing poses as applicable; record uncertainty-bearing observations and run `preflight`
+before the full fit. The optional CLI argument preserves legacy compatibility, not a recommendation to
+skip the checkpoint. See `reference/failures.md`, “Source articulation checkpoint”.
+`jointFrames` alone is a fitting input, not evidence that articulation passed.
+A matched toe or high IoU cannot excuse a missed elbow.
+Recorded hidden/ambiguous/tentative correspondence remains unresolved even when projected points match.
+`facts`, `bake`, `review`, `verify` and `export` block when recorded articulation evidence fails or is stale.
+Legacy workspaces remain usable and explicitly show `not_assessed`, never an implied articulation pass.
+One fold observation only supports that fold; it cannot verify recovery over unobserved motion phases.
+
+### Restart noise: one fit is one draw
+
+Restarts are random, so any change to marks, spans or inputs reshuffles every later restart: a refit that scores
+worse (fit IoU, facts' averaged cycle, identity spread) may be a bad draw, not a bad change. Before calling a
+change worse or better, or a clip blocked, run each side with at least three `--seed` values in separate work copies
+and compare the spread, not single numbers. A gate still judges the one fit you ship; seeds never average a gate.
+See `reference/failures.md`, “Restart noise”.
 
 ## Shipping
 
@@ -60,16 +85,5 @@ Keys are the contract's `paws` bones. More fixes: `reference/failures.md`.
 is mechanical, not approval: the clip enters the game only once the owner approves. Owner notes ("frame 47, legs
 jump back") become marks or a span refit and a new review; after two failed artistic rounds, ask whether to go on.
 
-## Rationalizations (from agents without this skill)
-
-| Thought | Reality |
-|---|---|
-| "None of the scripts named below exist yet. I would write them" | They exist: the command table. |
-| "Timing and stride come from re-timing to 24 frames and from the paw-planting step" | `ingest` and `facts` measure them. |
-| "Replace only the `lope` samplers and accessors in the GLB with pygltflib" | `bake` writes an evaluation GLB. |
-| "Under the project's rule for image models, the harness or the owner picks the model" | That rule is for images. The owner names the video model, or a criterion. |
-| "The footfall phases … decide that" / "Hold the far legs to the near legs' phase offset" | Marks and `fit --span` decide identity. |
-| "Depth is not observed … It comes from priors" / "It mostly happens in the side plane" | Unseen depth is why you refuse. |
-| "Steps 1–8 are ordinary Blender and Python work" / "try `parent_set(type='ARMATURE_AUTO')` first" | Rigging is game-asset-3d-pipeline's. Hand it over. |
-| "If it passes: I'll replace only the `lope` animation in `wolf.glb`" / "Before overwriting, I'll keep a backup" | Your checks are not approval; a backup is not either. |
-| "Passing these checks isn't your artistic sign-off" (then planning the copy) | Approval precedes writing `game/assets`. Stop at `export`. |
+Do not bypass these stages with a substitute fitter, angle keys or GLB patcher.
+See `reference/failures.md` for detailed failure remedies and pipeline guardrails.

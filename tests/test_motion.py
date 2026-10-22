@@ -187,6 +187,143 @@ class LegIkTests(unittest.TestCase):
             motion.ik_bones(["up", "paw"])
 
 
+class RedundantLegIkTests(unittest.TestCase):
+    """A target constructed from a bent, fixed-foot pose is not a straight-leg mandate."""
+
+    def setUp(self):
+        points = [(-0.3, 0.0), (0.0, -0.4), (0.17, -0.87), (0.0, -1.34),
+                  (0.05, -1.42), (0.12, -1.42)]
+        self.chain = ["girdle", "upper", "lower", "wrist", "paw"]
+        bones = [{"name": "body", "parent": None, "head": [-0.3, 0, 0], "tail": [0, 0, 0]}]
+        for i, bone in enumerate(self.chain):
+            a, b = points[i], points[i + 1]
+            bones.append({"name": bone, "parent": "body" if i == 0 else self.chain[i - 1],
+                          "head": [a[0], 0, a[1]], "tail": [b[0], 0, b[1]]})
+        self.rig = motion.PlanarRig({"bones": bones})
+        self.names = ["dx", "dz", "body"] + self.chain
+        self.values = np.zeros((1, len(self.names)))
+        self.witness = self.values.copy()
+        self.witness[0, self.names.index("girdle")] = np.radians(10)
+        self.witness[0, self.names.index("upper")] = np.radians(-10)
+        self.target = self.rig.point(self.rig.pose(self.witness, self.names), "paw")
+
+    def bend(self, values):
+        posed = self.rig.pose(values, self.names)
+        a, b, c = (self.rig.point(posed, n, "head")[0] for n in ("upper", "lower", "wrist"))
+        return np.degrees(np.arccos(np.clip(np.dot(b - a, c - b) /
+                                           np.linalg.norm(b - a) / np.linalg.norm(c - b), -1, 1)))
+
+    def assert_pose_contract(self, solved, reached, limits=None):
+        np.testing.assert_allclose(reached, self.target, atol=1e-6, rtol=0)
+        posed = self.rig.pose(solved, self.names)
+        np.testing.assert_allclose(self.rig.point(posed, "paw"), reached, atol=1e-12, rtol=0)
+        np.testing.assert_allclose(posed[0]["wrist"], 0, atol=1e-9, rtol=0)
+        frozen = [self.names.index(n) for n in ("dx", "dz", "body", "paw")]
+        np.testing.assert_array_equal(solved[:, frozen], self.values[:, frozen])
+        for bone in self.chain:
+            low, high = np.radians((limits or {}).get(bone, [-60, 60]))
+            self.assertGreaterEqual(solved[0, self.names.index(bone)], low - 1e-12)
+            self.assertLessEqual(solved[0, self.names.index(bone)], high + 1e-12)
+
+    def test_bent_fixed_foot_witness_uses_redundancy_before_straightening(self):
+        self.assertGreater(self.bend(self.witness), 39)
+        solved, reached = motion.solve_leg(self.rig, self.values, self.names, self.chain, "paw", self.target,
+                                           pivot=False)
+        self.assert_pose_contract(solved, reached)
+        self.assertGreater(self.bend(solved), 30)
+        self.assertLess(np.sum((solved - self.values) ** 2), np.sum((self.witness - self.values) ** 2))
+
+    def test_shared_target_broadcast_matches_single_pose_solves(self):
+        values = np.repeat(self.values, 2, axis=0)
+        single, endpoint = motion.solve_leg(self.rig, self.values, self.names, self.chain, "paw", self.target,
+                                            pivot=False)
+        for target in (self.target, self.target[0]):
+            with self.subTest(target_shape=target.shape):
+                solved, reached = motion.solve_leg(self.rig, values, self.names, self.chain, "paw", target,
+                                                   pivot=False)
+                np.testing.assert_allclose(solved, np.repeat(single, 2, axis=0), atol=1e-12, rtol=0)
+                np.testing.assert_allclose(reached, np.repeat(endpoint, 2, axis=0), atol=1e-12, rtol=0)
+                np.testing.assert_allclose(reached, np.repeat(self.target, 2, axis=0), atol=1e-6, rtol=0)
+                frozen = [self.names.index(n) for n in ("dx", "dz", "body", "paw")]
+                np.testing.assert_array_equal(solved[:, frozen], values[:, frozen])
+
+    def test_incompatible_target_batch_is_rejected_instead_of_partially_solving(self):
+        values = np.repeat(self.values, 2, axis=0)
+        with self.assertRaises(ValueError):
+            motion.solve_leg(self.rig, values, self.names, self.chain, "paw", np.repeat(self.target, 3, axis=0))
+
+    def test_integer_pose_arrays_and_lists_match_float_endpoint_and_foot_frame(self):
+        expected, endpoint = motion.solve_leg(self.rig, self.values, self.names, self.chain, "paw", self.target,
+                                              pivot=False)
+        for values in (self.values.astype(np.int64), self.values.astype(np.int64).tolist()):
+            with self.subTest(input_type=type(values).__name__):
+                solved, reached = motion.solve_leg(self.rig, values, self.names, self.chain, "paw", self.target,
+                                                   pivot=False)
+                np.testing.assert_allclose(solved, expected, atol=1e-12, rtol=0)
+                np.testing.assert_allclose(reached, endpoint, atol=1e-12, rtol=0)
+                self.assert_pose_contract(solved, reached)
+
+    def test_asymmetric_boxes_constrain_derived_upper_lower_and_wrist(self):
+        limits = {"girdle": [8, 12], "upper": [-12, -8], "lower": [-2, 2], "wrist": [-2, 2]}
+        solved, reached = motion.solve_leg(self.rig, self.values, self.names, self.chain, "paw", self.target,
+                                           pivot=False, limits_deg=limits)
+        self.assert_pose_contract(solved, reached, limits)
+
+    def test_unresolved_preservation_search_retains_legacy_analytic_fallback(self):
+        limits = {bone: [-0.01, 0.01] for bone in self.chain}
+        solved, reached = motion.solve_leg(self.rig, self.values, self.names, self.chain, "paw", self.target,
+                                           limits_deg=limits)
+        frozen = [self.names.index(n) for n in ("dx", "dz", "body", "paw")]
+        np.testing.assert_array_equal(solved[:, frozen], self.values[:, frozen])
+        np.testing.assert_allclose(self.rig.pose(solved, self.names)[0]["wrist"],
+                                   self.rig.pose(self.values, self.names)[0]["wrist"], atol=1e-9, rtol=0)
+        np.testing.assert_allclose(reached, self.target, atol=1e-6, rtol=0)
+        np.testing.assert_allclose(reached, self.rig.point(self.rig.pose(solved, self.names), "paw"),
+                                   atol=1e-12, rtol=0)
+
+    def test_frozen_angle_outside_fit_box_skips_preservation_not_legacy_correction(self):
+        values = self.values.copy()
+        values[0, self.names.index("paw")] = np.radians(20)
+        witness = self.witness.copy()
+        witness[0, self.names.index("paw")] = values[0, self.names.index("paw")]
+        target = self.rig.point(self.rig.pose(witness, self.names), "paw")
+        solved, reached = motion.solve_leg(self.rig, values, self.names, self.chain, "paw", target,
+                                           limits_deg={"paw": [-10, 10]})
+        frozen = [self.names.index(n) for n in ("dx", "dz", "body", "paw")]
+        np.testing.assert_array_equal(solved[:, frozen], values[:, frozen])
+        np.testing.assert_allclose(self.rig.pose(solved, self.names)[0]["wrist"],
+                                   self.rig.pose(values, self.names)[0]["wrist"], atol=1e-9, rtol=0)
+        np.testing.assert_allclose(reached, target, atol=1e-6, rtol=0)
+        self.assertEqual(solved[0, self.names.index("paw")], values[0, self.names.index("paw")])
+
+    def test_ground_clearance_keeps_corrected_support_while_lifting_reachable_paw(self):
+        keys = np.repeat(self.witness, 4, axis=0)
+        before = self.rig.pose(keys, self.names)
+        ground = float(self.rig.point(before, "paw")[0, 1] + 0.005)
+        project = {"chains": {"front": self.chain}, "paws": {"front": "paw"}}
+        solved, lifted = motion.clear_ground(self.rig, keys, self.names, project, {"front": ground}, 0.002,
+                                             rounds=1)
+        after = self.rig.pose(solved, self.names)
+        self.assertGreater(lifted["front"], 0.)
+        heights = motion.played_heights(self.rig, solved, self.names, project, {"front": ground})["front"]
+        self.assertGreaterEqual(float(heights.min()), -0.002)
+        np.testing.assert_allclose(self.rig.point(after, "upper", "head"),
+                                   self.rig.point(before, "upper", "head"), atol=1e-12, rtol=0,
+                                   err_msg="secondary clearance must not redistribute already corrected support")
+        np.testing.assert_allclose(after[0]["wrist"], before[0]["wrist"], atol=1e-9, rtol=0)
+        frozen = [self.names.index(n) for n in ("dx", "dz", "body", "paw")]
+        np.testing.assert_array_equal(solved[:, frozen], keys[:, frozen])
+
+    def test_unreachable_fallback_returns_actual_endpoint_not_a_claimed_pin(self):
+        target = self.target + np.array([0., -5.])
+        solved, reached = motion.solve_leg(self.rig, self.values, self.names, self.chain, "paw", target)
+        np.testing.assert_allclose(reached, self.rig.point(self.rig.pose(solved, self.names), "paw"),
+                                   atol=1e-12, rtol=0)
+        self.assertGreater(float(np.linalg.norm(reached - target)), 1.)
+        frozen = [self.names.index(n) for n in ("dx", "dz", "body", "paw")]
+        np.testing.assert_array_equal(solved[:, frozen], self.values[:, frozen])
+
+
 class PlanKeysTests(unittest.TestCase):
     def test_planted_paws_are_world_still_on_the_ground(self):
         poses = toy_rig.toy_gait(frames=20, trunk=0.02)
@@ -522,11 +659,16 @@ class LegReachTests(unittest.TestCase):
         self.assertLess(float(np.linalg.norm(reached[0] - target)), 1e-6)
         self.assertNotEqual(solved[0, self.names.index("scapula_L")], 0.0)
         np.testing.assert_allclose(self.rig.paws(solved, self.names, self.project)["front_L"][0], target, atol=1e-6)
+        active = {upper, lower, foot[0], "scapula_L"}
+        frozen = [i for i, name in enumerate(self.names) if name not in active]
+        np.testing.assert_array_equal(solved[:, frozen], values[:, frozen])
 
-    def test_a_reachable_pin_leaves_the_scapula_alone(self):
+    def test_a_reachable_pin_preserves_the_fixed_foot_frame(self):
         values, bones, target = self.pose_and_target(0.6)
         solved, reached = motion.solve_leg(self.rig, values, self.names, bones, "paw_front_L", target[None])
-        self.assertEqual(solved[0, self.names.index("scapula_L")], 0.0)
+        before = self.rig.pose(values, self.names)[0]["wrist_L"]
+        after = self.rig.pose(solved, self.names)[0]["wrist_L"]
+        np.testing.assert_allclose(after, before, atol=1e-9, rtol=0)
         self.assertLess(float(np.linalg.norm(reached[0] - target)), 1e-6)
 
     def test_reach_drop_lowers_the_body_only_where_a_pin_is_out_of_reach(self):
@@ -554,8 +696,7 @@ class LegReachTests(unittest.TestCase):
 
 
 class VoleKeysTests(unittest.TestCase):
-    """Vole round 5 on the derived vole cycle: the planned keys keep every eased paw on or above its ground and the
-    IK reaches every pin; the wolf lope's plan needs neither the girdle swing nor the drop."""
+    """Derived cycles retain their contact endpoints and body-reach contracts."""
 
     def plan(self, name, n=24):
         from anim import facts
@@ -578,10 +719,9 @@ class VoleKeysTests(unittest.TestCase):
         self.assertIn("girdleSwingMaxDeg", report["front_L"])
         self.assertNotIn("girdleSwingMaxDeg", report["hind_L"])
 
-    def test_the_wolf_needs_no_swing_and_no_drop(self):
+    def test_the_wolf_reaches_its_pins_without_a_body_drop(self):
         (keys, paws, report), _ = self.plan("wolfLopeCycle")
         for chain, entry in report.items():
-            self.assertNotIn("girdleSwingMaxDeg", entry, chain)
             self.assertNotIn("bodyDropMaxM", entry, chain)
             self.assertEqual(entry["maxResidualM"], 0.0)
 

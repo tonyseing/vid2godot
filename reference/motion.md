@@ -175,15 +175,44 @@ retime is 1 and nothing changes. Pick F so the band's centre gives at least 10 f
   are unchanged (the wolf lope's every column; its tail_03 world pitch warning stands). `smooth.worldPitchKept` is
   the baked cycle's, `smooth.seriesWorldPitchKept` the series'.
 - **Ground**: the root is lifted so the shared ground is the rig's rest ground (`cycle.groundLift`).
-- **Pins**: over each stance's keys less half a key at each end, two-bone IK (the two bones above the last two; the
-  foot keeps its world orientation, the knee its bend; where the leg cannot reach, the foot turns about the pinned
-  toe, the heel lifting) holds the paw on a world-still line: on the ground, sliding back one stride per cycle.
-  Where even the straight pair and foot cannot reach from the shoulder, a front leg's scapula (the chain bone the
-  pair hangs from) swings about its head by the least angle that reaches (`ik.<paw>.girdleSwingMaxDeg`); where the
-  whole straight leg cannot, the body comes down by the least smooth amount that reaches with 2 % to spare
-  (`ik.<paw>.bodyDropMaxM`). Vole round 5: the round-4 vole's fronts missed by 6.2 mm because the IK held the
-  scapula at the fit's angle while the fit's body rode 10 mm high; neither applies to the wolf. No eased or
-  swinging key goes below its paw's ground (a noisy fit's mid-swing dip is lifted onto it). Vole round 6: the knee
+- **Pins**: over each stance's keys less half a key at each end, IK holds the paw on a world-still line: on the
+  ground, sliding back one stride per cycle. A chain with a fitted girdle first searches its one redundant girdle
+  angle using the existing `fitconstraints.refine`. The existing analytic pair derives the upper, lower and wrist
+  angles; counterrotation at the wrist preserves the original world foot frame. Actual FK must reach within
+  1e-6 m and **every derived chain angle of this preservation candidate** must stay in the brief's original
+  `limitsDeg` fit-search box (missing bones use [-60, 60] degrees, exactly as in the fitter). These are not new
+  downstream acceptance limits. The objective is uniform squared full-chain angle change from the incoming pose,
+  not a bend target; a reachable pin no longer mandates a fixed girdle and straightened elbow.
+  If refinement from the incoming girdle angle is unresolved, deterministic scalar seeds cover the original girdle
+  interval at at most one-degree spacing (`IK_GIRDLE_SAMPLE_DEG`); the lowest uniform-angle-change feasible seed is
+  refined with the same helper, retaining the certified seed if refinement cannot improve it. This is numerical
+  branch discovery, not an acceptance threshold or proof that an unsampled branch cannot exist.
+  Body/root, unrelated joints and terminal paw angles stay frozen. If a frozen angle is already outside its
+  fit-search box, the preservation search is skipped for that pose rather than changing the frozen angle.
+  This is bounded local refinement, not a global optimum or infeasibility proof.
+  When preservation search is unresolved or ineligible, the original analytic reach/toe-pivot correction is
+  retained unchanged, including historically permitted angles outside the fit-search boxes. No fallback angle is
+  clipped, and the wrapper returns the actual FK endpoint for the existing downstream contact/motion gates.
+  `pivot=False` disables pivoting in the original analytic fallback, not fixed-foot redundancy. Short chains
+  without a fitted girdle retain their original analytic behavior. The original fit-search boxes flow from the
+  brief through facts, recursive seam planning, contact pins, ground clearance, edge settling and swing nudges;
+  fitter boxes and downstream acceptance thresholds are unchanged.
+  Primary `plan_keys` pins and standalone `solve_leg` calls use `preserve_source=True`: they preserve the fitted
+  source articulation even when a fixed-pair endpoint alone would be reachable. Secondary ground clearance, edge
+  settling (initial and iterative), and swing corrections act on an already-corrected pose and pass
+  `preserve_source=False`. When the existing fixed-foot analytic pair reaches their target within the same 1e-6 m,
+  it keeps the corrected support rather than redistributing the girdle again; redundant preservation recovery is
+  still available when that pair misses. This stage distinction avoids unnecessary girdle work during secondary
+  nudges without bypassing source-articulation recovery or changing played-ground/contact gates.
+  With played-ground clearance enabled, primary preservation is also checked on the complete cyclic key matrix
+  before clearance nudges. If its played chain dips below the existing penetration tolerance, the original analytic
+  correction is compared on the same source poses, targets and body. It replaces that chain's active angles only
+  when its actual endpoints reach within 1e-6 m and its played dip improves; unrelated angles and body stay frozen.
+  This is candidate acceptance against the existing grounding constraint, not a new temporal solver or a change
+  to pin timing, contact/ground thresholds, or key counts. Remaining dips still run through existing clearance.
+  Past the whole straight leg's reach, the body still comes down by the least smooth amount with 2 % to spare
+  (`ik.<paw>.bodyDropMaxM`); girdle motion is reported as `ik.<paw>.girdleSwingMaxDeg`. No eased or swinging key
+  goes below its paw's ground (a noisy fit's mid-swing dip is lifted onto it). Vole round 6: the knee
   bends to the rig's rest side at every key (round 5's nearly straight vole elbows flipped between keys and the
   played paw swung 6.9 mm into the ground), and no paw goes more than 5 mm times the body's leg-length scale
   (0.32 mm at the vole) under its ground anywhere in the played cycle, between keys too: an interval that dips

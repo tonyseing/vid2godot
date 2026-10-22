@@ -10,11 +10,14 @@ import numpy as np
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 from anim import brief as brief_mod  # noqa: E402
+from anim import articulation  # noqa: E402
+from anim import silhouette_regions  # noqa: E402
 from anim import contract as contract_mod  # noqa: E402
 from anim import facts as facts_mod  # noqa: E402
 from anim import generate as generate_mod  # noqa: E402
 from anim import ingest as ingest_mod  # noqa: E402
 from anim import raster as raster_mod  # noqa: E402
+from anim import marks as marks_mod  # noqa: E402
 from anim import reference as reference_mod  # noqa: E402
 from anim import review as review_mod  # noqa: E402
 from anim import sheet as sheet_mod  # noqa: E402
@@ -30,11 +33,16 @@ ARGS = {"init": [("--model", {"required": True, "type": Path}), ("--clip", {"req
         "contract": [("--project-contract", {"required": True, "type": Path})],
         "brief": [("--file", {"required": True, "type": Path})], "reference": [],
         "generate": [("--model-id", {"required": True}), ("--candidates", {"type": int, "default": 2}),
-                     ("--seed", {"type": int, "default": 1000}), ("--max-cost", {"type": float})],
+                     ("--seed", {"type": int, "default": 1000}), ("--max-cost", {"type": float}),
+                     ("--no-audio", {"action": "store_true"})],
         "accept": [("--candidate", {"required": True, "type": int}), ("--checks", {"required": True, "type": Path})],
         "ingest": [("--work-scale", {"type": float, "default": 0.5})],
         "gridframe": [("--frame", {"required": True, "type": int})],
-        "fit": [("--marks", {"type": Path}), ("--span", {})],
+        "fit": [("--marks", {"type": Path}), ("--span", {}), ("--source-observations", {"type": Path}),
+                ("--silhouette-regions", {"type": Path}), ("--seed", {"type": int})],
+        "preflight": [("--source-observations", {"type": Path}), ("--witness", {"type": Path}),
+                      ("--silhouette-regions", {"type": Path})],
+        "assess": [],
         "facts": [("--mass-kg", {"type": float}), ("--accept-gait", {}), ("--accept-retime", {})], "bake": [],
         "lab": [],
         "review": [("--template", {"action": "store_true"}), ("--file", {"type": Path})],
@@ -143,7 +151,8 @@ def cmd_generate(a):
     meta = load_json(ledger.output("reference", "meta"))
     folder = ledger.work / "generate"
     record = generate_mod.run_generate(Client(), folder, a.model_id, brief, ledger.output("reference", "image"),
-                                       meta["background"], candidates=a.candidates, seed=a.seed, max_cost=a.max_cost)
+                                       meta["background"], candidates=a.candidates, seed=a.seed, max_cost=a.max_cost,
+                                       audio=False if a.no_audio else None)
     outputs = {"record": folder / "record.json"}
     outputs.update({f"candidate{c['index']}": Path(c["video"]) for c in record["candidates"]})
     ledger.record("generate", {"image": ledger.output("reference", "image")}, outputs,
@@ -191,23 +200,336 @@ def cmd_gridframe(a):
     emit({"grid": str(out)})
 
 
+def observation_path(ledger):
+    entry = ledger.data["stages"].get("fit", {}).get("inputs", {}).get("observations")
+    if entry:
+        return Path(entry["path"])  # Missing recorded evidence never turns a workspace into a legacy one.
+    # Enrollment survives a failed first preflight and deletion of its sidecar.
+    enrollment = ledger.work / "articulation" / "enrollment.json"
+    retained = ledger.work / "articulation" / "preflight" / "assessment.json"
+    if enrollment.is_file():
+        recorded = load_json(enrollment).get("observations", {})
+        if not isinstance(recorded, dict) or not isinstance(recorded.get("path"), str):
+            raise StageError("Articulation enrollment is invalid; restore the recorded source observations")
+        return Path(recorded["path"])
+    if retained.is_file():
+        recorded = load_json(retained).get("bound", {}).get("observations", {})
+        if not isinstance(recorded, dict) or not isinstance(recorded.get("path"), str):
+            raise StageError("Retained preflight lacks its source observation binding; rerun `preflight`")
+        return Path(recorded["path"])
+    candidates = [ledger.work / "articulation" / "observations.json",
+                  ledger.work / "articulation" / "preflight" / "observations.json"]
+    return next((p for p in candidates if p.is_file()), None)
+
+
+def source_observations(ledger, path):
+    if path is None:
+        return None
+    video = Path(ledger.require("ingest")["inputs"]["video"]["path"])
+    return articulation.validate(load_json(path), project_contract(ledger),
+                                 load_json(ledger.output("brief", "brief")),
+                                 load_json(ledger.output("ingest", "meta"))["frames"], sha256_file(video))
+
+
+def articulation_paths(ledger, observations, folder):
+    """Rebuild current bindings, rather than trusting a report's list of its own inputs."""
+    paths = {"observations": observations, "model": ledger.model,
+             "rig": ledger.output("contract", "rig"), "project": ledger.work / "contract" / "project-contract.json",
+             "brief": ledger.output("brief", "brief"), "meta": ledger.output("ingest", "meta"),
+             "masks": ledger.output("ingest", "masks"),
+             "source": Path(ledger.require("ingest")["inputs"]["video"]["path"]),
+             "poses": folder / "poses.json", "projection": folder / "projection.npz"}
+    for key in source_observations(ledger, observations)["frames"]:
+        paths[f"registered:{key}"] = ledger.work / "ingest" / "registered" / f"{int(key):05d}.png"
+    for name in ("articulation.py", "pipeline.py", "blender/fit_clip.py", "blender/rigutil.py",
+                 "fitsearch.py", "fitconstraints.py", "camera.py", "marks.py", "raster.py", "paws.py", "cycle.py"):
+        paths[f"code:{name}"] = Path(__file__).parent / name
+    return paths
+
+
+def region_path(ledger):
+    recorded = ledger.data["stages"].get("fit", {}).get("inputs", {}).get("regions")
+    if recorded:
+        return Path(recorded["path"])
+    folder = ledger.work / "silhouette-regions"
+    for path, key in ((folder / "enrollment.json", "regions"),
+                      (folder / "assessment.json", None),
+                      (ledger.work / "articulation" / "preflight" / "regions-assessment.json", None)):
+        if path.is_file():
+            document = load_json(path)
+            item = document.get(key, {}) if key else document.get("bound", {}).get("regions", {})
+            if not isinstance(item, dict) or not isinstance(item.get("path"), str):
+                raise StageError("Silhouette region enrollment is invalid; restore recorded source regions")
+            return Path(item["path"])
+    canonical = folder / "regions.json"
+    return canonical if canonical.is_file() else None
+
+
+def source_regions(ledger, path):
+    if path is None:
+        return None
+    from PIL import Image
+    meta = load_json(ledger.output("ingest", "meta"))
+    video = Path(ledger.require("ingest")["inputs"]["video"]["path"])
+    with Image.open(ledger.work / "ingest" / "registered" / "00000.png") as image:
+        width, height = image.size
+    return silhouette_regions.validate(load_json(path), sha256_file(video), width, height, meta["frames"])
+
+
+def region_paths(ledger, regions, folder):
+    paths = {"regions": regions, "model": ledger.model,
+             "rig": ledger.output("contract", "rig"), "project": ledger.work / "contract" / "project-contract.json",
+             "brief": ledger.output("brief", "brief"), "meta": ledger.output("ingest", "meta"),
+             "masks": ledger.output("ingest", "masks"),
+             "source": Path(ledger.require("ingest")["inputs"]["video"]["path"]),
+             "registered:0": ledger.work / "ingest" / "registered" / "00000.png",
+             "poses": folder / "poses.json", "projection": folder / "projection.npz"}
+    for index in source_regions(ledger, regions)["frames"]:
+        paths[f"registered:{index}"] = ledger.work / "ingest" / "registered" / f"{index:05d}.png"
+    for name in ("silhouette_regions.py", "articulation.py", "pipeline.py", "blender/fit_clip.py",
+                 "blender/rigutil.py", "fitsearch.py", "fitconstraints.py", "camera.py", "marks.py",
+                 "raster.py", "paws.py", "cycle.py"):
+        paths[f"code:{name}"] = Path(__file__).parent / name
+    return paths
+
+
+def measure_regions(ledger, regions, folder):
+    """Acceptance uses the saved actual Blender mesh projection, never optimization occupancy or pose claims."""
+    document = source_regions(ledger, regions)
+    meta = load_json(ledger.output("ingest", "meta"))
+    threshold = load_json(ledger.output("brief", "brief"))["iouThreshold"]
+    poses = load_json(folder / "poses.json")
+    body = raster_mod.score_fit(poses, folder / "projection.npz", ledger.output("ingest", "masks"),
+                                threshold, meta["flags"])
+    body_by_frame = {row["index"]: row["iou"] for row in body["frames"]}
+    entries = {row["index"] for row in poses["frames"] if row is not None}
+    frames = []
+    with np.load(folder / "projection.npz") as projection, np.load(ledger.output("ingest", "masks")) as data:
+        masks = data["masks"]
+        for index, items in sorted(document["frames"].items()):
+            if index not in entries:
+                frames.append({"index": index, "status": "unresolved", "regions": [],
+                               "reason": "Recorded region frame has no actual fitted projection"})
+                continue
+            fitted = raster_mod.rasterize(projection["uv"][index], projection["faces"],
+                                          masks.shape[2], masks.shape[1])
+            result = silhouette_regions.evaluate(masks[index], fitted, items, meta["workScale"])
+            frames.append({"index": index, "status": "pass" if result["pass"] else
+                           ("unresolved" if any(r["status"] == "unresolved" for r in result["regions"]) else "fail"),
+                           **result, "bodyIoU": body_by_frame[index]})
+    body_gate = {"threshold": threshold, "meanIoU": body["meanIoU"],
+                 "pass": body["meanIoU"] >= threshold and
+                         all(body_by_frame.get(index, -1) >= threshold for index in document["frames"])}
+    states = [row["status"] for row in frames]
+    status = ("unresolved" if "unresolved" in states else
+              "pass" if body_gate["pass"] and all(s == "pass" for s in states) else "fail")
+    return {"status": status, "frames": frames, "bodyGate": body_gate,
+            "scope": "Recorded visible source contours only; no anatomical joint identity is inferred",
+            "warning": None if status == "pass" else
+                       "Local contour and unchanged whole-body gates must both pass. An unsuccessful finite "
+                       "search does not establish that the requirements are infeasible."}
+
+
+def assess_regions(ledger, regions=None, folder=None):
+    regions = regions or region_path(ledger)
+    if regions is None:
+        return {"status": "not_assessed", "frames": []}
+    folder = folder or ledger.work / "fit"
+    report = articulation.bind(measure_regions(ledger, regions, folder), region_paths(ledger, regions, folder))
+    target = (ledger.work / "silhouette-regions" / "assessment.json" if folder == ledger.work / "fit"
+              else folder / "regions-assessment.json")
+    target.parent.mkdir(parents=True, exist_ok=True)
+    target.write_text(json.dumps(report, indent=2))
+    return report
+
+
+def require_regions(ledger, regions=None, folder=None):
+    regions = regions or region_path(ledger)
+    if regions is None:
+        return {"status": "not_assessed", "frames": []}
+    folder = folder or ledger.work / "fit"
+    target = (ledger.work / "silhouette-regions" / "assessment.json" if folder == ledger.work / "fit"
+              else folder / "regions-assessment.json")
+    report = articulation.require_current(target, region_paths(ledger, regions, folder))
+    measured = measure_regions(ledger, regions, folder)
+    if any(report.get(key) != measured[key] for key in ("status", "frames", "bodyGate")):
+        raise StageError("Silhouette region assessment does not match actual projection; run `assess` or refit")
+    return report
+
+
+def assess_fit(ledger, observations=None):
+    if observations is None:
+        canonical = ledger.work / "articulation" / "observations.json"
+        recorded = ledger.data["stages"].get("fit", {}).get("inputs", {}).get("observations")
+        # During first-fit promotion the canonical sidecar is copied before its ledger input is recorded.
+        observations = canonical if not recorded and canonical.is_file() else observation_path(ledger)
+    if observations is None:
+        return articulation.assess(None, {})
+    document = source_observations(ledger, observations)
+    folder = ledger.work / "fit"
+    report = articulation.assess(document, load_json(folder / "poses.json"),
+                                 load_json(ledger.output("ingest", "meta"))["workScale"])
+    report = articulation.bind(report, articulation_paths(ledger, observations, folder))
+    target = ledger.work / "articulation" / "assessment.json"
+    target.parent.mkdir(exist_ok=True)
+    target.write_text(json.dumps(report, indent=2))
+    return report
+
+
+def require_articulation(ledger):
+    require_regions(ledger)
+    observations = observation_path(ledger)
+    if observations is None:
+        return articulation.assess(None, {})
+    report = articulation.require_current(ledger.work / "articulation" / "assessment.json",
+                                          articulation_paths(ledger, observations, ledger.work / "fit"))
+    measured = articulation.assess(source_observations(ledger, observations),
+                                    load_json(ledger.work / "fit" / "poses.json"),
+                                    load_json(ledger.output("ingest", "meta"))["workScale"])
+    if any(report.get(key) != measured[key] for key in ("status", "frames", "coverage")):
+        raise StageError("Articulation assessment does not match current landmarks; run `assess`")
+    return report
+
+
+@command("assess")
+def cmd_assess(a):
+    ledger = Ledger(a.work)
+    ledger.require("fit")
+    report = assess_fit(ledger)
+    regions = assess_regions(ledger)
+    if regions["status"] != "not_assessed":
+        report["silhouetteRegions"] = regions
+    emit(report)
+
+
+@command("preflight")
+def cmd_preflight(a):
+    ledger = Ledger(a.work)
+    meta = load_json(ledger.output("ingest", "meta"))
+    document = source_observations(ledger, a.source_observations)
+    regions = getattr(a, "silhouette_regions", None)
+    region_document = source_regions(ledger, regions)
+    if document is None and region_document is None:
+        raise StageError("preflight needs --source-observations or --silhouette-regions")
+    folder = ledger.work / "articulation" / "preflight"
+    if a.witness is not None and a.witness.resolve().is_relative_to(folder.resolve()):
+        raise StageError("Diagnostic witness collides with preflight outputs; copy it outside the output folder")
+    folder.mkdir(parents=True, exist_ok=True)
+    observations = None
+    if document is not None:
+        observations = folder / "observations.json"
+        if a.source_observations.resolve() != observations.resolve():
+            shutil.copyfile(a.source_observations, observations)
+        (folder.parent / "enrollment.json").write_text(json.dumps(
+            {"observations": {"path": str(observations.resolve()), "sha256": sha256_file(observations)}}, indent=2))
+    if region_document is not None:
+        stored = folder / "regions.json"
+        if regions.resolve() != stored.resolve():
+            shutil.copyfile(regions, stored)
+        regions = stored
+        enrollment = ledger.work / "silhouette-regions" / "enrollment.json"
+        enrollment.parent.mkdir(exist_ok=True)
+        enrollment.write_text(json.dumps(
+            {"regions": {"path": str(regions.resolve()), "sha256": sha256_file(regions)}}, indent=2))
+    indices = set(map(int, (document or {}).get("frames", {}))) | set((region_document or {}).get("frames", {}))
+    marks = {"frames": {}, "jointFrames": {}}
+    run_blender("fit_clip", {"model": str(ledger.model), "project": project_contract(ledger),
+                             "brief": load_json(ledger.output("brief", "brief")), "camera": meta["camera"],
+                             "masks": str(ledger.output("ingest", "masks")), "marks": marks["frames"],
+                             "jointFrames": marks["jointFrames"], "sourceObservations": document,
+                             **({"silhouetteRegions": region_document} if region_document is not None else {}),
+                             "frameIndices": sorted(indices), "periodic": False,
+                             "workScale": meta["workScale"], "fps": meta["fps"],
+                             "out": str(folder / "poses.json"), "projection": str(folder / "projection.npz"),
+                             **({"witness": str(a.witness)} if a.witness else {})}, folder, a.blender)
+    poses = load_json(folder / "poses.json")
+    assessment = articulation.assess(document, poses, meta["workScale"])
+    witness = articulation.assess(document, poses.get("witness", {"frames": []}), meta["workScale"])
+    assessment["diagnosis"] = articulation.diagnose(assessment, witness, poses.get("comparisons"))
+    if observations is not None:
+        paths = articulation_paths(ledger, observations, folder)
+        if a.witness:
+            paths["witness"] = a.witness
+        assessment = articulation.bind(assessment, paths)
+        (folder / "assessment.json").write_text(json.dumps(assessment, indent=2))
+    report = raster_mod.score_fit(poses, folder / "projection.npz", ledger.output("ingest", "masks"),
+                                  load_json(ledger.output("brief", "brief"))["iouThreshold"], meta["flags"])
+    report["articulation"] = assessment
+    if regions is not None:
+        report["silhouetteRegions"] = assess_regions(ledger, regions, folder)
+    (folder / "report.json").write_text(json.dumps(report, indent=2))
+    review_mod.draw_overlays(ledger.work, poses, folder / "projection.npz", ledger.output("ingest", "masks"),
+                             folder / "overlays", articulation_report=assessment, work_scale=meta["workScale"],
+                             region_report=report.get("silhouetteRegions"))
+    (folder / "lab.html").write_text(review_mod.lab_page(
+        ledger.clip + " preflight", report, load_json(ledger.output("brief", "brief"))["iouThreshold"],
+        {}, {k: v["sha256"] for k, v in
+             {**assessment.get("bound", {}), **report.get("silhouetteRegions", {}).get("bound", {})}.items()}))
+    emit({"assessment": str(folder / ("assessment.json" if observations else "regions-assessment.json")),
+          "lab": str(folder / "lab.html"), "status": assessment["status"],
+          "coverage": assessment["coverage"], "diagnosis": assessment["diagnosis"],
+          **({"silhouetteRegions": report["silhouetteRegions"]} if regions is not None else {})})
+
+
 @command("fit")
 def cmd_fit(a):
     ledger = Ledger(a.work)
     meta = load_json(ledger.output("ingest", "meta"))
     brief = load_json(ledger.output("brief", "brief"))
     masks = ledger.output("ingest", "masks")
+    supplied = getattr(a, "source_observations", None)
+    observations = supplied or observation_path(ledger)
+    document_observations = source_observations(ledger, observations)
+    regions = getattr(a, "silhouette_regions", None) or region_path(ledger)
+    region_document = source_regions(ledger, regions)
+    if regions is not None:
+        preflight_folder = ledger.work / "articulation" / "preflight"
+        retained = preflight_folder / "regions.json"
+        require_regions(ledger, retained, preflight_folder)
+        if sha256_file(regions) != sha256_file(retained):
+            raise StageError("Silhouette regions changed since preflight; run `preflight` again")
+        stored = ledger.work / "silhouette-regions" / "regions.json"
+        stored.parent.mkdir(exist_ok=True)
+        if regions.resolve() != stored.resolve():
+            shutil.copyfile(regions, stored)
+        regions = stored
+    if observations is not None:
+        preflight_folder = ledger.work / "articulation" / "preflight"
+        expected = articulation_paths(ledger, preflight_folder / "observations.json", preflight_folder)
+        preflight_report = load_json(preflight_folder / "assessment.json") if (preflight_folder / "assessment.json").is_file() else {}
+        if "witness" in preflight_report.get("bound", {}):
+            expected["witness"] = Path(preflight_report["bound"]["witness"]["path"])
+        articulation.require_current(preflight_folder / "assessment.json", expected)
+        measured = articulation.assess(source_observations(ledger, preflight_folder / "observations.json"),
+                                        load_json(preflight_folder / "poses.json"), meta["workScale"])
+        if any(preflight_report.get(key) != measured[key] for key in ("status", "frames", "coverage")):
+            raise StageError("Preflight articulation does not match its projected landmarks; run `preflight` again")
+        if sha256_file(observations) != sha256_file(preflight_folder / "observations.json"):
+            raise StageError("Source observations changed since preflight; run `preflight` again")
+        stored = ledger.work / "articulation" / "observations.json"
+        if observations.resolve() != stored.resolve():
+            shutil.copyfile(observations, stored)
+        observations = stored
     folder = ledger.work / "fit"
     folder.mkdir(exist_ok=True)
     marks_path = folder / "marks.json"
+    document = load_json(a.marks or marks_path) if a.marks or marks_path.exists() else {"frames": {}}
+    project = project_contract(ledger)
+    paw_marks, joint_marks = marks_mod.validate(document, project, brief, meta["frames"])
     if a.marks:
         shutil.copyfile(a.marks, marks_path)
     elif not marks_path.exists():
-        marks_path.write_text(json.dumps({"frames": {}}))
-    args = {"model": str(ledger.model), "project": project_contract(ledger), "brief": brief,
-            "camera": meta["camera"], "masks": str(masks), "marks": load_json(marks_path)["frames"],
+        marks_path.write_text(json.dumps(document))
+    args = {"model": str(ledger.model), "project": project, "brief": brief,
+            "camera": meta["camera"], "masks": str(masks), "marks": paw_marks, "jointFrames": joint_marks,
             "workScale": meta["workScale"], "fps": meta["fps"], "out": str(folder / "poses.json"),
             "projection": str(folder / "projection.npz")}
+    if document_observations is not None:
+        args["sourceObservations"] = document_observations
+    if region_document is not None:
+        args["silhouetteRegions"] = region_document
+    if a.seed is not None:
+        args["seed"] = a.seed  # Restart-noise draw; omitted keeps the default stream (seed 0).
     if a.span:
         start, end = (int(x) for x in a.span.split(":"))
         if not (folder / "poses.json").is_file():
@@ -217,11 +539,25 @@ def cmd_fit(a):
     report = raster_mod.score_fit(load_json(folder / "poses.json"), folder / "projection.npz", masks,
                                   brief["iouThreshold"], meta["flags"])
     (folder / "report.json").write_text(json.dumps(report, indent=2))
-    ledger.record("fit", {"masks": masks, "marks": marks_path},
+    if observations is not None:
+        report["articulation"] = assess_fit(ledger, observations=observations)
+        (folder / "report.json").write_text(json.dumps(report, indent=2))
+    if regions is not None:
+        report["silhouetteRegions"] = assess_regions(ledger, regions)
+        (folder / "report.json").write_text(json.dumps(report, indent=2))
+    ledger.record("fit", {"masks": masks, "marks": marks_path,
+                          **({"observations": observations} if observations is not None else {}),
+                          **({"regions": regions} if regions is not None else {})},
                   {"poses": folder / "poses.json", "projection": folder / "projection.npz",
-                   "report": folder / "report.json"}, {"meanIoU": report["meanIoU"], "lowFrames": report["lowFrames"]})
-    emit({"ok": True, "meanIoU": report["meanIoU"], "lowFrames": report["lowFrames"],
-          "next": "Run `lab`, open the overlay of every low frame, mark or refit, then run `facts`."})
+                   "report": folder / "report.json"}, {"meanIoU": report["meanIoU"], "lowFrames": report["lowFrames"],
+                                                       "seed": a.seed})
+    region_ok = report.get("silhouetteRegions", {}).get("status", "pass") == "pass"
+    emit({"ok": region_ok, "meanIoU": report["meanIoU"], "lowFrames": report["lowFrames"],
+          "articulation": report.get("articulation", {"status": "not_assessed"})["status"],
+          **({"silhouetteRegions": report["silhouetteRegions"]["status"],
+              "warning": report["silhouetteRegions"]["warning"]} if regions is not None else {}),
+          "next": "Run `lab`, inspect local and whole-body overlays and refit before acceptance." if not region_ok else
+                  "Run `lab`, open the overlay of every low frame, mark or refit, then run `facts`."})
 
 
 def silhouette_renderer(model, poses, shape, folder, blender=None):
@@ -265,6 +601,7 @@ def facts_mass(a, ledger, brief, folder):
 @command("facts")
 def cmd_facts(a):
     ledger = Ledger(a.work)
+    require_articulation(ledger)
     rest = paw_rest(ledger)
     rig = load_json(ledger.output("contract", "rig"))
     brief = load_json(ledger.output("brief", "brief"))
@@ -292,6 +629,7 @@ def cmd_facts(a):
 @command("bake")
 def cmd_bake(a):
     ledger = Ledger(a.work)
+    require_articulation(ledger)
     project = project_contract(ledger)
     facts_path = ledger.output("facts", "facts")
     cycle = load_json(facts_path)["cycle"]
@@ -359,16 +697,40 @@ def build_lab(ledger):
     folder = ledger.work / "review"
     poses = load_json(ledger.output("fit", "poses"))
     report = load_json(ledger.output("fit", "report"))
+    assessment_path = ledger.work / "articulation" / "assessment.json"
+    report["articulation"] = (load_json(assessment_path) if assessment_path.is_file()
+                              else articulation.assess(None, {}))
+    if observation_path(ledger) is not None:
+        expected = articulation.bind({}, articulation_paths(ledger, observation_path(ledger), ledger.work / "fit"))
+        if report["articulation"].get("bound") != expected["bound"]:
+            report["articulation"]["status"] = "stale"
+    regions = region_path(ledger)
+    if regions is not None:
+        target = ledger.work / "silhouette-regions" / "assessment.json"
+        report["silhouetteRegions"] = load_json(target) if target.is_file() else {"status": "unresolved", "frames": []}
+        expected = articulation.bind({}, region_paths(ledger, regions, ledger.work / "fit"))
+        if report["silhouetteRegions"].get("bound") != expected["bound"]:
+            report["silhouetteRegions"]["status"] = "stale"
     brief = load_json(ledger.output("brief", "brief"))
     review_mod.draw_overlays(ledger.work, poses, ledger.output("fit", "projection"), ledger.output("ingest", "masks"),
-                             folder / "overlays")
+                             folder / "overlays", articulation_report=report["articulation"],
+                             work_scale=load_json(ledger.output("ingest", "meta"))["workScale"],
+                             region_report=report.get("silhouetteRegions"))
     hashes = {name: ledger.require("fit")["outputs"][name]["sha256"] for name in ("poses", "projection")}
+    marks_input = ledger.require("fit")["inputs"].get("marks")
+    marks = load_json(marks_input["path"]) if marks_input else None
+    if marks_input:
+        hashes["marks"] = marks_input["sha256"]
+    if regions is not None:
+        hashes["regions"] = sha256_file(regions)
+        if target.is_file():
+            hashes["regionAssessment"] = sha256_file(target)
     facts = load_json(ledger.output("facts", "facts")) if ledger.state("facts") == "ok" else None
     project = project_contract(ledger)
     tol = facts_mod.tolerances(load_json(ledger.output("contract", "rig")), project)
     page = review_mod.lab_page(ledger.clip, report, brief["iouThreshold"],
                                review_mod.contact_timeline(poses, project, paw_rest(ledger), facts, tol=tol),
-                               hashes, review_mod.motion_summary(facts))
+                               hashes, review_mod.motion_summary(facts), marks=marks)
     (folder / "lab.html").write_text(page)
     return folder / "lab.html", report
 
@@ -383,6 +745,7 @@ def cmd_lab(a):
 @command("review")
 def cmd_review(a):
     ledger = Ledger(a.work)
+    require_articulation(ledger)
     folder = ledger.work / "review"
     history_path = folder / "history.json"
     history = load_json(history_path) if history_path.is_file() else []
@@ -391,6 +754,15 @@ def cmd_review(a):
         bound = {"poses": ledger.output("fit", "poses"), "facts": ledger.output("facts", "facts"),
                  "glb": ledger.output("bake", "glb"), "sheet": ledger.output("bake", "sheet"),
                  "closeup": ledger.output("bake", "closeup"), "lab": lab}
+        marks_input = ledger.require("fit")["inputs"].get("marks")
+        if marks_input:
+            bound["marks"] = Path(marks_input["path"])
+        if observation_path(ledger) is not None:
+            bound["observations"] = observation_path(ledger)
+            bound["articulation"] = ledger.work / "articulation" / "assessment.json"
+        if region_path(ledger) is not None:
+            bound["regions"] = region_path(ledger)
+            bound["regionAssessment"] = ledger.work / "silhouette-regions" / "assessment.json"
         template = review_mod.make_template(ledger.clip, bound, report, len(history) + 1)
         (folder / "template.json").write_text(json.dumps(template, indent=2))
         emit({"template": str(folder / "template.json"), "lab": str(lab), "lowFrames": report["lowFrames"]})
@@ -424,6 +796,7 @@ def cmd_review(a):
 def cmd_verify(a):
     ledger = Ledger(a.work)
     ledger.require("review")
+    require_articulation(ledger)
     script = verify_mod.verifier(a.threed_verify)
     glb = ledger.output("bake", "glb")
     facts = load_json(ledger.output("facts", "facts"))
@@ -463,6 +836,7 @@ def cmd_verify(a):
 def cmd_export(a):
     ledger = Ledger(a.work)
     ledger.require("verify")
+    require_articulation(ledger)
     stem = f"{ledger.model.stem}-{ledger.clip}"
     files = {f"{stem}-eval.glb": ledger.output("bake", "glb"), "anim-entry.json": ledger.output("facts", "entry"),
              "facts.json": ledger.output("facts", "facts"), "fit-report.json": ledger.output("fit", "report"),
@@ -475,6 +849,13 @@ def cmd_export(a):
              "ingest.json": ledger.output("ingest", "meta"), "reference.png": ledger.output("reference", "image"),
              "brief.json": ledger.output("brief", "brief"), "rig.json": ledger.output("contract", "rig"),
              "ledger.json": ledger.path}
+    observations = observation_path(ledger)
+    if observations is not None:
+        files["source-observations.json"] = observations
+        files["articulation-assessment.json"] = ledger.work / "articulation" / "assessment.json"
+    if region_path(ledger) is not None:
+        files["silhouette-regions.json"] = region_path(ledger)
+        files["silhouette-regions-assessment.json"] = ledger.work / "silhouette-regions" / "assessment.json"
     if "audio" in ledger.require("ingest")["outputs"]:
         files["candidate-audio.wav"] = ledger.output("ingest", "audio")
     for prefix in ("4.7", "4.5"):

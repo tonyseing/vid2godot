@@ -275,7 +275,8 @@ class ReviewCommandTests(unittest.TestCase):
         outputs = {"contract": {"rig": put("contract/rig.json", rig)}, "brief": {"brief": work / "brief/brief.json"},
                    "reference": {"x": put("reference/x.json", {})}, "generate": {"x": put("generate/x.json", {})},
                    "accept": {"x": put("accept/x.json", {})},
-                   "ingest": {"masks": work / "ingest/masks.npz", "meta": put("ingest/ingest.json", {})},
+                   "ingest": {"masks": work / "ingest/masks.npz",
+                              "meta": put("ingest/ingest.json", {"workScale": 0.5})},
                    "fit": {"poses": work / "fit/poses.json", "projection": work / "fit/projection.npz",
                            "report": work / "fit/report.json"},
                    "facts": {"facts": put("facts/facts.json", {"period": 3.0})},
@@ -296,6 +297,28 @@ class ReviewCommandTests(unittest.TestCase):
         filled = self.tmp / f"filled-{template['artisticRound']}-{verdict}.json"
         filled.write_text(json.dumps(template))
         return run("review", "--work", str(self.work), "--file", str(filled))
+
+    def test_joint_landmarks_remain_hash_bound_in_lab_and_review(self):
+        marks = {"frames": {}, "jointFrames": {"1": {"lower_fl": [24, 32]}}}
+        path = self.work / "fit" / "marks.json"
+        path.write_text(json.dumps(marks))
+        ledger = Ledger(self.work)
+        later = {name: ledger.require(name) for name in ("facts", "bake")}
+        outputs = {k: v["path"] for k, v in ledger.require("fit")["outputs"].items()}
+        ledger.record("fit", {"marks": path}, outputs)
+        for stage, entry in later.items():
+            ledger.record(stage, {}, {k: v["path"] for k, v in entry["outputs"].items()})
+        code, _, err = run("review", "--work", str(self.work), "--template")
+        self.assertEqual(code, 0, err)
+        template = json.loads((self.work / "review" / "template.json").read_text())
+        marks["jointFrames"]["1"]["lower_fl"][0] += 1
+        path.write_text(json.dumps(marks))
+        self.assertEqual(Ledger(self.work).state("fit"), "stale")
+        self.assertTrue(any("marks changed" in p for p in review.validate(template, template)))
+        ledger = Ledger(self.work)
+        ledger.record("fit", {"marks": path}, outputs)
+        self.assertEqual(ledger.state("facts"), "missing")
+        self.assertEqual(ledger.state("bake"), "missing")
 
     def test_file_without_a_template_is_a_clean_error(self):
         filled = self.tmp / "filled.json"

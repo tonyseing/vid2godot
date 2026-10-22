@@ -441,6 +441,28 @@ class PerSecondGenerateTests(unittest.TestCase):
         self.assertIs(saved["generateAudio"], True)
         self.assertEqual(len(saved["candidates"]), 2)
 
+    def test_audio_off_sends_explicit_false_to_an_audio_model(self):
+        client = FakeClient()
+        generate.run_generate(client, self.tmp / "gen", "bytedance/seedance-2.5", BRIEF, self.png, "#c8c8c8",
+                              audio=False)
+        self.assertEqual(len(client.submitted), 2)
+        for payload in client.submitted:
+            self.assertIs(payload["generate_audio"], False)
+        saved = json.loads((self.tmp / "gen" / "record.json").read_text())
+        self.assertIs(saved["generateAudio"], False)
+
+    def test_audio_off_prices_without_audio(self):
+        client = FakeClient(info=LISTING["kwaivgi/kling-v3.0-pro"], cost=0.56)
+        record = generate.run_generate(client, self.tmp / "gen", "kwaivgi/kling-v3.0-pro", BRIEF, self.png, "#c8c8c8",
+                                       audio=False)
+        self.assertAlmostEqual(record["estimateUsd"], 1.12)
+
+    def test_audio_off_on_a_silent_model_still_omits_generate_audio(self):
+        client = FakeClient(info=LISTING["runway/gen-4.5"], cost=0.6)
+        generate.run_generate(client, self.tmp / "gen", "runway/gen-4.5", BRIEF, self.png, "#c8c8c8", audio=False)
+        for payload in client.submitted:
+            self.assertNotIn("generate_audio", payload)
+
     def test_null_sizes_model_generates_at_derived_size(self):
         client = FakeClient(info=LISTING["alibaba/wan-3.0"], cost=0.5)
         record = generate.run_generate(client, self.tmp / "gen", "alibaba/wan-3.0", BRIEF, self.png, "#c8c8c8")

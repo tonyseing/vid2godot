@@ -12,8 +12,9 @@ constant-velocity prior against the previous frames.
 Posing runs in numpy (forward kinematics plus linear-blend skinning, checked against Blender's own deform at start;
 the script falls back to Blender's depsgraph if they disagree). Ingest registers scale from the first frame's height
 alone, which a bent paw throws off by a few percent, so a new fit also solves the camera's scale (about the rest
-model's bottom centre, where ingest pins the video): free on every frame of the forward pass, then fixed at the clip's
-median for the refinement. The refined camera goes to poses.json as "camera" ("cameraScale" and "registrationCamera"
+model's bottom centre, where ingest pins the video): free on every frame of the forward pass, then one shared camera
+for refinement. Without source disks this is the legacy median; with disks it is restored jointly with the observed
+poses. The refined camera goes to poses.json as "camera" ("cameraScale" and "registrationCamera"
 record the change); dx/dz stay in model metres. The first frame has no prior, so it is solved from several camera
 scales with coarse grid searches over the legs, and the best is polished with local grids at the middle level.
 
@@ -46,7 +47,7 @@ import bpy  # noqa: E402
 import numpy as np  # noqa: E402
 from mathutils import Matrix  # noqa: E402
 import rigutil  # noqa: E402
-from anim import cycle, fitsearch, paws  # noqa: E402
+from anim import articulation, cycle, fitconstraints, fitsearch, marks as marks_mod, paws, silhouette_regions  # noqa: E402
 from anim.camera import SideCamera  # noqa: E402
 
 LEVELS = (0.25, 0.5, 1.0)                       # pyramid levels, as fractions of the working resolution
@@ -84,7 +85,32 @@ data = np.load(args["masks"])
 outside, masks = data["outside"], data["masks"]
 frame_count, height, width = masks.shape
 work_scale = args["workScale"]
-marks = {int(f): {b: np.array(p, float) * work_scale for b, p in points.items()} for f, points in args["marks"].items()}
+paw_frames, joint_frames = marks_mod.validate(
+    {"frames": args["marks"], "jointFrames": args.get("jointFrames", {})}, project, brief, frame_count)
+marks = {int(f): {b: np.array(p, float) * work_scale for b, p in points.items()} for f, points in paw_frames.items()}
+joint_marks = {int(f): {b: np.array(p, float) * work_scale for b, p in points.items()}
+               for f, points in joint_frames.items()}
+source_observations = (articulation.validate(args["sourceObservations"], project, brief, frame_count)
+                       if args.get("sourceObservations") is not None else None)
+observation_frames = {int(f): frame["observations"] for f, frame in
+                      (source_observations or {}).get("frames", {}).items()}
+usable_observations = {f: [item for item in items if articulation.usable(item)]
+                       for f, items in observation_frames.items()}
+constraint_search = {}
+region_document = args.get("silhouetteRegions")
+region_frames = {int(f): items for f, items in (region_document or {}).get("frames", {}).items()}
+region_cache = {}
+if region_frames:
+    try:
+        from anim import raster
+    except ModuleNotFoundError as exc:
+        if exc.name != "PIL":
+            raise
+        raise RuntimeError(
+            "Region-guided fitting requires Pillow in Blender's Python. Set "
+            "VID2GODOT_BLENDER_PYTHON_SITE to a dependency directory containing "
+            "Pillow compatible with Blender's Python version and ABI."
+        ) from exc
 
 bones = list(dict.fromkeys(b for chain in brief["fitChains"] for b in project["chains"][chain]
                            if b != project["rootBone"]))
@@ -192,14 +218,20 @@ rng = np.random.default_rng(0)
 check = np.zeros(N)
 check[:2] = rng.uniform(-0.05, 0.05, 2)
 check[2:] = rng.uniform(-0.5, 0.5, N - 2)
+if "seed" in args:  # Opt-in restart seed for seed-variance studies; absent keeps the default stream.
+    rng = np.random.default_rng(int(args["seed"]))
 apply(check)
 blender_xz = rigutil.evaluated_vertices(skinned)[:, [0, 2]]
 mark_bones = sorted({b for points in marks.values() for b in points})
+joint_bones = sorted({b for points in joint_marks.values() for b in points})
 if blender_xz.shape == (len(rig.rest_co), 2):
     deform_error_px = max([float(np.abs(blender_xz - rig.vertices_xz(check[2:], check[0], check[1])).max())]
                           + [float(np.abs(np.array(rigutil.bone_point(arm, b))
                                           - rig.tails_xz(check[2:], check[0], check[1], [b])[b]).max())
-                             for b in mark_bones]) * base_camera.px_per_m
+                             for b in mark_bones]
+                          + [float(np.abs(np.array(rigutil.bone_point(arm, b, "head"))
+                                          - rig.points_xz(check[2:], check[0], check[1], [(b, "head")])[0]).max())
+                             for b in joint_bones]) * base_camera.px_per_m
 else:
     deform_error_px = float("inf")
 FAST = deform_error_px < 0.25
@@ -235,11 +267,89 @@ def posed_uv(x):
     return cam.project(rigutil.evaluated_vertices(skinned)[:, [0, 2]]), cam
 
 
-def mark_points(x, cam, names_):
+def mark_points(x, cam, names_, end="tail"):
     if FAST:
-        return {b: cam.project(p) for b, p in rig.tails_xz(x[2:N], x[0], x[1], names_).items()}
+        points = rig.points_xz(x[2:N], x[0], x[1], [(b, end) for b in names_])
+        return {b: cam.project(p) for b, p in zip(names_, points)}
     apply(x)
-    return {b: cam.project(np.array(rigutil.bone_point(arm, b))) for b in names_}
+    return {b: cam.project(np.array(rigutil.bone_point(arm, b, end))) for b in names_}
+
+
+def mark_errors(x, f, cam, paw_names=None, joint_names=None):
+    """Distances in working pixels; paw tails and articulated joint heads share one manual-point mean."""
+    errors = []
+    for frames_, wanted, end in ((marks, paw_names, "tail"), (joint_marks, joint_names, "head")):
+        targets = frames_.get(f, {})
+        selected = list(targets) if wanted is None else [b for b in wanted if b in targets]
+        if selected:
+            points = mark_points(x, cam, selected, end)
+            errors.extend(np.hypot(*(points[b] - targets[b])) for b in selected)
+    return errors
+
+
+def observation_term(x, f, cam, selected=None):
+    """Squared source-pixel residual / recorded uncertainty; hidden identity has no invented target."""
+    errors = []
+    for item in observation_frames.get(f, []):
+        if not articulation.usable(item) or (selected is not None and item["bone"] not in selected):
+            continue
+        point = mark_points(x, cam, [item["bone"]], item["end"])[item["bone"]]
+        errors.append(float(np.linalg.norm(point / work_scale - item["point"])) / item["uncertaintyPx"])
+    return float(np.mean(np.square(errors))) if errors else 0.0
+
+
+def observation_residuals(x, f, actual=False):
+    """Source-pixel residuals; `actual` uses the same Blender bones as output landmarks."""
+    items = usable_observations.get(f, [])
+    if not items:
+        return np.empty((0, 2))
+    wanted = [(item["bone"], item["end"]) for item in items]
+    if FAST and not actual:
+        points = rig.points_xz(x[2:N], x[0], x[1], wanted)
+    else:
+        apply(x)
+        points = [rigutil.bone_point(arm, bone, end) for bone, end in wanted]
+    projected = camera_for(x[SCALE]).project(np.array(points)) / work_scale
+    return np.array([(point - item["point"]) / item["uncertaintyPx"]
+                     for point, item in zip(projected, items)])
+
+
+def region_metrics(x, f):
+    """Exact all-face working-mask feasibility, not an independent Blender projection certificate."""
+    key = (f, x.tobytes())
+    if key not in region_cache:
+        uv, _ = posed_uv(x)
+        level = levels[1.0]
+        source = level.masks[f].reshape(level.h, level.w)
+        candidate = raster.rasterize(uv.astype(np.float32), faces, level.w, level.h)
+        iou = raster.iou(source, candidate)
+        local = silhouette_regions.evaluate(source, candidate, region_frames.get(f, []), work_scale)
+        if len(region_cache) >= 256:
+            region_cache.clear()
+        region_cache[key] = (iou, local["pass"])
+    return region_cache[key]
+
+
+def region_key(x, f, loss):
+    iou, local_pass = region_metrics(x, f)
+    deficit = max(0.0, brief["iouThreshold"] - iou)
+    return (deficit > 0, deficit, not local_pass, loss)
+
+
+def candidate_key(x, f, loss):
+    """Original joint disks first, then regional body/local feasibility, then the augmented objective."""
+    prefix = ()
+    if usable_observations.get(f):
+        norms = np.linalg.norm(observation_residuals(x, f), axis=1)
+        prefix = (not bool(np.all(norms <= 1.0 + fitconstraints.TOL)),)
+    return prefix + (region_key(x, f, loss) if region_frames.get(f) else (loss,))
+
+
+def prefer_candidate(trial, x, f, prior, k, w_marks=W_MARKS):
+    objective = lambda y: score(y, f, prior, k, w_marks)
+    if region_frames.get(f):
+        return candidate_key(trial, f, objective(trial)) < candidate_key(x, f, objective(x) - 1e-6)
+    return fitconstraints.prefer(trial, x, objective, lambda y: observation_residuals(y, f))
 
 
 # ------------------------------------------------------------------------------------- the rasteriser and pyramid
@@ -344,17 +454,33 @@ class Level:
             occ[v.astype(np.int32) * self.w + u.astype(np.int32)] = True     # truncation is floor here: >= 0
         return occ, lost
 
-    def loss(self, uv, f):
+    def loss(self, uv, f, include_regions=False):
         occ, lost = self.occupancy(uv)
         inter = np.count_nonzero(occ & self.masks[f])
         model_area = np.count_nonzero(occ) + lost
         union = model_area + self.areas[f] - inter
         iou = inter / union if union else 1.0
         grid = occ.reshape(self.h, self.w)
+        regional = None
+        if include_regions:
+            source = self.masks[f].reshape(self.h, self.w)
+            candidate = grid
+            items = region_frames.get(f, [])
+            if self.k < 1.0 and items:
+                # Ingest and pyramid dimensions each round once. Preserve the
+                # source-coordinate crop by extending a missing coarse edge with
+                # identical zeros, not by changing either crop or inventing overlap.
+                need_w = max(self.w, max(math.ceil(item["bounds"][2] * work_scale * self.k) for item in items))
+                need_h = max(self.h, max(math.ceil(item["bounds"][3] * work_scale * self.k) for item in items))
+                if need_w > self.w or need_h > self.h:
+                    padding = ((0, need_h - self.h), (0, need_w - self.w))
+                    source, candidate = np.pad(source, padding), np.pad(candidate, padding)
+            regional = silhouette_regions.evaluate(source, candidate, items, work_scale * self.k)
         edges = grid & ~erode(grid)
         r, c = np.nonzero(edges)
         if len(r) == 0:
-            return W_IOU + W_CHAMFER * OUT_OF_FRAME, 0.0
+            result = (W_IOU + W_CHAMFER * OUT_OF_FRAME, 0.0)
+            return (result[0], iou, regional["loss"], regional["pass"]) if include_regions else result
         a = float(self.dist[f][r, c].mean())
         if len(r) > MAX_BOUNDARY:
             pick = np.linspace(0, len(r) - 1, MAX_BOUNDARY).astype(int)
@@ -367,7 +493,8 @@ class Level:
         else:
             b = 0.0
         chamfer = 0.5 * (a + b) / self.k + OUT_OF_FRAME * lost / max(model_area, 1)
-        return W_IOU * (1.0 - iou) + W_CHAMFER * chamfer, iou
+        result = (W_IOU * (1.0 - iou) + W_CHAMFER * chamfer, iou)
+        return (*result, regional["loss"], regional["pass"]) if include_regions else result
 
 
 t0 = time.time()
@@ -427,11 +554,17 @@ PERIODIC = {}       # frame -> (target values, per-value weights) while the peri
 
 def score(x, f, prior, k, w_marks=W_MARKS):
     uv, cam = posed_uv(x)
-    loss, _ = levels[k].loss(uv, f)
+    if region_frames.get(f):
+        loss, _, regional, _ = levels[k].loss(uv, f, include_regions=True)
+        loss += regional
+    else:
+        loss, _ = levels[k].loss(uv, f)
     loss += paw_term(x, f, cam)
-    if f in marks and w_marks:
-        points = mark_points(x, cam, list(marks[f]))
-        loss += w_marks * float(np.mean([np.hypot(*(points[b] - p)) for b, p in marks[f].items()]))
+    loss += observation_term(x, f, cam)
+    if w_marks and (f in marks or f in joint_marks):
+        errors = mark_errors(x, f, cam)
+        if errors:
+            loss += w_marks * float(np.mean(errors))
     if prior is not None:
         target, weight = prior
         loss += weight * W_SMOOTH * float(np.sum((x[2:N] - target[2:N]) ** 2))
@@ -495,13 +628,28 @@ def descend(x, f, prior, free_scale=False, schedule=LEVELS, w_marks=W_MARKS, onl
                             if trial[i] == x[i]:
                                 break
                             loss = score(trial, f, prior, k, w_marks)
-                            if loss >= best - 1e-6:
+                            wins = (candidate_key(trial, f, loss) < candidate_key(x, f, best - 1e-6)
+                                    if usable_observations.get(f) or region_frames.get(f) else loss < best - 1e-6)
+                            if not wins:
                                 break
                             x, best, improved, moved = trial, loss, True, True
                         if moved:
                             break
                 if not improved:
                     break
+        if usable_observations.get(f) and only is None:
+            # One coupled pass per pyramid level, never per grid/restart candidate.
+            scales = np.array([delta_for(i, max(1.0, LEVEL_STEPS[k][0])) for i in range(N + 1)])
+            if not free_scale:
+                scales[SCALE] = 0.0
+            refined, diagnostic = fitconstraints.refine(
+                x, lambda y: score(y, f, prior, k, w_marks),
+                lambda y: observation_residuals(y, f), clamp, scales, max_iterations=12)
+            if not region_frames.get(f) or prefer_candidate(refined, x, f, prior, k, w_marks):
+                x = refined
+            diagnostic["level"] = k
+            constraint_search.setdefault(f, []).append(diagnostic)
+            best = score(x, f, prior, k, w_marks)
     return x, best
 
 
@@ -530,12 +678,14 @@ for a, b in project["legPairs"]:
 
 def grid_search(x, f, idx, grid, k=LEVELS[0], around=False):
     best, keep = score(x, f, None, k), x[idx].copy()
+    best_key = candidate_key(x, f, best)
     for combo in np.array(np.meshgrid(*[grid] * len(idx), indexing="ij")).reshape(len(idx), -1).T:
         trial = x.copy()
         trial[idx] = combo + (x[idx] if around else 0.0)
         loss = score(clamp(trial), f, None, k)
-        if loss < best:
-            best, keep = loss, trial[idx].copy()
+        key = candidate_key(trial, f, loss)
+        if key < best_key:
+            best, keep, best_key = loss, trial[idx].copy(), key
     x[idx] = keep
     return x
 
@@ -566,9 +716,14 @@ def first_frame(f, known_scale, scales=FIRST_SCALES):
     for s in starts:
         x = chain_search(initial_offset(f, s), f)
         coarse.append(descend(x, f, None, free_scale=known_scale is None, schedule=LEVELS[:1]))
-    coarse.sort(key=lambda item: item[1])
+    coarse.sort(key=lambda item: candidate_key(item[0], f, item[1]))
     mid = [descend(x, f, None, free_scale=known_scale is None, schedule=LEVELS[1:2]) for x, _ in coarse[:3]]
-    x, _ = min(mid, key=lambda item: item[1])
+    if usable_observations.get(f) or region_frames.get(f):
+        # Compare a bounded shortlist at the actual full-resolution objective.
+        fine = [descend(chain_polish(x, f), f, None, free_scale=known_scale is None,
+                        schedule=LEVELS[1:]) for x, _ in mid]
+        return min(fine, key=lambda item: candidate_key(item[0], f, item[1]))
+    x, _ = min(mid, key=lambda item: candidate_key(item[0], f, item[1]))
     x = chain_polish(x, f)
     return descend(x, f, None, free_scale=known_scale is None, schedule=LEVELS[1:])
 
@@ -583,6 +738,7 @@ def chain_polish(x, f):
         if len(idx) < 2:
             continue
         best, keep = score(x, f, None, LEVELS[1]), x.copy()
+        best_key = candidate_key(x, f, best)
         for a in near:
             for b in near:
                 trial = x.copy()
@@ -591,8 +747,9 @@ def chain_polish(x, f):
                 for i in idx[2:]:
                     trial = grid_search(clamp(trial), f, [i], wide, LEVELS[1])
                 loss = score(clamp(trial), f, None, LEVELS[1])
-                if loss < best:
-                    best, keep = loss, trial
+                key = candidate_key(trial, f, loss)
+                if key < best_key:
+                    best, keep, best_key = loss, trial, key
         x = keep
     return x
 
@@ -635,6 +792,16 @@ def search(x, f, prior, free_scale):
         return y
     for chain, idx in chain_indices.items():
         candidates += [(lambda best, idx=idx: perturb(best, idx), idx)] * RESTARTS
+    if usable_observations.get(f) or region_frames.get(f):
+        best = x
+        for make, idx in candidates:
+            trial = descend(clamp(make(best)), f, prior, schedule=(k,), only=set(idx))[0]
+            if prefer_candidate(trial, best, f, prior, k):
+                best = trial
+        if best is x:
+            return x
+        polished = descend(best, f, prior, free_scale=free_scale, schedule=LEVELS[2:])[0]
+        return polished if prefer_candidate(polished, x, f, prior, 1.0) else x
     return fitsearch.search(
         x, candidates,
         solve=lambda y, idx: descend(clamp(y), f, prior, schedule=(k,), only=set(idx))[0],
@@ -647,15 +814,98 @@ def restart(x, f, free_scale):
     """A tracked frame still below RESTART_IOU: solve it again from scratch (the first frame's global search, about
     the tracked camera scale) and keep whichever has the lower silhouette loss. Returns the pose and whether the
     global solution won (tracking then restarts from it, without the old velocity)."""
-    if frame_iou(x, f) >= RESTART_IOU:
+    if region_frames.get(f):
+        iou, local_pass = region_metrics(x, f)
+        if iou >= brief["iouThreshold"] and local_pass:
+            return x, False
+    elif frame_iou(x, f) >= RESTART_IOU:
         return x, False
     if free_scale:
         g, _ = first_frame(f, None, tuple(x[SCALE] + d for d in RESTART_SCALES))
     else:
         g, _ = first_frame(f, x[SCALE])
-    if score(g, f, None, 1.0) < score(x, f, None, 1.0) - 1e-6:
+    wins = (prefer_candidate(g, x, f, None, 1.0) if usable_observations.get(f) or region_frames.get(f)
+            else score(g, f, None, 1.0) < score(x, f, None, 1.0) - 1e-6)
+    if wins:
         return g, True
     return x, False
+
+
+def shared_camera(xs, frames):
+    """Choose one camera with the observed poses jointly, retaining feasible shared candidates."""
+    median = float(np.median([xs[f][SCALE] for f in frames]))
+    regional = any(region_frames.get(f) for f in frames)
+    has_disks = any(usable_observations.get(f) for f in frames)
+    observed = [f for f in frames if usable_observations.get(f) or region_frames.get(f)]
+    if not observed:
+        for f in frames:
+            xs[f][SCALE] = median
+        return median
+
+    # Only observed poses need coupled restoration. The last coordinate is the
+    # single camera shared by every frame, never an independently fitted scale.
+    slots = {f: slice(i * N, (i + 1) * N) for i, f in enumerate(observed)}
+    start = np.concatenate([xs[f][:N] for f in observed] + [[median]])
+
+    def pose(y, f):
+        return np.append(y[slots[f]] if f in slots else xs[f][:N], y[-1])
+
+    def residuals(y):
+        return np.concatenate([observation_residuals(pose(y, f), f) for f in observed])
+
+    def objective(y):
+        return sum(score(pose(y, f), f, None, 1.0) for f in frames)
+
+    def bounded(y):
+        for f in observed:
+            value = clamp(pose(y, f))
+            y[slots[f]], y[-1] = value[:N], value[SCALE]
+        return y
+
+    def key(y):
+        norms = np.linalg.norm(residuals(y), axis=1)
+        if regional:
+            value = objective(y)
+            metrics = {f: region_metrics(pose(y, f), f) for f in frames}
+            threshold = brief["iouThreshold"]
+            deficit = max(0.0, threshold - float(np.mean([row[0] for row in metrics.values()])))
+            deficit += sum(max(0.0, threshold - metrics[f][0]) for f in observed if region_frames.get(f))
+            return (not bool(np.all(norms <= 1.0 + fitconstraints.TOL)), deficit > 0, deficit,
+                    any(not metrics[f][1] for f in observed if region_frames.get(f)), value)
+        return (not bool(np.all(norms <= 1.0 + fitconstraints.TOL)), objective(y))
+
+    step = max(1.0, LEVEL_STEPS[LEVELS[0]][0])
+    scales = np.concatenate([np.tile([delta_for(i, step) for i in range(N)], len(observed)),
+                             [delta_for(SCALE, step)]])
+    best = start.copy()
+    # The median is only a seed: an observed frame may already supply the only
+    # viable shared scale. Judge all disks together before replacing that seed.
+    seeds = dict.fromkeys([median] + [float(xs[f][SCALE]) for f in observed])
+    for scale in seeds:
+        trial = start.copy()
+        trial[-1] = scale
+        if key(trial) < key(best):
+            best = trial.copy()
+        if has_disks:
+            restored, _ = fitconstraints.refine(trial, objective, residuals, bounded, scales)
+            if key(restored) < key(best):
+                best = restored
+        if regional:
+            # Refine only existing observed-pose parameters at one shared candidate
+            # scale. Each accepted update must retain the aggregate body/local gate.
+            for f in observed:
+                refined, _ = descend(pose(trial, f), f, None, schedule=(1.0,))
+                candidate = trial.copy()
+                candidate[slots[f]] = refined[:N]
+                if key(candidate) < key(trial):
+                    trial = candidate
+            if key(trial) < key(best):
+                best = trial
+    for f in frames:
+        xs[f] = pose(best, f)
+    return float(best[-1])
+
+
 
 
 # ------------------------------------------------------------------------------------------- identity relabelling
@@ -692,7 +942,7 @@ def fixed_neighbours(xs, frames):
 
 def relabel(xs, frames):
     """Left and right legs of a pair cast the same silhouette: choose, per frame, which fitted chain is which, by
-    dynamic programming over (previous label, label) with the marks and the legs' acceleration as costs.
+    dynamic programming: source-disk feasibility first, then the original marks and acceleration costs.
 
     A span refit adds up to two fixed frames on each side with their label pinned to 0 (as fitted), so acceleration
     ties the span's identity to its neighbours': without them, keeping or exchanging a pair for the whole span costs
@@ -704,42 +954,73 @@ def relabel(xs, frames):
     for pair in pairs:
         a, b, ia, ib = pair
         paw_a, paw_b = project["paws"].get(a), project["paws"].get(b)
+        joint_names = [bone for chain in (a, b) for bone in project["chains"][chain] if bone in bones]
         options = []
         for f in seq:
             opts = []
+            source_error = (np.linalg.norm(observation_residuals(xs[f], f), axis=1)
+                            if usable_observations.get(f) else np.empty(0))
             for label in (0, 1):
                 y = swapped(xs[f], pair) if label else xs[f]
                 cost = inf if label and f in pinned else 0.0
-                if f in marks and f not in pinned:
+                if f not in pinned and (f in marks or f in joint_marks):
                     cam = camera_for(y[SCALE])
-                    wanted = [p for p in (paw_a, paw_b) if p in marks[f]]
-                    if wanted:
-                        pts = mark_points(y, cam, wanted)
-                        cost = W_SWAP_MARKS * float(np.mean([np.hypot(*(pts[p] - marks[f][p])) for p in wanted]))
-                opts.append((y[ia + ib], cost))
+                    errors = mark_errors(y, f, cam, [p for p in (paw_a, paw_b) if p], joint_names)
+                    if errors:
+                        cost = W_SWAP_MARKS * float(np.mean(errors))
+                if f not in pinned and f in observation_frames:
+                    cost += observation_term(y, f, camera_for(y[SCALE]),
+                                             joint_names + [p for p in (paw_a, paw_b) if p])
+                if label and region_frames.get(f) and candidate_key(y, f, 0.0) > candidate_key(xs[f], f, 0.0):
+                    cost = inf
+                error = (np.linalg.norm(observation_residuals(y, f), axis=1)
+                         if len(source_error) else source_error)
+                if label and len(source_error):
+                    # Preserve every established disk, even when another disk is
+                    # still unresolved. A swap cannot trade away source evidence.
+                    if np.any(error > np.maximum(1.0, source_error) + fitconstraints.TOL):
+                        cost = inf
+                infeasible = (int(np.any(error > 1.0 + fitconstraints.TOL))
+                              if math.isfinite(cost) else inf)
+                opts.append((y[ia + ib], cost, infeasible))
             options.append(opts)
         n = len(seq)
         if n < 3:
+            # There is no acceleration term with fewer than three samples.
+            # Source-observed frames still need identity selection; leave the
+            # historical no-observation short-clip behavior untouched.
+            for f, opts in zip(seq, options):
+                if f in pinned or not usable_observations.get(f):
+                    continue
+                if (opts[1][2] < opts[0][2]
+                        or (opts[1][2] == opts[0][2] and better(opts[1][1], opts[0][1]))):
+                    xs[f] = swapped(xs[f], pair)
+                    changed += 1
             continue
         # state = (label at t-1, label at t); cost[t][s]
         states = [(0, 0), (0, 1), (1, 0), (1, 1)]
         cost = {(l1, l2): options[0][l1][1] + options[1][l2][1] for l1, l2 in states}
+        violations = {(l1, l2): options[0][l1][2] + options[1][l2][2] for l1, l2 in states}
         back = []
         for t in range(2, n):
-            new, ptr = {}, {}
+            new, new_violations, ptr = {}, {}, {}
             for l1, l2 in states:
-                best, arg = inf, 0
+                best, best_violation, arg = inf, inf, 0
                 for l0 in (0, 1):
                     accel = options[t][l2][0] - 2 * options[t - 1][l1][0] + options[t - 2][l0][0]
                     c = cost[(l0, l1)] + W_SWAP_ACCEL * float(np.sum(accel ** 2))
-                    if better(c, best):
-                        best, arg = c, l0
+                    v = violations[(l0, l1)]
+                    if v < best_violation or (v == best_violation and better(c, best)):
+                        best, best_violation, arg = c, v, l0
                 new[(l1, l2)], ptr[(l1, l2)] = best + options[t][l2][1], arg
+                new_violations[(l1, l2)] = best_violation + options[t][l2][2]
             cost = new
+            violations = new_violations
             back.append(ptr)
         state = states[0]
         for s in states[1:]:
-            if better(cost[s], cost[state]):
+            if (violations[s] < violations[state]
+                    or (violations[s] == violations[state] and better(cost[s], cost[state]))):
                 state = s
         labels = [state[0], state[1]]
         for ptr in reversed(back):
@@ -762,12 +1043,20 @@ for f in range(frame_count):
     if entries[f] and (f < span[0] or f >= span[1]):
         xs[f] = np.array(list(entries[f]["values"]) + [cam_scale])
 history = [xs[f] for f in (span[0] - 2, span[0] - 1) if f in xs]
-frames = list(range(span[0], span[1]))
+frames = args.get("frameIndices", list(range(span[0], span[1])))
+if (not isinstance(frames, list) or len(set(frames)) != len(frames)
+        or any(isinstance(f, bool) or not isinstance(f, int) or not 0 <= f < frame_count for f in frames)):
+    raise ValueError("frameIndices must be distinct ingested frame indices")
+frames = sorted(frames)
+if args.get("frameIndices") is not None and (not frames or previous is not None or args.get("span")):
+    raise ValueError("Sparse preflight needs frames and cannot initialize or overwrite a canonical span fit")
 t_start = time.time()
-# A new fit tracks the camera scale frame by frame (one frame can mistake it), then keeps the clip's median.
+# A new fit tracks scale freely, then restores one shared camera when source disks are present.
 scale_free = cam_scale is None
 for f in frames:
     t_frame = time.time()
+    if args.get("frameIndices") is not None:
+        history = []  # Representative frames are independent solves, not adjacent motion samples.
     prior = predict(history)
     if prior is None:
         x, loss = first_frame(f, cam_scale)
@@ -784,19 +1073,18 @@ for f in frames:
           f"({time.time() - t_frame:.1f}s)", flush=True)
 
 if scale_free:
-    cam_scale = float(np.median([xs[f][SCALE] for f in frames]))
-    for f in frames:
-        xs[f][SCALE] = cam_scale
+    cam_scale = shared_camera(xs, frames)
     print(f"VID2GODOT_FIT camera scale {cam_scale:.4f}", flush=True)
-changed = relabel(xs, frames)
+changed = relabel(xs, frames) if args.get("frameIndices") is None else 0
 print(f"VID2GODOT_FIT relabelled {changed} leg-pair frames", flush=True)
 for p in range(REFINE_PASSES):
     for f in frames:
-        neighbours = [xs[g] for g in (f - 1, f + 1) if g in xs]
+        neighbours = ([xs[g] for g in (f - 1, f + 1) if g in xs]
+                      if args.get("frameIndices") is None else [])
         target = np.mean(neighbours, axis=0) if neighbours else None
         xs[f], _ = descend(xs[f], f, (target, 1.0) if target is not None else None,
                            schedule=LEVELS[1:] if p == 0 and scale_free else LEVELS[2:])
-    changed = relabel(xs, frames)
+    changed = relabel(xs, frames) if args.get("frameIndices") is None else 0
     print(f"VID2GODOT_FIT refine pass {p + 1}: relabelled {changed}", flush=True)
 print(f"VID2GODOT_FIT solved {len(frames)} frames in {time.time() - t_start:.1f}s", flush=True)
 
@@ -826,7 +1114,7 @@ def periodic_pass(xs, frames):
         start[2:N] = prior["targets"][f][2:]
         kept, _ = descend(xs[f], f, smooth, schedule=LEVELS[2:])
         moved, _ = descend(clamp(start), f, smooth, schedule=LEVELS[1:])
-        xs[f] = min((kept, moved), key=lambda y: score(y, f, smooth, 1.0))
+        xs[f] = min((kept, moved), key=lambda y: candidate_key(y, f, score(y, f, smooth, 1.0)))
     PERIODIC.clear()
     changed = relabel(xs, frames)
     print(f"VID2GODOT_FIT periodic pass in {time.time() - t_pass:.1f}s: relabelled {changed}", flush=True)
@@ -862,23 +1150,95 @@ def describe(values, previous_entry):
     paws_u = {f"{a}/{b}": float(camera.project(np.array(paws[a]))[0] - camera.project(np.array(paws[b]))[0])
               for a, b in project["legPairs"]}
     uv = camera.project(rigutil.evaluated_vertices(skinned)[:, [0, 2]]).astype(np.float32)
-    return {"flags": flags, "joints": joints, "paws": paws, "paws_u": paws_u}, uv
+    landmarks = {bone: {end: camera.project(np.array(rigutil.bone_point(arm, bone, end))).tolist()
+                        for end in ("head", "tail")}
+                 for bone in dict.fromkeys(bones + list(project["paws"].values()))}
+    return {"flags": flags, "joints": joints, "paws": paws, "paws_u": paws_u, "landmarks": landmarks}, uv
 
 
 prev_entry = entries[span[0] - 1] if span[0] > 0 else None
 for f in frames:
     x = xs[f]
+    if usable_observations.get(f):
+        exact = lambda y: observation_residuals(y, f, actual=True)
+        before = np.linalg.norm(exact(x), axis=1)
+        if np.any(before > 1.0 + fitconstraints.TOL):
+            # NumPy FK can differ by a few floating-point units at a disk's
+            # boundary. Restore against the actual output oracle, not a larger
+            # disk or a mandatory inward target. The shared camera stays fixed.
+            center = x.copy()
+            scales = np.array([delta_for(i, LEVEL_STEPS[1.0][-1]) for i in range(N + 1)])
+            scales[SCALE] = 0.0
+
+            def final_clamp(y):
+                return clamp(np.clip(y, center - scales, center + scales))
+
+            original = score(x, f, None, 1.0)
+            x, diagnostic = fitconstraints.refine(
+                x, lambda y: score(y, f, None, 1.0), exact, final_clamp, scales,
+                max_iterations=0)
+            diagnostic.update({"phase": "final-actual-projection", "oracle": "Blender pose bones",
+                               "objectiveBefore": original,
+                               "maxNormalizedErrorBefore": float(before.max())})
+            constraint_search.setdefault(f, []).append(diagnostic)
+            xs[f] = x
     loss = score(x, f, None, 1.0)
     info, uv = describe(x, prev_entry)
     entries[f] = {"index": f, "values": [float(v) for v in x[:N]], "loss": loss, **info}
+    scored_uv, cam = posed_uv(x)
+    silhouette, _ = levels[1.0].loss(scored_uv, f)
+    manual = mark_errors(x, f, cam)
+    entries[f]["objective"] = {"silhouette": float(silhouette), "paws": float(paw_term(x, f, cam)),
+                                "marks": W_MARKS * float(np.mean(manual)) if manual else 0.0,
+                                "observations": observation_term(x, f, cam), "total": loss,
+                                "context": "same full-resolution objective, no temporal/periodic prior"}
+    if region_frames.get(f):
+        _, _, regional, _ = levels[1.0].loss(scored_uv, f, include_regions=True)
+        entries[f]["objective"]["regions"] = regional
+    if usable_observations.get(f):
+        # Recompute after the shared-camera, relabel and all refinement passes.
+        normalized = np.linalg.norm(observation_residuals(x, f, actual=True), axis=1)
+        feasible = bool(np.all(normalized <= 1.0 + fitconstraints.TOL))
+        entries[f]["constraintSearch"] = {
+            "status": "feasible" if feasible else "unresolved", "feasible": feasible,
+            "maxNormalizedError": float(normalized.max()), "cameraScale": float(cam_scale),
+            "passes": constraint_search.get(f, []),
+            "scope": "Local search diagnostics; independent assessment remains authoritative"}
     projection[f] = uv
     prev_entry = entries[f]
 
 poses = {"bones": bones, "names": names, "axes": [list(a) for a in axes], "fps": args["fps"],
          "camera": camera.to_json(), "cameraScale": cam_scale, "registrationCamera": base_camera.to_json(),
-         "deformModel": DEFORM_MODEL, "periodicPass": periodic_ran, "frames": entries}
+         "deformModel": DEFORM_MODEL, "periodicPass": periodic_ran, "restartSeed": args.get("seed"),
+         "frames": entries}
+if args.get("witness"):
+    witness = json.loads(Path(args["witness"]).read_text())
+    if witness.get("names") != names or witness.get("registrationCamera") != base_camera.to_json():
+        raise ValueError("Diagnostic witness must use the same rig parameter names and registered camera")
+    witness_entries = {e["index"]: e for e in witness["frames"] if e is not None}
+    witness_frames, comparisons = [], []
+    for f in frames:
+        if f not in witness_entries:
+            continue
+        values = witness_entries[f]["values"]
+        valid = (len(values) == N and all(math.isfinite(v) for v in values)
+                 and all(low <= values[i + 2] <= high for i, (low, high) in enumerate(limits))
+                 and math.isclose(float(witness.get("cameraScale", 1)), cam_scale, rel_tol=1e-9, abs_tol=1e-9))
+        if not valid:
+            comparisons.append({"index": f, "validWitness": False})
+            continue
+        x = np.array(list(values) + [cam_scale], float)
+        info, _ = describe(x, None)
+        witness_frames.append({"index": f, "values": values, **info})
+        comparisons.append({"index": f, "validWitness": True,
+                            "fittedObjective": score(xs[f], f, None, 1.0),
+                            "witnessObjective": score(x, f, None, 1.0)})
+    poses["witness"] = {"frames": witness_frames}
+    poses["comparisons"] = comparisons
+if args.get("frameIndices") is not None:
+    poses["frames"] = [entries[f] for f in frames]
 Path(args["out"]).write_text(json.dumps(poses))
 np.savez_compressed(args["projection"], uv=projection, faces=rigutil.triangles(skinned))
-rigutil.write_result(args, {"frames": span[1] - span[0], "meanLoss": float(np.mean([e["loss"] for e in entries])),
+rigutil.write_result(args, {"frames": len(frames), "meanLoss": float(np.mean([entries[f]["loss"] for f in frames])),
                             "cameraScale": cam_scale, "deformModel": DEFORM_MODEL, "periodicPass": periodic_ran,
                             "seconds": time.time() - t_start})

@@ -1102,7 +1102,8 @@ def loop_rest(found, period, doubled, identity, poses, project, every, paws, cha
                      "drift": contacts["drift"]}
     else:
         n_keys = motion.key_count(duration)
-        keys, declared, bake = rig_keys(contacts, n_keys, names, project, rig, rest, period / fps, factor)
+        keys, declared, bake = rig_keys(contacts, n_keys, names, project, rig, rest, period / fps, factor,
+                                        limits_deg=(brief or {}).get("limitsDeg", {}))
         extra.update({"smooth": {**contacts["smoothReport"], "seriesWorldPitchKept": contacts["smoothReport"][
                           "worldPitchKept"], "worldPitchKept": bake["worldPitchKept"], "played": bake["played"]},
                       "contactCheck": bake["check"], "ik": bake["ik"]})
@@ -1330,7 +1331,7 @@ def redetect(keys, planar, names, project, rest, declared, speed, tol, period_s)
     return agreement, heights, vx, phases, again
 
 
-def rig_keys(contacts, n_keys, names, project, rig, rest, period_s, factor, start=None):
+def rig_keys(contacts, n_keys, names, project, rig, rest, period_s, factor, start=None, limits_deg=None):
     """The bake's keys from the smooth cycle: every planted paw pinned (motion.plan_keys) over its detection on the
     key grid, the declared contacts half a key wider at each end (`widened`), and the check: the keys played as the clip plays them (linear between
     keys), their paws detected again with the same rule (near the ground within CONTACT_TOLERANCE and world-still;
@@ -1354,7 +1355,7 @@ def rig_keys(contacts, n_keys, names, project, rig, rest, period_s, factor, star
     lift = -contacts["groundHeight"]
     stride = (speed or 0.0) * period_s
     keys, paws, ik = motion.plan_keys(planar, smooth, names, project, pinned, stride, rest, lift, n_keys,
-                                      clearance=penetration(tol))
+                                      clearance=penetration(tol), limits_deg=limits_deg)
     agreement, heights, vx, phases, again = redetect(keys, planar, names, project, rest, declared, speed, tol,
                                                      period_s)
     releases = motion.release_windows(pinned, n_keys, motion.PIN_RELEASE.inset_keys)
@@ -1377,12 +1378,14 @@ def rig_keys(contacts, n_keys, names, project, rig, rest, period_s, factor, star
             for chain in low:
                 open_keys, settled[chain] = motion.settle_edges(planar, open_keys, names, project, chain,
                                                                 releases[chain], declared[chain], n_keys, plant,
-                                                                grounds[chain])
-            open_keys, _ = motion.clear_ground(planar, open_keys, names, project, grounds, penetration(tol))
+                                                                grounds[chain], limits_deg=limits_deg)
+            open_keys, _ = motion.clear_ground(planar, open_keys, names, project, grounds, penetration(tol),
+                                               limits_deg=limits_deg)
             if settle_pass == 0:
                 swings = {c: (declared[c], set(np.flatnonzero(motion._pinned_mask(releases[c], n_keys)[0]).tolist())
                               | set(settled[c])) for c in low}
-                open_keys, swung = motion.clear_swing(planar, open_keys, names, project, swings, grounds, plant)
+                open_keys, swung = motion.clear_swing(planar, open_keys, names, project, swings, grounds, plant,
+                                                      limits_deg=limits_deg)
         for chain in low:
             if settled[chain]:
                 ik.setdefault(chain, {})["settledKeys"] = settled[chain]
@@ -1404,7 +1407,7 @@ def rig_keys(contacts, n_keys, names, project, rig, rest, period_s, factor, star
         shift = motion.seam_shift(keys, planar, names, project, room)
         if shift:
             out = rig_keys(contacts, n_keys, names, project, rig, rest, period_s, factor,
-                           start=(key0 + shift) % n_keys)
+                           start=(key0 + shift) % n_keys, limits_deg=limits_deg)
             out[2]["check"]["loopSeam"]["movedFrom"] = {"key": key0, "worstRatio": round(max(seam.values()), 4)}
             return out
     jumps = motion.edge_jumps(paws, motion.release_windows(pinned, n_keys, motion.PIN_RELEASE.inset_keys), n_keys,
@@ -1473,8 +1476,8 @@ def rig_keys(contacts, n_keys, names, project, rig, rest, period_s, factor, star
         raise FactsError("The leg IK cannot reach a pin within the body's contact tolerance "
                          f"({reach_tol * 1000:.2f} mm): " + ", ".join(f"{b} misses by {v * 1000:.2f} mm"
                                                                       for b, v in worst.items() if v > reach_tol)
-                         + f" (leg IK: {ik}). The pinned paw lies beyond the whole leg's straight reach even with "
-                           f"the girdle swung and the body lowered; check the rig's leg chains and the fit's trunk")
+                         + f" (leg IK: {ik}). The contact correction remains unresolved; measured IK residuals "
+                           f"are not proof of unreachable geometry. Check the rig's leg chains and the fit's trunk")
     low = {b: a for b, a in agreement.items() if a < CONTACT_AGREEMENT}
     if low:
         raise FactsError(f"The declared contacts and a re-detection from the baked keys disagree: they agree on "

@@ -29,8 +29,18 @@ def run_blender(script, args, log_dir, blender=None, timeout=4 * 3600):
     result.unlink(missing_ok=True)
     args_path = log_dir / f"{script.stem}.args.json"
     args_path.write_text(json.dumps({**args, "result": str(result)}, indent=2))
-    command = [str(blender_path(blender)), "--background", "--factory-startup", "--python-exit-code", "1",
-               "--python", str(script), "--", str(args_path)]
+    command = [str(blender_path(blender)), "--background", "--factory-startup", "--python-exit-code", "1"]
+    python_site = os.environ.get("VID2GODOT_BLENDER_PYTHON_SITE")
+    if python_site is not None:
+        site = Path(python_site).expanduser().resolve()
+        if not python_site or not site.is_dir():
+            raise BlenderError(
+                "VID2GODOT_BLENDER_PYTHON_SITE must name an existing directory "
+                "containing packages compatible with Blender's bundled Python ABI; "
+                "install wheels with that Python's pip --target into a task-local directory"
+            )
+        command.extend(["--python-expr", f"import sys; sys.path.insert(0, {str(site)!r})"])
+    command.extend(["--python", str(script), "--", str(args_path)])
     log = log_dir / f"{script.stem}.log"
 
     def text(data):

@@ -155,6 +155,25 @@ python3 anim/pipeline.py lab --work $WORK       # open review/lab.html and every
 - `ingest` drops repeated frames by their rhythm and keeps one frame per pose.
 - If it warns that the outline's height varies, or flags the animal touching the frame edge, I reject the video and go back to step 4.
 - `fit` matches the bones to the outline frame by frame and decides once which leg is near and which is far.
+- For region-guided fits, feasibility uses every posed mesh triangle at the full
+  working-mask resolution, including opposite-facing protrusions. Sampled or
+  facing-filtered silhouettes may guide the unchanged objective, but cannot
+  establish feasibility or populate the region-metrics cache. Exact region
+  evaluation owns that cache.
+- The independent final assessment of the actual Blender-deformed mesh remains
+  the production authority: the candidate's exact raster and final assessment
+  must agree on the unchanged regional thresholds (body 0.90, local 0.85).
+  A nearest-neighbor-derived mask is diagnostic only, not independent original
+  segmentation or production evidence. Do not relax thresholds, alter the rig
+  or source, or add hidden joint marks to turn a failed assessment into a pass.
+- Blender's bundled Python needs its own ABI-compatible numpy and Pillow.
+  Host Python packages alone are insufficient. If necessary, use the selected
+  Blender's bundled Python to install compatible wheels with `pip --target`
+  into one task-local directory and set `VID2GODOT_BLENDER_PYTHON_SITE` to that
+  existing directory; the central runner inserts it before the worker script.
+  See README's separate-Python setup example. Scratch Pillow 12.3.0 worked with
+  CPython 3.13 (`cp313`); it is not a universal pin. No system/application install,
+  automatic dependency installation, or ambient `PYTHONPATH` assumption is needed.
 
 **When a leg swaps sides partway through.** Near and far legs share one outline, so sometimes the fit swaps them mid-clip. It shows as a `leg_crossing:` flag, or `facts` saying a paw touches down twice in one cycle. A pair swapped for the whole clip is fine; that's just a mirrored lead. A swap partway through is a failure, and I fix it like this:
 

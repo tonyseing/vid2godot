@@ -30,6 +30,38 @@ Rollback: `python3 ~/.vid2godot/repo/install.py --rollback <backup directory pri
 - game-asset-3d-pipeline installed (img2godot); `verify` uses its `forge/godot/verify.py` from
   `~/.agents/skills/game-asset-3d-pipeline`, or the path given to `--threed-verify`
 
+### Blender's separate Python dependencies
+
+The host Python's numpy, scipy and Pillow do not make those packages available to
+Blender's bundled Python. Region-guided fitting needs numpy and Pillow inside
+Blender; its candidate rasterization does not need scipy. Compiled wheels must
+match the bundled Python's ABI, platform and architecture, not the host Python.
+
+If Pillow is absent, install compatible wheels into a task-local directory using
+the **selected Blender installation's bundled Python** (replace the executable
+and target paths below with your installation and task paths):
+
+```bash
+BLENDER_PYTHON=/absolute/path/to/blender/bundled/python3.13
+BLENDER_SITE=/absolute/path/to/task/blender-python-site
+"$BLENDER_PYTHON" -m pip install --target "$BLENDER_SITE" Pillow
+export VID2GODOT_BLENDER_PYTHON_SITE="$BLENDER_SITE"
+```
+
+This is an explicit setup step, not an automatic install. It writes only to the
+task-local target, not Blender's application or system site-packages. Pillow
+12.3.0 was measured compatible with the scratch CPython 3.13 (`cp313`) Blender
+environment; that is an example, not a universal version pin or ABI guarantee.
+Use wheels matching your selected Blender. If numpy is also missing, install a
+compatible numpy wheel into the same target.
+
+`VID2GODOT_BLENDER_PYTHON_SITE` accepts one existing directory, not a path list.
+The central Blender runner resolves it and inserts that exact directory at the
+front of Blender's `sys.path` with an ordered `--python-expr` before the worker
+script. It does not change the environment or rely on ambient `PYTHONPATH`.
+Unset it to retain the default Blender invocation. `--blender` and
+`VID2GODOT_BLENDER` continue to select the Blender executable independently.
+
 ## Tests
 
 ```bash

@@ -206,7 +206,9 @@ def returned_model(client, done, sleep, warnings, index):
 
 
 def run_generate(client, out_dir, model_id, brief, reference_png, background, candidates=2, seed=1000,
-                 max_cost=None, interval=10, timeout=1800, sleep=time.sleep):
+                 max_cost=None, interval=10, timeout=1800, sleep=time.sleep, audio=None):
+    """`audio` None asks for sound when the listing allows it; False turns it off (an audio model is sent
+    `generate_audio: false`, since leaving it out may keep the provider's default of sound)."""
     if shutil.which("ffmpeg") is None:
         raise StageError("ffmpeg is not installed; it is needed for the candidate strips, so nothing was submitted")
     info = client.video_model(model_id)
@@ -215,7 +217,8 @@ def run_generate(client, out_dir, model_id, brief, reference_png, background, ca
     if "first_frame" not in (info.get("supported_frame_images") or []):
         raise StageError(f"{model_id} cannot start from our reference image (no first_frame)")
     w, h = size_for(info, brief["resolution"], brief["aspectRatio"])
-    audio = sends_audio(info)
+    can_sound = sends_audio(info)
+    audio = can_sound if audio is None else bool(audio) and can_sound
     each, basis = price(info, brief["videoSeconds"], brief["resolution"], brief["aspectRatio"], audio=audio,
                         size=(w, h))
     if each is None and max_cost is None:
@@ -255,8 +258,8 @@ def run_generate(client, out_dir, model_id, brief, reference_png, background, ca
                        "seed": seed + index,
                        "frame_images": [{"type": "image_url", "image_url": {"url": data_url(reference_png)},
                                          "frame_type": "first_frame"}]}
-            if audio:
-                payload["generate_audio"] = True
+            if can_sound:
+                payload["generate_audio"] = audio
             job = client.submit(payload)
             record["jobs"].append({"index": index, "jobId": job["id"], "pollingUrl": job["polling_url"]})
             done = client.wait(job, interval=interval, timeout=timeout, sleep=sleep)
