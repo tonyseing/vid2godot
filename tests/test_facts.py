@@ -1404,6 +1404,53 @@ class BodyScaleTests(unittest.TestCase):
         self.assertGreater(report["touchdowns"]["a"], 1)
         self.assertIn("slideCheck", report)
 
+    def test_a_noisy_fit_stance_is_trimmed_to_the_still_part_of_the_slide(self):
+        """#174 (wolf lope on elbow-174b): the backward slide runs on past liftoff and starts before touchdown (the
+        paw decelerates into it and keeps drifting back as it lifts), so pinning the whole slide held paws 0.40-0.60
+        of a cycle against the video's 0.35-0.41 and the contact IK snapped them at the edges. With `trim_stance` (a
+        recorded reason; the field vole's accepted reading is unchanged without it) the stance is the slide from its
+        first to its last world-still sample (in-place speed at NOISY['order'] harmonics within SLIP_SHARE of the ground
+        speed)."""
+        n = 240
+        u = np.arange(n) / n
+        x, still, z = {}, {}, {}
+        for chain, phase in (("a", 0.0), ("b", 0.5)):
+            w = (u - phase) % 1.0
+            v = np.where(w < 0.5, -1.0, 1.0)                           # slides back for half the cycle
+            v[(w < 0.5) & ((w < 0.08) | (w >= 0.42))] = -0.4           # but is world-still only from 0.08 to 0.42
+            still[chain] = v
+            x[chain] = np.where(w < 0.5, 0.25 - w, w - 0.75)          # forward at the slide's start
+            z[chain] = np.where((w >= 0.08) & (w < 0.42), 0.0, 0.03)   # hovers 3 cm, inside the stance tolerance
+            z[chain][(w > 0.2) & (w < 0.23)] = 0.07                     # a lift in mid-stance breaks the strict reading
+        tol = facts.REFERENCE
+        untrimmed = facts.read_cycle(z, still, still, lambda: x, 1, tol)
+        self.assertNotIn("trimStance", untrimmed[-1])                 # the default reading is unchanged
+        for chain in untrimmed[3]:
+            self.assertAlmostEqual(float(np.mean(untrimmed[3][chain])), 0.5, delta=1.5 / n)
+        ground, speed, reason, masks, report = facts.read_cycle(z, still, still, lambda: x, 1, tol,
+                                                                trim_stance="test")
+        self.assertEqual(report["reading"], "noisy fit")
+        self.assertEqual(report["trimStance"], "test")
+        self.assertTrue(any("--trim-stance" in w for w in facts.reading_warning(report)))
+        for chain, phase in (("a", 0.0), ("b", 0.5)):
+            on, off = facts.contact_window(masks[chain])[0]
+            self.assertAlmostEqual((on - phase) % 1.0, 0.08, delta=1.5 / n, msg=chain)
+            self.assertAlmostEqual((off - phase) % 1.0, 0.42, delta=1.5 / n, msg=chain)
+        self.assertAlmostEqual(speed, 1.0, places=6)
+        self.assertEqual(report["slideDuty"], {"a": 0.5, "b": 0.5})
+
+    def test_a_noisy_fit_slide_with_no_still_sample_is_kept_whole(self):
+        """A slide whose in-place speed never comes within SLIP_SHARE of the ground speed, or a reading without a
+        ground speed, keeps the whole slide as its stance."""
+        slide = np.zeros(48, bool)
+        slide[10:34] = True
+        still = np.full(48, -0.2)
+        self.assertTrue(np.array_equal(facts.still_spans({"a": slide}, {"a": still}, 1.0)["a"], slide))
+        self.assertTrue(np.array_equal(facts.still_spans({"a": slide}, {"a": -np.ones(48)}, None)["a"], slide))
+        still[[14, 20, 29]] = -1.0
+        trimmed = facts.still_spans({"a": slide}, {"a": still}, 1.0)["a"]
+        self.assertEqual(list(np.flatnonzero(trimmed)[[0, -1]]), [14, 29])
+
     def test_the_vole_without_the_scaling_still_fails_as_in_round_three(self):
         block = derived("voleR3Cycle")
         with self.assertRaisesRegex(facts.TouchdownError, "touches down [2-9] times"):

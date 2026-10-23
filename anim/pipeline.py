@@ -43,7 +43,7 @@ ARGS = {"init": [("--model", {"required": True, "type": Path}), ("--clip", {"req
         "preflight": [("--source-observations", {"type": Path}), ("--witness", {"type": Path}),
                       ("--silhouette-regions", {"type": Path})],
         "assess": [],
-        "facts": [("--mass-kg", {"type": float}), ("--accept-gait", {}), ("--accept-retime", {})], "bake": [],
+        "facts": [("--mass-kg", {"type": float}), ("--accept-gait", {}), ("--accept-retime", {}), ("--trim-stance", {})], "bake": [],
         "lab": [],
         "review": [("--template", {"action": "store_true"}), ("--file", {"type": Path})],
         "verify": [("--godot47", {"required": True, "type": Path}), ("--godot45", {"required": True, "type": Path}),
@@ -613,14 +613,15 @@ def cmd_facts(a):
     mass = facts_mass(a, ledger, brief, folder / "mass")
     render = silhouette_renderer(ledger.model, poses, masks.shape[1:], folder / "render", a.blender)
     result = facts_mod.clip_facts(poses, project_contract(ledger), brief, rest, masks=masks, render=render, rig=rig,
-                                  mass=mass, accept_gait=a.accept_gait, accept_retime=a.accept_retime)
+                                  mass=mass, accept_gait=a.accept_gait, accept_retime=a.accept_retime,
+                                  trim_stance=a.trim_stance)
     (folder / "facts.json").write_text(json.dumps(result, indent=2))
     (folder / "anim-entry.json").write_text(json.dumps({ledger.clip: result["entry"]}, indent=2))
     ledger.record("facts", {"poses": ledger.output("fit", "poses"), "masks": masks_path},
                   {"facts": folder / "facts.json", "entry": folder / "anim-entry.json"},
                   {"speedMps": result["speedMps"], "period": result["period"], "warnings": result["warnings"],
                    "averagedCycleIoU": result.get("averagedCycleIoU"), "mass": mass, "acceptGait": a.accept_gait,
-                   "acceptRetime": a.accept_retime, "retime": (result.get("cadence") or {}).get("retime")})
+                   "acceptRetime": a.accept_retime, "trimStance": a.trim_stance, "retime": (result.get("cadence") or {}).get("retime")})
     emit({"ok": True, **{k: result[k] for k in ("start", "period", "speedMps", "strideM", "warnings")},
           **{k: result[k] for k in ("cyclesAveraged", "averagedCycleIoU", "cadence", "gaitCheck", "contactCheck")
              if k in result}})

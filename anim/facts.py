@@ -406,7 +406,7 @@ def slide_stances(heights, x, ground, tol):
     return masks, extremes
 
 
-def read_cycle(heights, vx, still, smooth_x, gap, tol, reading=None):
+def read_cycle(heights, vx, still, smooth_x, gap, tol, reading=None, trim_stance=None):
     """One cycle's contacts (round 4). The strict reading is `motion_contacts` with the body's tolerances and the
     smoothed stillness velocity `still`. When it gives a planted paw more than one touchdown and every one of them
     lies inside that paw's backward slide, they are fragments of one stance that the fit's height and speed noise
@@ -431,7 +431,40 @@ def read_cycle(heights, vx, still, smooth_x, gap, tol, reading=None):
                       f"slide: each stance is the slide from the paw's most forward to its most backward point "
                       f"(its in-place x capped at {NOISY['order']} harmonics), planted when it comes within the "
                       f"stance tolerance of the ground; the ground speed from those stances"}
-    return ground, speed, why, slides, report
+    if not trim_stance:
+        return ground, speed, why, slides, report
+    stances = still_spans(slides, {c: lowpass(v, NOISY["order"]) for c, v in still.items()}, speed)
+    if speed is not None:
+        speed, why = speed_from(vx, stances)
+    report.update({"touchdowns": cycle_touchdowns(stances), "trimStance": trim_stance,
+                   "slideDuty": {c: round(float(np.mean(m)), 4) for c, m in slides.items()},
+                   "stanceDuty": {c: round(float(np.mean(m)), 4) for c, m in stances.items()},
+                   "trimRule": f"`facts --trim-stance` (#174): each stance is its slide from the first to the last "
+                               f"world-still sample (the stillness speed capped at {NOISY['order']} harmonics, within "
+                               f"{SLIP_SHARE} of the slides' ground speed; the whole slide when none is); the ground "
+                               f"speed from those stances"})
+    return ground, speed, why, stances, report
+
+
+def still_spans(slides, still, speed):
+    """#174: each noisy-fit slide from its first to its last world-still sample (in-place speed `still` within
+    SLIP_SHARE * speed of -speed). The slide also holds the paw's deceleration into touchdown and its backward drift
+    as it lifts, which the contact IK pinned and then snapped. A slide with no still sample, or no ground speed, is
+    kept whole."""
+    out = {}
+    for chain, slide in slides.items():
+        slide = np.asarray(slide, bool)
+        out[chain] = slide.copy()
+        if not speed or speed <= 0 or not slide.any() or slide.all():
+            continue
+        n = len(slide)
+        start = int(np.flatnonzero(slide & ~np.roll(slide, 1))[0])
+        order = (start + np.arange(int(slide.sum()))) % n
+        hit = np.flatnonzero(np.abs(np.asarray(still[chain], float)[order] + speed) <= SLIP_SHARE * speed)
+        if len(hit):
+            out[chain] = np.zeros(n, bool)
+            out[chain][order[hit[0]:hit[-1] + 1]] = True
+    return out
 
 
 def reading_warning(report):
@@ -440,7 +473,10 @@ def reading_warning(report):
     strict = ", ".join(f"{c} {v}" for c, v in report["strictTouchdowns"].items() if v != 1)
     return [f"Contacts read for a noisy fit (round 4): the strict reading touched down {strict} times in a cycle, "
             f"every touchdown inside the paw's backward slide; each stance is that slide (anterior to posterior "
-            f"extreme of the paw's x at {report['order']} harmonics)"]
+            f"extreme of the paw's x at {report['order']} harmonics)"] + ([
+        f"Stances trimmed to the world-still part of each slide (`facts --trim-stance`, #174): duty "
+        f"{report['slideDuty']} -> {report['stanceDuty']}; accepted: {report['trimStance']}"]
+        if report.get("trimStance") else [])
 
 
 def circular_speed(x, dt):
@@ -730,7 +766,7 @@ def gait_pattern(masks, touchdowns, project, n):
 
 
 def clip_facts(poses, project, brief, rest, masks=None, render=None, rig=None, mass=None, accept_gait=None,
-               accept_retime=None):
+               accept_retime=None, trim_stance=None):
     """The clip's facts. `rest` is each paw chain's rest-pose tail height (`rest_heights`); the paws' heights are
     measured from it. A loop needs the video: `masks` (the ingest's working masks, (T, H, W) bool) and `render`
     (value vectors -> the rig's silhouettes at the masks' size) for the averaged cycle's check.
@@ -739,7 +775,8 @@ def clip_facts(poses, project, brief, rest, masks=None, render=None, rig=None, m
     and makes the bake's 60 Hz keys (the pipeline always passes it; without it the averaged cycle's paw columns are
     read and its samples are the keys, as before). `mass` ({"kg": m or [lo, hi], "source"}; else the brief's massKg)
     sets the cadence band; `accept_gait` is the recorded reason a gait mismatch (or an unnamed gait) stands, and
-    `accept_retime` the reason a retime outside RETIME_BOUND does. With `rig`, a one-shot's facts predict each paw at
+    `accept_retime` the reason a retime outside RETIME_BOUND does. `trim_stance` (#174) is the recorded reason a
+    noisy-fit reading trims each slide to its world-still part (`read_cycle`). With `rig`, a one-shot's facts predict each paw at
     every key as the bake plays it (`cycle.paws`), which `bake` checks."""
     fps = float(poses["fps"])
     frames = poses["frames"]
@@ -751,7 +788,7 @@ def clip_facts(poses, project, brief, rest, masks=None, render=None, rig=None, m
         mass = {"kg": brief["massKg"], "source": "brief massKg"}
     if brief["loop"]:
         found = loop_cycle(poses, project, every, paws, chains, masks, render, rest, rig, brief, mass, accept_gait,
-                           accept_retime)
+                           accept_retime, trim_stance)
         start, period, entry, cycle_out, extra = found
         speed, speed_reason = entry["authored_speed_mps"], extra.pop("speedReason", None)
         warnings += extra.pop("warnings", [])
@@ -965,7 +1002,7 @@ def describe_identity(report):
 
 
 def loop_cycle(poses, project, every, paws, chains, masks, render, rest, rig=None, brief=None, mass=None,
-               accept_gait=None, accept_retime=None):
+               accept_gait=None, accept_retime=None, trim_stance=None):
     """The loop's cycle from the video: period, steady cycles, phase average, the averaged cycle's check against the
     masks, the contacts, the gait and cadence checks, and (with `rig`) the 60 Hz keys. Returns (start, period, entry,
     cycle block, extra facts).
@@ -986,13 +1023,13 @@ def loop_cycle(poses, project, every, paws, chains, masks, render, rest, rig=Non
                          f"must hold at least two cycles{short}")
     try:
         return loop_from_period(found, poses, project, every, paws, chains, masks, render, rest, rig, brief, mass,
-                                accept_gait, accept_retime, force=False)
+                                accept_gait, accept_retime, force=False, trim_stance=trim_stance)
     except TouchdownError as error:
         first = getattr(error, "identity", None) or {}
         if not first.get("resolved"):
             try:
                 return loop_from_period(found, poses, project, every, paws, chains, masks, render, rest, rig, brief,
-                                        mass, accept_gait, accept_retime, force=True)
+                                        mass, accept_gait, accept_retime, force=True, trim_stance=trim_stance)
             except TouchdownError as again:
                 error, first = again, getattr(again, "identity", None) or {}
         raise FactsError(f"{error}: resolving leg identity across the clip from the paw tracks "
@@ -1002,7 +1039,7 @@ def loop_cycle(poses, project, every, paws, chains, masks, render, rest, rig=Non
 
 
 def loop_from_period(found, poses, project, every, paws, chains, masks, render, rest, rig, brief, mass, accept_gait,
-                     accept_retime, force=False):
+                     accept_retime, force=False, trim_stance=None):
     """`loop_cycle` from the video's period on: leg identity (`leg_identity`; with `force` resolved even when the
     half-period test is decisive), the stride, the steady cycles, the average and the contacts."""
     fps = float(poses["fps"])
@@ -1013,14 +1050,14 @@ def loop_from_period(found, poses, project, every, paws, chains, masks, render, 
     pairs = cycle.leg_pairs(names, project)
     try:
         return loop_rest(found, period, doubled, identity, poses, project, every, paws, chains, masks, render, rest,
-                         rig, brief, mass, accept_gait, accept_retime, fps, names, count, pairs)
+                         rig, brief, mass, accept_gait, accept_retime, fps, names, count, pairs, trim_stance)
     except TouchdownError as error:
         error.identity = identity
         raise
 
 
 def loop_rest(found, period, doubled, identity, poses, project, every, paws, chains, masks, render, rest, rig, brief,
-              mass, accept_gait, accept_retime, fps, names, count, pairs):
+              mass, accept_gait, accept_retime, fps, names, count, pairs, trim_stance=None):
     """The stride (the video's period, doubled when the masks show half of it), its steady cycles, their average, the
     contacts, gait, cadence and keys, from leg-identity-resolved values and paws."""
     mask_frames = period
@@ -1066,9 +1103,11 @@ def loop_rest(found, period, doubled, identity, poses, project, every, paws, cha
     origin = project.get("phaseOrigin", chains[0])
     tol = REFERENCE if rig is None else tolerances(rig, project)
     if rig is None:
-        contacts = averaged_contacts(avg, n, kinds, paw_cols, chains, origin, fps, period, kept, project, rest, tol)
+        contacts = averaged_contacts(avg, n, kinds, paw_cols, chains, origin, fps, period, kept, project, rest, tol,
+                                     trim_stance)
     else:
-        contacts = rig_contacts(avg, n, drift, names, project, rig, rest, chains, origin, fps, period, kept, tol)
+        contacts = rig_contacts(avg, n, drift, names, project, rig, rest, chains, origin, fps, period, kept, tol,
+                                trim_stance=trim_stance)
     masks_of, touchdowns = contacts["masks"], {}
     for c in chains:
         if masks_of[c].any():
@@ -1135,7 +1174,8 @@ def loop_rest(found, period, doubled, identity, poses, project, every, paws, cha
     return start, period, entry, cycle_out, extra
 
 
-def averaged_contacts(avg, n, kinds, paw_cols, chains, origin, fps, period, kept, project, rest, tol=None):
+def averaged_contacts(avg, n, kinds, paw_cols, chains, origin, fps, period, kept, project, rest, tol=None,
+                      trim_stance=None):
     """Without the rig: contacts from the averaged cycle's paw columns at its n samples, rolled to the phase
     origin's touchdown; the keys are the rolled average (as before Task 19). Round 4: `read_cycle` (the noisy-fit
     reading's slides from the paw track's first NOISY['order'] harmonics)."""
@@ -1147,7 +1187,7 @@ def averaged_contacts(avg, n, kinds, paw_cols, chains, origin, fps, period, kept
         heights = {c: table[:n, paw_cols[c][1]] for c in chains}
         vx = {c: np.gradient(table[:, paw_cols[c][0]])[:n] * rate for c in chains}
         noisy = lambda: {c: lowpass(table[:n, paw_cols[c][0]], NOISY["order"]) for c in chains}
-        *found, report = read_cycle(heights, vx, vx, noisy, 1, tol, chosen.get("reading"))
+        *found, report = read_cycle(heights, vx, vx, noisy, 1, tol, chosen.get("reading"), trim_stance)
         chosen.setdefault("reading", report["reading"])
         chosen["report"] = report
         return tuple(found), heights
@@ -1171,7 +1211,8 @@ def averaged_contacts(avg, n, kinds, paw_cols, chains, origin, fps, period, kept
             "warnings": reading_warning(chosen["report"])}
 
 
-def rig_contacts(avg, n, drift, names, project, rig, rest, chains, origin, fps, period, kept, tol=None, reading=None):
+def rig_contacts(avg, n, drift, names, project, rig, rest, chains, origin, fps, period, kept, tol=None, reading=None,
+                 trim_stance=None):
     """With the rig: the smooth periodic cycle (motion.SmoothCycle of the averaged values, root drift removed),
     its paws by forward kinematics at DENSE samples, the contacts from that motion, all rolled to the phase origin's
     touchdown. Round 4: `tol` is the body's Tolerances (default: scaled to `rig`); the heights and the ground speed
@@ -1209,7 +1250,8 @@ def rig_contacts(avg, n, drift, names, project, rig, rest, chains, origin, fps, 
         heights = {c: paws[c][:, 1] - float(rest[c]) for c in chains}
         vx = {c: circular_speed(paws[c][:, 0], dt) for c in chains}
         *found, report = read_cycle(heights, vx, speeds(smooth_cycle, VELOCITY_ORDER),
-                                    lambda: capped_x(smooth_cycle, NOISY["order"]), gap, tol, chosen["reading"])
+                                    lambda: capped_x(smooth_cycle, NOISY["order"]), gap, tol, chosen["reading"],
+                                    trim_stance)
         chosen["reading"], chosen["report"] = report["reading"], report
         return tuple(found), heights
     (_, _, _, first), _ = read(smooth)
